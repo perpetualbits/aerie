@@ -1,0 +1,33 @@
+name: apptop
+version: '0.1.0'
+summary: Process-group performance monitor with Proxmox VM support
+description: |
+  apptop monitors Linux process groups by reading /proc, displaying a
+  dual-metric bar chart. Metrics include CPU%, memory (fraction of physical
+  RAM), disk I/O rates, page faults, context switches, open file descriptors,
+  swap usage, scheduler wait time, and estimated power (RAPL).
+
+  Group by process name, cgroup, or executable -- press 'g' to cycle.
+  Optionally poll a Proxmox VE API to monitor VMs and containers.
+  With --enable-remote, press Enter on a VM to SSH in and monitor it live.
+
+  Press 'm' for the built-in manual.
+
+grade: stable
+confinement: classic
+base: core22
+
+parts:
+  apptop:
+    plugin: rust
+    source: .
+    build-attributes:
+      - enable-patchelf
+    override-build: |
+      craftenv
+      cargo build --release --locked
+      install -Dm755 target/release/apptop $CRAFT_PART_INSTALL/bin/apptop
+
+apps:
+  apptop:
+    command: bin/apptop

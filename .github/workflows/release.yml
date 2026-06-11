@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  packages:
+    name: Build packages (deb, rpm, binary)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb package
+        run: cargo deb --no-build
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Strip binary for RPM
+        run: strip target/release/apptop
+
+      - name: Build .rpm package
+        run: cargo generate-rpm
+
+      - name: Rename binary for release asset
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          cp target/release/apptop "apptop-${VERSION}-x86_64-linux"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apptop-*-x86_64-linux
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+
+  snap:
+    name: Build snap package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build snap
+        uses: snapcore/action-build@v1
+        id: build-snap
+        with:
+          snapcraft-args: --destructive-mode
+
+      - name: Upload snap to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.build-snap.outputs.snap }}

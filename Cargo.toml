@@ -1,0 +1,46 @@
+[package]
+name = "apptop"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Process-group performance monitor with Proxmox VM support and SSH drill-down"
+repository = "https://github.com/perpetualbits/apptop"
+homepage = "https://github.com/perpetualbits/apptop"
+categories = ["command-line-utilities"]
+keywords = ["monitoring", "performance", "top", "proxmox", "processes"]
+
+[package.metadata.deb]
+maintainer = "Epsilon Null Operation <perpetualbits@gmail.com>"
+copyright = "2026, Epsilon Null Operation"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+Process-group performance monitor that reads /proc and groups processes by \
+name, cgroup, or executable. Shows a dual-metric bar chart with CPU%, \
+memory (fraction of physical RAM), disk I/O rates, page faults, context \
+switches, open FDs, swap, scheduler wait, and estimated power (RAPL). \
+Supports Proxmox VE API polling and optional SSH drill-down into VMs."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/apptop", "usr/bin/apptop", "755"],
+    ["LICENSE", "usr/share/doc/apptop/copyright", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/apptop", dest = "/usr/bin/apptop", mode = "755" },
+    { source = "LICENSE", dest = "/usr/share/licenses/apptop/LICENSE", mode = "644" },
+]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+ratatui = "0.29"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
