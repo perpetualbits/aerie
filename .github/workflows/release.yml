@@ -6,75 +6,167 @@ on:
       - 'v*.*.*'
 
 jobs:
-  packages:
-    name: Build packages (deb, rpm, binary)
+  # ── Native x86-64: binary + .deb + .rpm ───────────────────────────────────
+  packages-x86_64:
+    name: Packages (x86_64)
     runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: x86_64-cargo-
 
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
-
-      - name: Build .deb package
-        run: cargo deb --no-build
-
-      - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm --locked
-
-      - name: Strip binary for RPM
-        run: strip target/release/apptop
-
-      - name: Build .rpm package
-        run: cargo generate-rpm
-
-      - name: Rename binary for release asset
+      - name: Build .deb
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          cp target/release/apptop "apptop-${VERSION}-x86_64-linux"
+          cargo install cargo-deb --locked
+          cargo deb --no-build
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+      - name: Build .rpm
+        run: |
+          cargo install cargo-generate-rpm --locked
+          strip target/release/apptop
+          cargo generate-rpm
+
+      - name: Stage artifacts
+        run: cp target/release/apptop "apptop-${GITHUB_REF_NAME}-x86_64-linux"
+
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
             apptop-*-x86_64-linux
             target/debian/*.deb
             target/generate-rpm/*.rpm
 
-  snap:
-    name: Build snap package
+  # ── Native aarch64 (ARMv8/v9): binary + .deb + .rpm ──────────────────────
+  # GitHub provides ubuntu-22.04-arm runners with real ARM hardware —
+  # no emulation, full native speed.
+  packages-aarch64:
+    name: Packages (aarch64)
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: aarch64-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+
+      - name: Build .rpm
+        run: |
+          cargo install cargo-generate-rpm --locked
+          strip target/release/apptop
+          cargo generate-rpm
+
+      - name: Stage artifacts
+        run: cp target/release/apptop "apptop-${GITHUB_REF_NAME}-aarch64-linux"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apptop-*-aarch64-linux
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+
+  # ── Cross-compiled riscv64gc ───────────────────────────────────────────────
+  # No GitHub-hosted RISC-V runner exists yet, so we cross-compile from x86_64.
+  # reqwest already uses rustls (no native OpenSSL needed) so cross-compilation
+  # is straightforward: install the target + a C cross-linker, then cargo build.
+  packages-riscv64:
+    name: Packages (riscv64gc)
     runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build snap
-        uses: snapcore/action-build@v1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-gnu
+
+      - name: Install RISC-V cross-linker
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-riscv64-linux-gnu
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: riscv64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: riscv64-cargo-
+
+      # Tell Cargo which linker to use for the RISC-V target.
+      - name: Configure cross-linker
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.riscv64gc-unknown-linux-gnu]
+          linker = "riscv64-linux-gnu-gcc"
+          EOF
+
+      - name: Build release binary
+        run: cargo build --release --locked --target riscv64gc-unknown-linux-gnu
+
+      - name: Stage artifact
+        run: |
+          riscv64-linux-gnu-strip target/riscv64gc-unknown-linux-gnu/release/apptop
+          cp target/riscv64gc-unknown-linux-gnu/release/apptop \
+             "apptop-${GITHUB_REF_NAME}-riscv64-linux"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: apptop-*-riscv64-linux
+
+  # ── Snap (x86_64 + aarch64 via remote builders) ───────────────────────────
+  # snapcore/action-build spins up an LXD container to compile inside.
+  # Remote builders handle other architectures automatically when published
+  # to the Snap Store. This job produces the x86_64 snap for the release asset.
+  snap:
+    name: Snap (x86_64)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: snapcore/action-build@v1
         id: build-snap
 
-      - name: Upload snap to release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.build-snap.outputs.snap }}
