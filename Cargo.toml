@@ -24,7 +24,6 @@ section = "utils"
 priority = "optional"
 assets = [
     ["target/release/apptop", "usr/bin/apptop", "755"],
-    ["LICENSE", "usr/share/doc/apptop/copyright", "644"],
 ]
 
 [package.metadata.generate-rpm]

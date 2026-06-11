@@ -73,8 +73,6 @@ jobs:
       - name: Build snap
         uses: snapcore/action-build@v1
         id: build-snap
-        with:
-          snapcraft-args: --destructive-mode
 
       - name: Upload snap to release
         uses: softprops/action-gh-release@v2
