@@ -227,6 +227,34 @@ impl GroupBy {
     }
 }
 
+/// Label identifying a group across all display levels.
+///
+/// In local mode this is the process-group name (comm/cgroup/exe key).
+/// In Proxmox mode it is the VM/CT name. In future levels it might be a pool
+/// name, a node hostname, or a Kubernetes deployment label.
+/// Using a named alias makes the intent clear at every call site.
+pub type GroupLabel = String;
+
+/// Per-group member values for the fair-share histogram overlay.
+///
+/// This is the single source-agnostic unit that the renderer (`fair_share_bins`)
+/// consumes. Any level that wants to drive the overlay just produces a
+/// `HashMap<GroupLabel, MemberSeries>` — the renderer doesn't care whether the
+/// members are threads, VMs, pods, or nodes.
+///
+/// Only the one metric the overlay is currently showing is kept; storing a single
+/// metric per group bounds both memory and sampling work.
+pub struct MemberSeries {
+    /// Which metric these values are for.
+    /// Used by the UI to detect mid-flight metric switches (stale data shows
+    /// all-zero heat for one frame rather than wrongly-coloured heat).
+    pub metric: Metric,
+    /// One value per member, in the unit of `metric`
+    /// (cpu%, faults/s, bytes/s, …). Order is arbitrary; `fair_share_bins`
+    /// treats them as an unordered multiset.
+    pub vals: Vec<f64>,
+}
+
 /// serde default helper: returns true (so old daemon output is treated as complete).
 ///
 /// `BarEntry` completeness flags use `#[serde(default = "default_true")]` so that
@@ -457,8 +485,14 @@ pub struct AppState {
     // ── group histogram overlay ───────────────────────────────────────────
     /// Per-group thread snapshots used for CPU+fault delta computation.
     pub group_snaps: HashMap<String, local::ThreadSnapshot>,
-    /// Per-group: cpu% and faults/s per thread (updated ~once/sec).
-    pub group_member_vals: HashMap<String, local::MemberVals>,
+    /// Per-group member series for the fair-share overlay (updated ~once/sec).
+    ///
+    /// The key is a `GroupLabel`; the value is a `MemberSeries` produced by
+    /// whichever level is active (currently always local threads via
+    /// `local::sample_member_vals`). Future levels — Proxmox VM pools, fleet
+    /// nodes — will write the same type here; the renderer (`fair_share_bins`)
+    /// is already level-agnostic.
+    pub group_member_vals: HashMap<GroupLabel, MemberSeries>,
     /// When the histogram overlay was last sampled (caps at 1 Hz).
     pub last_hist_sample: Option<Instant>,
     /// Whether the distribution-heat overlay is drawn ('h' to toggle).
@@ -625,12 +659,18 @@ impl AppState {
         }
     }
 
-    /// Sample per-thread metric values for all groups currently visible on screen.
+    /// Sample per-member values for all groups currently visible on screen and
+    /// store them as `MemberSeries` in `group_member_vals`.
     ///
-    /// This is intentionally called at most once per second (the caller gates on
-    /// `last_hist_sample`), independent of the main refresh interval, because
-    /// reading `/proc/PID/task/*/stat` for every visible group is moderately
-    /// expensive.
+    /// This is the *local-threads* implementation of member-series production:
+    /// each group's members are its threads, sampled via `/proc/PID/task/*/stat`.
+    /// Future levels (Proxmox pools, fleet nodes) will populate `group_member_vals`
+    /// through their own paths but store the same `MemberSeries` type, which the
+    /// renderer (`fair_share_bins`) consumes without knowing the source.
+    ///
+    /// Called at most once per second (the caller gates on `last_hist_sample`),
+    /// independent of the main refresh interval, because reading per-thread /proc
+    /// files for every visible group is moderately expensive.
     ///
     /// Only groups within the visible scroll window are sampled; groups that scroll
     /// off screen have their data evicted from `group_member_vals` and `group_snaps`

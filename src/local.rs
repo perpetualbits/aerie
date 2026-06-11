@@ -133,16 +133,8 @@ pub struct ThreadSample {
     pub sched_wait_pct: f64,
 }
 
-/// Per-group per-thread values for the histogram overlay.
-///
-/// Only the one metric the overlay is currently showing is sampled and stored.
-/// Storing only one metric keeps the histogram fast and memory-bounded.
-pub struct MemberVals {
-    /// Which metric these values are for (used to detect metric switches).
-    pub metric: Metric,
-    /// One value per thread; unit matches the metric (cpu%, faults/s, bytes/s, etc.).
-    pub vals: Vec<f64>,
-}
+// MemberSeries is defined in main.rs (crate root) so any level — local threads,
+// Proxmox VMs, future fleet nodes — can produce it without depending on this module.
 
 /// System-level sample (network, GPU, RAPL).
 ///
@@ -915,8 +907,12 @@ pub fn sample_threads(
 /// Sample per-thread values for the histogram overlay.
 ///
 /// A thin wrapper around `sample_threads` that extracts a single metric's values
-/// as a plain `Vec<f64>`. The caller (`sample_histograms`) stores these in
-/// `group_member_vals` for the UI to bin into the distribution histogram.
+/// as a plain `Vec<f64>`, packaged as a `MemberSeries` — the source-agnostic type
+/// that the renderer (`fair_share_bins`) consumes. The caller (`sample_histograms`)
+/// stores these in `group_member_vals` keyed by group label.
+///
+/// This is the *local-threads* producer of `MemberSeries`. Other levels (Proxmox VM
+/// pools, fleet nodes) will supply the same type through different paths.
 ///
 /// Parameters:
 /// - `pids`: PIDs belonging to the group.
@@ -930,7 +926,7 @@ pub fn sample_member_vals(
     metric: Metric,
     fields: &ThreadFields,
     cpu_total: u64,
-) -> Result<(MemberVals, ThreadSnapshot)> {
+) -> Result<(crate::MemberSeries, ThreadSnapshot)> {
     let (samples, snap) = sample_threads(pids, prev, fields, cpu_total)?;
     let vals: Vec<f64> = samples
         .iter()
@@ -945,7 +941,7 @@ pub fn sample_member_vals(
             _ => 0.0,
         })
         .collect();
-    Ok((MemberVals { metric, vals }, snap))
+    Ok((crate::MemberSeries { metric, vals }, snap))
 }
 
 #[cfg(test)]
