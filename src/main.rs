@@ -30,7 +30,11 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     collections::HashMap,
     io,
-    sync::mpsc,
+    sync::{
+        mpsc,
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -88,7 +92,7 @@ struct Cli {
 /// short label shown in the header and column headers. `cycle_next`/`cycle_prev`
 /// walk the ordered list appropriate for the current mode (local has more options
 /// than Proxmox, which only exposes CPU, memory, and disk I/O).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Metric {
     Cpu,
     Memory,
@@ -224,6 +228,46 @@ impl GroupBy {
     /// Advance to the next strategy in the cycle: comm → cgroup → exe → comm.
     pub fn next(self) -> Self {
         match self { Self::Comm => Self::Cgroup, Self::Cgroup => Self::Exe, Self::Exe => Self::Comm }
+    }
+}
+
+/// Grouping strategy for Proxmox VM display.
+///
+/// Controls how VMs/CTs are bucketed into display rows in Proxmox mode.
+/// The active strategy is shared with the background polling thread via
+/// `AppState::pve_group_by_shared` (an `AtomicU8`) so grouping changes
+/// take effect on the next sample without restarting the thread.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum PveGroupBy {
+    #[default]
+    /// One row per VM — same flat list as before Tier 1.
+    Flat = 0,
+    /// Group VMs/CTs by their Proxmox pool name.
+    /// VMs without a pool appear under "(no pool)".
+    Pool = 1,
+    /// Group VMs/CTs by their first tag (semicolon-delimited).
+    /// VMs with no tags appear under "(untagged)".
+    Tag = 2,
+    /// Group VMs/CTs by the Proxmox node they run on.
+    /// Gives a node-rollup view: how much of each host is consumed.
+    Node = 3,
+}
+
+impl PveGroupBy {
+    /// Short name for the header indicator, e.g. `[pool]`.
+    pub fn name(self) -> &'static str {
+        match self { Self::Flat => "flat", Self::Pool => "pool", Self::Tag => "tag", Self::Node => "node" }
+    }
+
+    /// Advance through the cycle: flat → pool → tag → node → flat.
+    pub fn next(self) -> Self {
+        match self { Self::Flat => Self::Pool, Self::Pool => Self::Tag, Self::Tag => Self::Node, Self::Node => Self::Flat }
+    }
+
+    /// Decode from the raw `u8` stored in the shared `AtomicU8`.
+    pub fn from_u8(v: u8) -> Self {
+        match v { 1 => Self::Pool, 2 => Self::Tag, 3 => Self::Node, _ => Self::Flat }
     }
 }
 
@@ -408,6 +452,14 @@ pub fn metric_sort_val(e: &BarEntry, m: Metric, total_ram: u64) -> f64 {
 pub(crate) struct PvePacket {
     entries: Vec<BarEntry>,
     meta: HashMap<String, proxmox::VmMeta>,
+    /// Per-group, per-metric member values for the fair-share overlay.
+    /// All four Proxmox metrics are always pre-computed so the main thread can
+    /// pick whichever is currently displayed without an extra round-trip.
+    member_vals: HashMap<GroupLabel, HashMap<Metric, Vec<f64>>>,
+    /// Per-node CPU/memory snapshot for the footer status line.
+    node_status: Vec<proxmox::NodeStatus>,
+    /// Per-storage fill snapshot for the footer status line.
+    storage_status: Vec<proxmox::StorageStatus>,
     /// Non-None when the API call failed; the string is shown in the UI error bar.
     err: Option<String>,
 }
@@ -510,6 +562,17 @@ pub struct AppState {
     pub prev_sys: Option<local::SysSample>,
     // ── grouping strategy ─────────────────────────────────────────────────
     pub group_by: GroupBy,
+    // ── Proxmox grouping strategy ─────────────────────────────────────────
+    /// Current Proxmox grouping mode (Flat/Pool/Tag/Node).
+    pub pve_group_by: PveGroupBy,
+    /// Shared with the background thread; written by the 'g' key handler,
+    /// read by the poller each iteration. `Relaxed` ordering is fine here
+    /// because the next sample picks up whatever is current at that instant.
+    pub pve_group_by_shared: Arc<AtomicU8>,
+    /// Per-node CPU/memory from the most recent Proxmox sample (footer display).
+    pub pve_node_status: Vec<proxmox::NodeStatus>,
+    /// Per-storage fill from the most recent Proxmox sample (footer display).
+    pub pve_storage_status: Vec<proxmox::StorageStatus>,
     // ── rolling peak values ───────────────────────────────────────────────
     pub peak_vals: PeakVals,
     // ── privilege flag ────────────────────────────────────────────────────
@@ -539,6 +602,11 @@ impl AppState {
             None => AppMode::Local,
         };
 
+        // Shared AtomicU8 so the 'g' key can change grouping without restarting
+        // the poller thread. Initialised to Flat (0). Created unconditionally so
+        // it is always valid regardless of mode.
+        let pve_group_by_shared = Arc::new(AtomicU8::new(PveGroupBy::Flat as u8));
+
         let (proxmox_rx, proxmox_url, proxmox_token, proxmox_insecure) =
             if let AppMode::Proxmox { ref url, ref token, insecure } = mode {
                 if insecure {
@@ -550,6 +618,7 @@ impl AppState {
                 let interval = Duration::from_secs_f64(cli.interval);
                 let url2 = url.clone();
                 let token2 = token.clone();
+                let shared = Arc::clone(&pve_group_by_shared);
                 // Spawn the Proxmox poller thread. It loops forever, sleeping `interval`
                 // between calls. The main thread drains `rx` non-blocking on each UI tick.
                 std::thread::spawn(move || {
@@ -559,17 +628,33 @@ impl AppState {
                             let _ = tx.send(PvePacket {
                                 entries: vec![],
                                 meta: HashMap::new(),
+                                member_vals: HashMap::new(),
+                                node_status: vec![],
+                                storage_status: vec![],
                                 err: Some(e.to_string()),
                             });
                             return;
                         }
                     };
                     loop {
-                        let packet = match client.sample() {
-                            Ok((entries, meta)) => PvePacket { entries, meta, err: None },
+                        // Read the current grouping strategy each iteration so 'g'
+                        // key changes are picked up without restarting the thread.
+                        let group_by = PveGroupBy::from_u8(shared.load(Ordering::Relaxed));
+                        let packet = match client.sample(group_by) {
+                            Ok(r) => PvePacket {
+                                entries: r.entries,
+                                meta: r.meta,
+                                member_vals: r.member_vals,
+                                node_status: r.node_status,
+                                storage_status: r.storage_status,
+                                err: None,
+                            },
                             Err(e) => PvePacket {
                                 entries: vec![],
                                 meta: HashMap::new(),
+                                member_vals: HashMap::new(),
+                                node_status: vec![],
+                                storage_status: vec![],
                                 err: Some(e.to_string()),
                             },
                         };
@@ -637,6 +722,10 @@ impl AppState {
             sys_rapl_w: 0.0,
             prev_sys: None,
             group_by: GroupBy::Comm,
+            pve_group_by: PveGroupBy::Flat,
+            pve_group_by_shared,
+            pve_node_status: vec![],
+            pve_storage_status: vec![],
             peak_vals: PeakVals::default(),
             running_unprivileged: false,
         })
@@ -818,6 +907,28 @@ impl AppState {
                     }
                     self.vm_meta = pkt.meta;
                     self.proxmox_last_ok = Some(Instant::now());
+                    self.pve_node_status = pkt.node_status;
+                    self.pve_storage_status = pkt.storage_status;
+
+                    // Populate group_member_vals from the per-group per-metric map.
+                    // The packet always carries all four Proxmox metrics; we pick
+                    // whichever the user is currently looking at for the overlay.
+                    let hist_metric = match self.active_side {
+                        Side::Left => self.left_metric,
+                        Side::Right => self.right_metric,
+                    };
+                    self.group_member_vals.clear();
+                    for (label, metric_map) in &pkt.member_vals {
+                        if let Some(vals) = metric_map.get(&hist_metric) {
+                            if !vals.is_empty() {
+                                self.group_member_vals.insert(
+                                    label.clone(),
+                                    MemberSeries { metric: hist_metric, vals: vals.clone() },
+                                );
+                            }
+                        }
+                    }
+
                     Ok(pkt.entries)
                 }
             }
@@ -1217,14 +1328,22 @@ fn main() -> Result<()> {
                             state.show_histogram = !state.show_histogram;
                         }
                     }
-                    // Cycle grouping strategy (Groups view, local mode only)
-                    KeyCode::Char('g')
-                        if matches!(state.view, AppView::Groups)
-                            && matches!(state.mode, AppMode::Local) =>
-                    {
-                        state.group_by = state.group_by.next();
-                        // Discard the previous snapshot so the next collect() uses the new strategy.
-                        state.snap = None;
+                    // Cycle grouping strategy (Groups view, local or Proxmox mode)
+                    KeyCode::Char('g') if matches!(state.view, AppView::Groups) => {
+                        if matches!(state.mode, AppMode::Local) {
+                            state.group_by = state.group_by.next();
+                            // Discard snapshot so the next collect() uses the new strategy.
+                            state.snap = None;
+                        } else {
+                            state.pve_group_by = state.pve_group_by.next();
+                            // Publish new grouping to the background thread atomically.
+                            state.pve_group_by_shared.store(
+                                state.pve_group_by as u8,
+                                Ordering::Relaxed,
+                            );
+                            // Clear member vals so the overlay doesn't show stale data.
+                            state.group_member_vals.clear();
+                        }
                         state.stable_order.clear();
                         state.entries.clear();
                     }

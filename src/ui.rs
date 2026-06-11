@@ -69,6 +69,11 @@ fn metric_selector_line(state: &AppState) -> Line<'static> {
                 format!("  [{}]", state.group_by.name()),
                 dim_style,
             ));
+        } else if matches!(state.mode, AppMode::Proxmox { .. }) {
+            spans.push(Span::styled(
+                format!("  [{}]", state.pve_group_by.name()),
+                dim_style,
+            ));
         }
         if state.proxmox_insecure {
             spans.push(Span::styled(
@@ -566,7 +571,6 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let is_local = matches!(state.mode, AppMode::Local);
     let lm = state.left_metric;
     let rm = state.right_metric;
 
@@ -577,12 +581,16 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
         Side::Left => lm,
         Side::Right => rm,
     };
+    // Overlay is enabled for any metric that can have per-member data.
+    // Local mode: threads supply CPU/fault/disk/ctx/sched data.
+    // Proxmox mode: VMs supply CPU/memory/disk data for the group overlay.
+    // Memory is included here; local mode simply won't have Memory member vals,
+    // so it shows a dark floor (all-zero bins) for that metric.
     let overlay_enabled = state.show_histogram
-        && is_local
         && matches!(
             hist_metric,
-            Metric::Cpu | Metric::PageFaults | Metric::DiskRead | Metric::DiskWrite
-                | Metric::CtxSwitches | Metric::SchedWait
+            Metric::Cpu | Metric::Memory | Metric::PageFaults | Metric::DiskRead
+                | Metric::DiskWrite | Metric::CtxSwitches | Metric::SchedWait
         );
 
     // Label column width: widest label, clamped to [8, 28] chars.
@@ -1027,11 +1035,27 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
                 String::new()
             };
 
-            // System metrics only in local mode (Proxmox footer would be too wide).
+            // System metrics: local /proc data in local mode; node/storage summary in Proxmox mode.
             let sys_parts = if matches!(state.mode, AppMode::Local) {
                 sys_metrics(state)
             } else {
-                String::new()
+                // Append per-node CPU/mem and per-storage fill to the Proxmox status line.
+                let mut s = String::new();
+                for ns in &state.pve_node_status {
+                    let mem_g = ns.mem_used as f64 / 1_073_741_824.0;
+                    let max_g = ns.mem_total as f64 / 1_073_741_824.0;
+                    s.push_str(&format!(
+                        "  │  {} {:.0}%cpu {:.0}/{:.0}G",
+                        ns.node, ns.cpu_pct, mem_g, max_g,
+                    ));
+                }
+                for ss in &state.pve_storage_status {
+                    if ss.total > 0 {
+                        let pct = ss.used as f64 / ss.total as f64 * 100.0;
+                        s.push_str(&format!("  │  {} {:.0}%", ss.storage, pct));
+                    }
+                }
+                s
             };
 
             let enter_hint = if matches!(state.mode, AppMode::Local) {
@@ -1151,9 +1175,9 @@ fn manual_lines() -> Vec<Line<'static>> {
         d("                             active side is highlighted in yellow in the header"),
         kv("  [← / →]                 ", "cycle the metric shown on the active side"),
         kv("  [s]                      ", "re-sort list by the current active-side metric"),
-        kv("  [h]                      ", "toggle thread-distribution histogram overlay"),
-        kv("  [g]                      ", "cycle grouping strategy: comm → cgroup → exe → comm"),
-        d("                             current grouping shown as [comm]/[cgroup]/[exe] in header"),
+        kv("  [h]                      ", "toggle distribution histogram overlay"),
+        kv("  [g]                      ", "cycle grouping: comm→cgroup→exe (local) or flat→pool→tag→node (Proxmox)"),
+        d("                             current grouping shown in brackets in the header"),
         kv("  [r]                      ", "force an immediate data refresh"),
         kv("  [m]                      ", "toggle this manual  (↑/↓ to scroll)"),
         blank(),
@@ -1302,14 +1326,28 @@ fn manual_lines() -> Vec<Line<'static>> {
         blank(),
         // ── GroupBy ───────────────────────────────────────────────────────────
         h("GROUPING STRATEGY  [g]"),
-        b("  Press [g] to cycle through three grouping strategies:"),
+        b("  Press [g] to cycle grouping.  The active strategy is shown in [brackets] in the header."),
         blank(),
+        b("  LOCAL MODE:"),
         kv("  comm    ", "Process name from /proc/<pid>/stat (default).  Best for"),
         d("            identifying individual applications and daemons."),
         kv("  cgroup  ", "Last meaningful component of /proc/<pid>/cgroup path, with"),
         d("            .service/.scope suffixes stripped.  Groups systemd units together."),
         kv("  exe     ", "Basename of /proc/<pid>/exe symlink.  Groups by the actual"),
         d("            binary, useful when the same binary runs under different names."),
+        blank(),
+        b("  PROXMOX MODE:"),
+        kv("  flat    ", "One row per VM/CT — the default, same as before."),
+        kv("  pool    ", "Group VMs/CTs by their Proxmox pool.  VMs without a pool"),
+        d("            appear as '(no pool)'.  Useful for workload-oriented views."),
+        kv("  tag     ", "Group by each VM's first tag (semicolon-delimited).  VMs"),
+        d("            with no tags appear as '(untagged)'."),
+        kv("  node    ", "Group all VMs/CTs running on the same Proxmox node."),
+        d("            Gives a host-rollup: how much of each hypervisor is consumed."),
+        blank(),
+        b("  In grouped Proxmox mode, the bar shows aggregated CPU/mem/disk for the group."),
+        b("  The fair-share overlay shows how load is distributed among VMs in each group."),
+        b("  Node/storage status is always shown in the footer in Proxmox mode."),
         blank(),
         b("  Switching strategy clears the current snapshot and resets the stable order."),
         blank(),
