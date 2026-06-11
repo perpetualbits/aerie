@@ -21,12 +21,6 @@ parts:
   apptop:
     plugin: rust
     source: .
-    build-attributes:
-      - enable-patchelf
-    override-build: |
-      craftenv
-      cargo build --release --locked
-      install -Dm755 target/release/apptop $CRAFT_PART_INSTALL/bin/apptop
 
 apps:
   apptop:
