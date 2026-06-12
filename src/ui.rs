@@ -1654,6 +1654,18 @@ fn manual_lines() -> Vec<Line<'static>> {
     ]
 }
 
+pub fn manual_text() -> String {
+    let lines = manual_lines();
+    let mut out = String::with_capacity(lines.len() * 72);
+    for line in lines {
+        for span in line.spans {
+            out.push_str(&span.content);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -41,6 +41,7 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(
     name = "apptop",
+    version,
     about = "Thread / VM activity bar-chart monitor.\n\
              Local mode (default): reads /proc and groups processes by name.\n\
              Proxmox mode: polls the PVE API and shows per-VM CPU + memory."
@@ -111,6 +112,10 @@ struct Cli {
     /// Without this flag, gpu% and vram always show 0 and fdinfo is never read.
     #[arg(long, default_value_t = false)]
     enable_gpu: bool,
+
+    /// Print the built-in manual and exit
+    #[arg(short = 'm', long)]
+    manual: bool,
 
     /// [EXPERIMENTAL] Monitor Kubernetes pods via kubectl exec.
     /// Accepts NAMESPACE or NAMESPACE/SELECTOR (label selector).
@@ -2031,6 +2036,11 @@ fn run_daemon(interval: Duration) -> Result<()> {
 /// Entry point: parse CLI, enter daemon mode or run the TUI event loop.
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.manual {
+        print!("{}", ui::manual_text());
+        return Ok(());
+    }
 
     if cli.daemon {
         return run_daemon(Duration::from_secs_f64(cli.interval));

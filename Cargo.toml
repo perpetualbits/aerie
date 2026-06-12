@@ -1,6 +1,6 @@
 [package]
 name = "apptop"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Process-group performance monitor with Proxmox VM support and SSH drill-down"
