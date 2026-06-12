@@ -49,6 +49,14 @@ pub struct DaemonSnapshot {
     /// System-level I/O PSI "some avg10" from /proc/pressure/io.
     #[serde(default)]
     pub sys_psi_io: Option<f64>,
+    /// System-wide CPU usage % [0, 100], computed from /proc/stat jiffy deltas.
+    /// None on the first daemon tick (no previous sample for delta yet).
+    #[serde(default)]
+    pub sys_cpu_pct: Option<f64>,
+    /// Bytes of memory currently in use on the remote machine (MemTotal − MemAvailable).
+    /// 0 when unavailable (old daemon version, or parse failure).
+    #[serde(default)]
+    pub sys_mem_used_bytes: u64,
 }
 
 /// SSH host-key checking policy.
@@ -58,6 +66,7 @@ pub struct DaemonSnapshot {
 /// Trust-On-First-Use (TOFU): new host keys are accepted and stored, but changed
 /// keys still cause an error. We never use `StrictHostKeyChecking=no` as that is
 /// a security risk even in private networks.
+#[derive(Clone, Copy)]
 pub enum SshHostKeyPolicy {
     /// StrictHostKeyChecking=yes — host key must be in known_hosts (default).
     Strict,
@@ -260,7 +269,7 @@ pub fn connect_vm(
             tried.push(format!("  {source}  →  port 22 not reachable"));
             continue;
         }
-        match spawn_daemon(host, ssh_user, &policy) {
+        match connect_direct(host, ssh_user, policy) {
             Ok(client) => return Ok(client),
             Err(e) => tried.push(format!("  {source}  →  {e}")),
         }
@@ -302,7 +311,11 @@ pub fn probe_port_22(host: &str) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
 }
 
-/// Spawn an `ssh` subprocess that runs `apptop --daemon` on the remote host.
+/// Connect directly to a remote host and run `apptop --daemon` over SSH.
+///
+/// This is the public, direct-connect variant of the SSH daemon launcher.
+/// It is used both internally by `connect_vm` (which calls it after host discovery)
+/// and by fleet mode, which already knows the hostname and skips guest-agent / DNS.
 ///
 /// SSH options used:
 /// - `BatchMode=yes`: disables password prompts; fails immediately if key auth fails.
@@ -318,7 +331,7 @@ pub fn probe_port_22(host: &str) -> bool {
 ///
 /// On success, a reader thread is spawned that parses JSON lines from the SSH
 /// stdout and forwards `DaemonSnapshot` values over an mpsc channel.
-fn spawn_daemon(host: &str, user: &str, policy: &SshHostKeyPolicy) -> Result<RemoteClient> {
+pub fn connect_direct(host: &str, user: &str, policy: SshHostKeyPolicy) -> Result<RemoteClient> {
     // Validate before constructing any SSH argument.
     validate_ssh_target(user, host)
         .map_err(|e| anyhow!("{e}"))?;
@@ -343,7 +356,8 @@ fn spawn_daemon(host: &str, user: &str, policy: &SshHostKeyPolicy) -> Result<Rem
             "ServerAliveCountMax=2",
             "--",           // prevents user@host from being parsed as an option
             &target,
-            "apptop --daemon",
+            "apptop",
+            "--daemon",
         ])
         .stdin(Stdio::null())   // no input needed from the remote daemon
         .stdout(Stdio::piped()) // we read JSON snapshots from stdout
@@ -384,6 +398,234 @@ fn spawn_daemon(host: &str, user: &str, policy: &SshHostKeyPolicy) -> Result<Rem
     Ok(RemoteClient { child, recv: rx, _thread: thread, host: host.to_string() })
 }
 
+/// Parse one block of /proc/stat + /proc/meminfo output from the thin probe.
+///
+/// A block is the text between two `===` separator lines as produced by the
+/// fixed shell command run by `connect_thin`.
+///
+/// - Parses the `/proc/stat` aggregate `cpu ` line to extract total and idle jiffies.
+/// - Parses `MemTotal` and `MemAvailable` from the meminfo section.
+/// - Computes `sys_cpu_pct` as the delta vs the previous call's values.
+///   On the first call (`prev_total` and `prev_idle` are both `None`) the CPU
+///   percentage cannot be computed yet, so `sys_cpu_pct` is `None`.
+/// - Increments `snap_count` on every call.
+///
+/// Returns `None` when neither a `cpu ` line nor meminfo lines could be parsed
+/// (i.e. the block was empty or malformed).
+fn parse_thin_block(
+    block: &[String],
+    prev_total: &mut Option<u64>,
+    prev_idle: &mut Option<u64>,
+    snap_count: &mut usize,
+) -> Option<DaemonSnapshot> {
+    let mut now_total: Option<u64> = None;
+    let mut now_idle: Option<u64> = None;
+    let mut mem_total_kb: u64 = 0;
+    let mut mem_avail_kb: u64 = 0;
+
+    for line in block {
+        // /proc/stat aggregate CPU line.
+        if line.starts_with("cpu ") {
+            let fields: Vec<u64> = line[3..]
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            let total: u64 = fields.iter().sum();
+            // idle = field[3] (idle) + field[4] (iowait).
+            let idle = fields.get(3).copied().unwrap_or(0)
+                + fields.get(4).copied().unwrap_or(0);
+            now_total = Some(total);
+            now_idle  = Some(idle);
+        } else if line.starts_with("MemTotal:") {
+            mem_total_kb = line.split_whitespace().nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if line.starts_with("MemAvailable:") {
+            mem_avail_kb = line.split_whitespace().nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+
+    // Need at least the cpu line to produce a useful snapshot.
+    let (nt, ni) = (now_total?, now_idle?);
+
+    // Compute CPU% from the delta vs previous sample.
+    let sys_cpu_pct = match (*prev_total, *prev_idle) {
+        (Some(pt), Some(pi)) => {
+            let d_total = nt.saturating_sub(pt) as f64;
+            let d_idle  = ni.saturating_sub(pi) as f64;
+            if d_total > 0.0 {
+                Some(((d_total - d_idle) / d_total * 100.0).clamp(0.0, 100.0))
+            } else {
+                None
+            }
+        }
+        _ => None, // first call: no previous sample
+    };
+
+    *prev_total = Some(nt);
+    *prev_idle  = Some(ni);
+    *snap_count += 1;
+
+    let mem_total_bytes = mem_total_kb * 1024;
+    let mem_avail_bytes = mem_avail_kb * 1024;
+    let sys_mem_used_bytes = mem_total_bytes.saturating_sub(mem_avail_bytes);
+
+    Some(DaemonSnapshot {
+        entries: vec![],
+        total_ram_bytes: mem_total_bytes,
+        snap_count: *snap_count,
+        sys_net_rx_s: 0.0,
+        sys_net_tx_s: 0.0,
+        sys_gpu_pct: None,
+        sys_rapl_w: 0.0,
+        sys_psi_cpu: None,
+        sys_psi_mem: None,
+        sys_psi_io: None,
+        sys_cpu_pct,
+        sys_mem_used_bytes,
+    })
+}
+
+/// Thin SSH probe: runs a fixed `/proc` reader shell command on the remote host.
+///
+/// Unlike `connect_direct` (which requires `apptop` to be installed), `ThinProbe`
+/// only requires `sh`, `cat`, and `sleep` — universally available on Linux.
+///
+/// The fixed command run over SSH is:
+/// ```text
+/// sh -c "while true; do cat /proc/stat /proc/meminfo; echo '==='; sleep 1; done"
+/// ```
+///
+/// The reader thread accumulates lines until it sees a `===` separator, then calls
+/// `parse_thin_block` to extract system-wide CPU% and memory usage.
+/// Only `sys_cpu_pct` and `sys_mem_used_bytes` are populated; `entries` is empty,
+/// so per-process drill-down is not available in thin mode.
+pub struct ThinProbe {
+    /// The spawned `ssh` subprocess.
+    child: Child,
+    /// Channel receiver for decoded `DaemonSnapshot` messages from the reader thread.
+    recv: Receiver<DaemonSnapshot>,
+    /// Reader thread handle. Kept alive via ownership; exits when SSH stdout closes.
+    _thread: JoinHandle<()>,
+    /// The hostname this probe is connected to (as supplied on the command line).
+    #[allow(dead_code)]
+    pub host: String,
+}
+
+impl ThinProbe {
+    /// Non-blocking drain of the snapshot channel.
+    ///
+    /// Returns the most recent `DaemonSnapshot` received since the last call,
+    /// discarding any intermediate ones.  Returns `None` if no new snapshot arrived.
+    pub fn try_recv(&mut self) -> Option<DaemonSnapshot> {
+        let mut latest = None;
+        while let Ok(snap) = self.recv.try_recv() {
+            latest = Some(snap);
+        }
+        latest
+    }
+
+    /// Returns true while the SSH subprocess is still running.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Kill the SSH subprocess and wait for it to exit.
+    #[allow(dead_code)]
+    pub fn close(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Establish a thin `/proc` shell probe to the given host over SSH.
+///
+/// Runs the fixed command:
+/// ```text
+/// sh -c "while true; do cat /proc/stat /proc/meminfo; echo '==='; sleep 1; done"
+/// ```
+/// via SSH with `BatchMode=yes` (key auth only).  No `apptop` binary is required
+/// on the remote machine — only a POSIX shell.
+///
+/// SSH options are identical to `connect_direct`: `BatchMode`, `ConnectTimeout=5`,
+/// `StrictHostKeyChecking` (controlled by `policy`), and keepalive options.
+/// The `--` separator before `user@host` prevents option injection.
+///
+/// The 600 ms fast-fail check detects immediate SSH errors (bad key, host
+/// unreachable) before returning `Ok`.
+pub fn connect_thin(user: &str, host: &str, policy: SshHostKeyPolicy) -> Result<ThinProbe> {
+    validate_ssh_target(user, host)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let strict_value = match policy {
+        SshHostKeyPolicy::Strict    => "StrictHostKeyChecking=yes",
+        SshHostKeyPolicy::AcceptNew => "StrictHostKeyChecking=accept-new",
+    };
+
+    let target = format!("{user}@{host}");
+    // The fixed shell command — NOT user-supplied; no injection risk.
+    let shell_cmd = "while true; do cat /proc/stat /proc/meminfo; echo '==='; sleep 1; done";
+
+    let mut child = Command::new("ssh")
+        .args([
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-o", strict_value,
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=2",
+            "--",           // prevents user@host from being parsed as an SSH option
+            &target,
+            "sh", "-c", shell_cmd,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow!("could not run ssh: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
+    let (tx, rx) = mpsc::channel::<DaemonSnapshot>();
+
+    let thread = std::thread::spawn(move || {
+        let mut block: Vec<String> = Vec::new();
+        let mut prev_total: Option<u64> = None;
+        let mut prev_idle: Option<u64> = None;
+        let mut snap_count: usize = 0;
+
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.trim() == "===" {
+                // Block complete: parse and send snapshot.
+                if let Some(snap) = parse_thin_block(
+                    &block, &mut prev_total, &mut prev_idle, &mut snap_count,
+                ) {
+                    if tx.send(snap).is_err() {
+                        break;
+                    }
+                }
+                block.clear();
+            } else {
+                block.push(line);
+            }
+        }
+    });
+
+    // Fast-fail: if SSH exits in under 600 ms it was an auth or host error.
+    std::thread::sleep(Duration::from_millis(600));
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            return Err(anyhow!(
+                "SSH exited immediately ({status}) — check key auth and SSH connectivity"
+            ));
+        }
+        Err(e) => return Err(anyhow!("process error: {e}")),
+        Ok(None) => {}
+    }
+
+    Ok(ThinProbe { child, recv: rx, _thread: thread, host: host.to_string() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,14 +650,78 @@ mod tests {
             sys_psi_cpu: Some(1.5),
             sys_psi_mem: None,
             sys_psi_io: None,
+            sys_cpu_pct: Some(42.5),
+            sys_mem_used_bytes: 1024 * 1024 * 512,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: DaemonSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.snap_count, 3);
         assert_eq!(back.entries[0].label, "test");
         assert!(back.entries[0].disk_complete);
+        assert_eq!(back.sys_cpu_pct, Some(42.5));
+        assert_eq!(back.sys_mem_used_bytes, 1024 * 1024 * 512);
         // suppress unused import warning
         let _ = default_true();
+    }
+
+    // ── parse_thin_block unit tests ───────────────────────────────────────
+
+    fn make_block(stat_line: &str, mem_total_kb: u64, mem_avail_kb: u64) -> Vec<String> {
+        let mut block = vec![stat_line.to_string()];
+        block.push(format!("MemTotal:     {mem_total_kb} kB"));
+        block.push(format!("MemFree:      0 kB"));
+        block.push(format!("MemAvailable: {mem_avail_kb} kB"));
+        block
+    }
+
+    #[test]
+    fn thin_block_first_call_returns_none_cpu() {
+        // First call with no previous sample: sys_cpu_pct must be None.
+        let block = make_block("cpu  100 0 50 800 50 0 0 0", 8_000_000, 4_000_000);
+        let mut prev_total = None;
+        let mut prev_idle  = None;
+        let mut snap_count = 0;
+        let snap = parse_thin_block(&block, &mut prev_total, &mut prev_idle, &mut snap_count)
+            .expect("should return a snapshot");
+        assert_eq!(snap.sys_cpu_pct, None, "first call must return None for cpu%");
+        assert_eq!(snap_count, 1);
+        // prev values should now be set for the next call.
+        assert!(prev_total.is_some());
+        assert!(prev_idle.is_some());
+    }
+
+    #[test]
+    fn thin_block_second_call_computes_cpu_pct() {
+        // Two successive calls with known jiffy values should produce a correct CPU%.
+        // First block: total=1000, idle=800 (800 idle + 0 iowait).
+        let block1 = make_block("cpu  100 0 100 800 0 0 0 0", 8_000_000, 4_000_000);
+        let mut prev_total = None;
+        let mut prev_idle  = None;
+        let mut snap_count = 0;
+        parse_thin_block(&block1, &mut prev_total, &mut prev_idle, &mut snap_count);
+
+        // Second block: total=2000, idle=1400 (delta total=1000, delta idle=600).
+        // Expected CPU% = (1000 - 600) / 1000 * 100 = 40%.
+        let block2 = make_block("cpu  300 0 300 1400 0 0 0 0", 8_000_000, 4_000_000);
+        let snap = parse_thin_block(&block2, &mut prev_total, &mut prev_idle, &mut snap_count)
+            .expect("should return a snapshot");
+        let cpu = snap.sys_cpu_pct.expect("second call must return Some(cpu%)");
+        assert!((cpu - 40.0).abs() < 0.01, "expected 40.0%, got {cpu}");
+    }
+
+    #[test]
+    fn thin_block_memory_computed_correctly() {
+        // mem_total=8_000_000 kB, mem_avail=3_000_000 kB → used = 5_000_000 * 1024 bytes.
+        let block = make_block("cpu  100 0 50 800 50 0 0 0", 8_000_000, 3_000_000);
+        let mut prev_total = None;
+        let mut prev_idle  = None;
+        let mut snap_count = 0;
+        let snap = parse_thin_block(&block, &mut prev_total, &mut prev_idle, &mut snap_count)
+            .expect("should return a snapshot");
+        let expected_used = (8_000_000u64 - 3_000_000u64) * 1024;
+        assert_eq!(snap.sys_mem_used_bytes, expected_used,
+            "sys_mem_used_bytes should be (total - avail) * 1024");
+        assert_eq!(snap.total_ram_bytes, 8_000_000u64 * 1024);
     }
 
     #[test]

@@ -188,6 +188,64 @@ pub struct SysSample {
     pub at: Instant,
 }
 
+/// Read the system-wide CPU total and idle jiffies from /proc/stat.
+///
+/// /proc/stat aggregate `cpu` line format (space-separated fields after the label):
+///   user  nice  system  idle  iowait  irq  softirq  steal  guest  guest_nice
+///
+/// We return:
+///   - `total_jiffies`: sum of **all** fields on the `cpu ` line.
+///   - `idle_jiffies`: `idle` (field index 3) + `iowait` (field index 4).
+///
+/// The idle + iowait sum represents "non-working time": CPU time not spent executing
+/// user or kernel code.  CPU% over an interval is therefore:
+///
+/// ```text
+///   cpu% = (Δtotal − Δidle) / Δtotal × 100
+/// ```
+///
+/// Two consecutive calls are needed to compute a meaningful percentage (the delta
+/// approach).  The first call just records the baseline; the second call's result
+/// minus the first gives the load over that interval.
+pub fn cpu_total_and_idle() -> Result<(u64, u64)> {
+    let data = fs::read_to_string("/proc/stat")?;
+    let line = data
+        .lines()
+        .find(|l| l.starts_with("cpu "))
+        .ok_or_else(|| anyhow::anyhow!("/proc/stat has no 'cpu ' line"))?;
+    let fields: Vec<u64> = line[3..]
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    let total: u64 = fields.iter().sum();
+    // idle = field[3] (idle) + field[4] (iowait); both represent "not working" time.
+    let idle = fields.get(3).copied().unwrap_or(0)
+        + fields.get(4).copied().unwrap_or(0);
+    Ok((total, idle))
+}
+
+/// Read bytes of memory currently in use from /proc/meminfo.
+///
+/// Returns `MemTotal − MemAvailable` in bytes.  `MemAvailable` (added in Linux 3.14)
+/// is preferred over `MemFree` because it includes reclaimable page-cache and slab
+/// memory — it is the kernel's own estimate of how much memory is truly available
+/// for new allocations without swapping.
+///
+/// Returns 0 on any parse failure (not `Result`); this metric is best-effort and
+/// the UI falls back to a "0 used" display gracefully.
+pub fn mem_available_bytes() -> u64 {
+    let s = match fs::read_to_string("/proc/meminfo") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    s.lines()
+        .find(|l| l.starts_with("MemAvailable:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
 /// Read total physical RAM from /proc/meminfo and return the value in bytes.
 ///
 /// /proc/meminfo format: `MemTotal:   16384000 kB`
@@ -1444,5 +1502,33 @@ Inter-|   Receive                                                |  Transmit
 Inter-|   Receive                                                |  Transmit
  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";
         assert_eq!(parse_net_dev(content), (0, 0));
+    }
+
+    // ── cpu_total_and_idle (pure-parse variant) ───────────────────────────
+
+    /// Parse a /proc/stat-style string for total and idle jiffies (no filesystem access).
+    fn parse_cpu_total_and_idle(content: &str) -> Option<(u64, u64)> {
+        let line = content.lines().find(|l| l.starts_with("cpu "))?;
+        let fields: Vec<u64> = line[3..]
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        let total: u64 = fields.iter().sum();
+        let idle = fields.get(3).copied().unwrap_or(0)
+            + fields.get(4).copied().unwrap_or(0);
+        Some((total, idle))
+    }
+
+    #[test]
+    fn cpu_total_and_idle_parses_fixture() {
+        // /proc/stat fixture: user=100 nice=0 system=50 idle=800 iowait=50 irq=0 softirq=0 steal=0
+        // total = 100+0+50+800+50+0+0+0 = 1000
+        // idle  = idle(800) + iowait(50) = 850
+        let content = "cpu  100 0 50 800 50 0 0 0 0 0\n\
+                       cpu0 50 0 25 400 25 0 0 0 0 0\n\
+                       cpu1 50 0 25 400 25 0 0 0 0 0\n";
+        let (total, idle) = parse_cpu_total_and_idle(content).expect("should parse");
+        assert_eq!(total, 1000, "total jiffies");
+        assert_eq!(idle, 850, "idle + iowait jiffies");
     }
 }

@@ -19,7 +19,7 @@ mod proxmox;
 mod remote;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -84,6 +84,17 @@ struct Cli {
     /// Never passes StrictHostKeyChecking=no.
     #[arg(long, default_value_t = false)]
     ssh_accept_new: bool,
+
+    /// Monitor a fleet of SSH hosts. Accepts a comma-separated list or @/path/to/file.
+    /// Each line/item is a hostname or IP. Requires --enable-remote.
+    #[arg(long)]
+    hosts: Option<String>,
+
+    /// Use a thin /proc shell probe instead of apptop --daemon on fleet hosts.
+    /// Provides CPU% and memory only; works without apptop installed remotely.
+    /// No per-process breakdown or drill-down available in thin mode.
+    #[arg(long)]
+    thin: bool,
 }
 
 /// Metric displayed on one side of the combined meter bar.
@@ -206,6 +217,15 @@ pub enum AppMode {
     Local,
     /// Poll the Proxmox VE REST API at `url` using `token`.
     Proxmox { url: String, token: String, insecure: bool },
+    /// Monitor multiple SSH hosts simultaneously.
+    Fleet {
+        /// Validated hostnames/IPs.
+        hosts: Vec<String>,
+        /// SSH login user.
+        ssh_user: String,
+        /// When true, use thin /proc probe; when false, use apptop --daemon.
+        thin: bool,
+    },
 }
 
 /// Which screen is currently shown.
@@ -508,6 +528,26 @@ pub(crate) struct PvePacket {
     err: Option<String>,
 }
 
+/// Connection type for a fleet member.
+pub enum FleetClient {
+    Daemon(remote::RemoteClient),
+    Thin(remote::ThinProbe),
+}
+
+/// One fleet member connection (daemon or thin probe).
+pub struct FleetConn {
+    /// Hostname exactly as supplied on the command line (validated).
+    pub hostname: String,
+    /// Live connection, or None if connection failed at startup.
+    pub client: Option<FleetClient>,
+    /// Last successful snapshot from this host.
+    pub snap: Option<remote::DaemonSnapshot>,
+    /// Error from the most recent connection attempt (shown in footer).
+    pub err: Option<String>,
+    /// Whether this connection uses thin probe (affects drill-down availability).
+    pub thin: bool,
+}
+
 /// All mutable state owned by the main event loop.
 pub struct AppState {
     pub mode: AppMode,
@@ -630,6 +670,38 @@ pub struct AppState {
     pub sys_psi_mem: Option<f64>,
     /// System-level I/O PSI "some avg10" from /proc/pressure/io.
     pub sys_psi_io: Option<f64>,
+    /// Fleet connections (AppMode::Fleet only). One entry per host in --hosts.
+    pub fleet_clients: Vec<FleetConn>,
+}
+
+/// Parse the --hosts argument into a validated list of hostnames.
+///
+/// Accepts a comma-separated list ("h1,h2,h3") or a file reference ("@/path/to/file").
+/// File format: one host per line; lines starting with '#' or empty lines are skipped.
+/// Each hostname is validated: must not start with '-' (SSH option injection guard).
+fn parse_hosts_arg(arg: &str) -> Result<Vec<String>> {
+    let raw: Vec<String> = if let Some(path) = arg.strip_prefix('@') {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read hosts file: {path}"))?;
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect()
+    } else {
+        arg.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    if raw.is_empty() {
+        anyhow::bail!("--hosts: no hosts found");
+    }
+    for host in &raw {
+        remote::validate_ssh_target("dummy", host).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(raw)
 }
 
 impl AppState {
@@ -641,16 +713,24 @@ impl AppState {
     ///
     /// Returns an error if Proxmox mode is requested but `--token` is missing.
     fn new(cli: &Cli) -> Result<Self> {
-        let mode = match &cli.proxmox {
-            Some(url) => {
-                let token = cli.token.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--token (or PROXMOX_TOKEN env var) is required with --proxmox"
-                    )
-                })?;
-                AppMode::Proxmox { url: url.clone(), token, insecure: cli.insecure }
+        let mode = if let Some(hosts_arg) = &cli.hosts {
+            if !cli.enable_remote {
+                anyhow::bail!("--hosts requires --enable-remote");
             }
-            None => AppMode::Local,
+            let hosts = parse_hosts_arg(hosts_arg)?;
+            let ssh_user = cli.ssh_user.clone().unwrap_or_else(|| {
+                std::env::var("USER").unwrap_or_else(|_| "root".to_string())
+            });
+            AppMode::Fleet { hosts, ssh_user, thin: cli.thin }
+        } else if let Some(url) = &cli.proxmox {
+            let token = cli.token.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--token (or PROXMOX_TOKEN env var) is required with --proxmox"
+                )
+            })?;
+            AppMode::Proxmox { url: url.clone(), token, insecure: cli.insecure }
+        } else {
+            AppMode::Local
         };
 
         // Shared AtomicU8 so the 'g' key can change grouping without restarting
@@ -722,11 +802,59 @@ impl AppState {
 
         let is_local = matches!(mode, AppMode::Local);
         // Fetch total RAM once; it rarely changes and avoids a /proc/meminfo read on every tick.
+        // Both Proxmox and Fleet modes use 0 (memory uses mem_pct / sys_mem_used_bytes instead).
         let total_ram_bytes = if is_local { local::total_ram_bytes() } else { 0 };
         // Default SSH user to the current OS user; "root" as last resort for headless systems.
         let ssh_user = cli.ssh_user.clone().unwrap_or_else(|| {
             std::env::var("USER").unwrap_or_else(|_| "root".to_string())
         });
+
+        // Build fleet connections (Fleet mode only): one connection per host, spawned in parallel.
+        let fleet_clients: Vec<FleetConn> = if let AppMode::Fleet { ref hosts, ref ssh_user, thin } = mode {
+            let accept_new = cli.ssh_accept_new;
+            let (tx, rx) = std::sync::mpsc::channel::<(String, Result<FleetClient>)>();
+            for host in hosts {
+                let tx = tx.clone();
+                let user = ssh_user.clone();
+                let host = host.clone();
+                let is_thin = thin;
+                std::thread::spawn(move || {
+                    let pol = if accept_new {
+                        remote::SshHostKeyPolicy::AcceptNew
+                    } else {
+                        remote::SshHostKeyPolicy::Strict
+                    };
+                    let result: Result<FleetClient> = if is_thin {
+                        remote::connect_thin(&user, &host, pol).map(FleetClient::Thin)
+                    } else {
+                        remote::connect_direct(&host, &user, pol).map(FleetClient::Daemon)
+                    };
+                    let _ = tx.send((host, result));
+                });
+            }
+            drop(tx); // close sender so the receiver loop terminates when all threads finish
+            rx.into_iter().map(|(hostname, result)| {
+                let thin_flag = thin;
+                match result {
+                    Ok(client) => FleetConn {
+                        hostname,
+                        client: Some(client),
+                        snap: None,
+                        err: None,
+                        thin: thin_flag,
+                    },
+                    Err(e) => FleetConn {
+                        hostname,
+                        client: None,
+                        snap: None,
+                        err: Some(e.to_string()),
+                        thin: thin_flag,
+                    },
+                }
+            }).collect()
+        } else {
+            vec![]
+        };
 
         Ok(Self {
             mode,
@@ -782,6 +910,7 @@ impl AppState {
             sys_psi_cpu: None,
             sys_psi_mem: None,
             sys_psi_io: None,
+            fleet_clients,
         })
     }
 
@@ -938,6 +1067,100 @@ impl AppState {
                 self.snap = Some(snap);
                 entries
             })
+        } else if matches!(self.mode, AppMode::Fleet { .. }) {
+            // Poll each fleet member for new snapshots.
+            let hist_metric = match self.active_side {
+                Side::Left => self.left_metric,
+                Side::Right => self.right_metric,
+            };
+            for conn in &mut self.fleet_clients {
+                let new_snap = match &mut conn.client {
+                    Some(FleetClient::Daemon(c)) => c.try_recv(),
+                    Some(FleetClient::Thin(t))   => t.try_recv(),
+                    None => None,
+                };
+                if let Some(snap) = new_snap {
+                    conn.snap = Some(snap);
+                    conn.err = None;
+                }
+                // Mark error if SSH process died.
+                let alive = match &mut conn.client {
+                    Some(FleetClient::Daemon(c)) => c.is_alive(),
+                    Some(FleetClient::Thin(t))   => t.is_alive(),
+                    None => false,
+                };
+                if !alive && conn.client.is_some() {
+                    conn.err = Some("connection lost".into());
+                }
+            }
+            // Build BarEntries: one per fleet member.
+            let raw: Vec<BarEntry> = self.fleet_clients.iter().map(|conn| {
+                let (cpu, mem_pct, mem_used, net_rx, net_tx, count, has_data) =
+                    if let Some(ref snap) = conn.snap {
+                        let cpu = snap.sys_cpu_pct.unwrap_or_else(|| {
+                            // Fallback: sum active process CPU% (daemon without sys_cpu_pct field)
+                            snap.entries.iter().map(|e| e.value).sum::<f64>().min(100.0)
+                        });
+                        let mem_pct = if snap.total_ram_bytes > 0 {
+                            snap.sys_mem_used_bytes as f64 / snap.total_ram_bytes as f64 * 100.0
+                        } else {
+                            0.0
+                        };
+                        (cpu, mem_pct, snap.sys_mem_used_bytes, snap.sys_net_rx_s,
+                         snap.sys_net_tx_s, snap.entries.len(), true)
+                    } else {
+                        (0.0, 0.0, 0, 0.0, 0.0, 0, false)
+                    };
+                let extra = if conn.thin {
+                    "(thin)".into()
+                } else if !has_data {
+                    "connecting…".into()
+                } else {
+                    format!("{count} procs")
+                };
+                BarEntry {
+                    label: conn.hostname.clone(),
+                    value: cpu,
+                    count: Some(count),
+                    extra,
+                    fading: false,
+                    fade_t: 0.0,
+                    rss_bytes: mem_used,
+                    mem_pct,
+                    page_faults_s: 0.0,
+                    disk_read_s: net_rx,   // repurposed: host network rx
+                    disk_write_s: net_tx,  // repurposed: host network tx
+                    ctx_switches_s: 0.0,
+                    open_fds: 0,
+                    swap_bytes: 0,
+                    sched_wait_pct: 0.0,
+                    power_w: 0.0,
+                    disk_complete: true,
+                    status_complete: true,
+                    fds_complete: true,
+                    sched_complete: true,
+                    rss_complete: true,
+                    cfs_throttle_pct: 0.0,
+                    psi_cpu_avg10: 0.0,
+                    psi_mem_avg10: 0.0,
+                    psi_io_avg10: 0.0,
+                    cg_v2_complete: false,
+                }
+            }).collect();
+            // Update MemberSeries: per-host process CPU distribution for the histogram overlay.
+            self.group_member_vals.clear();
+            for conn in &self.fleet_clients {
+                if let Some(ref snap) = conn.snap {
+                    let vals: Vec<f64> = snap.entries.iter().map(|e| e.value).collect();
+                    if !vals.is_empty() {
+                        self.group_member_vals.insert(
+                            conn.hostname.clone(),
+                            MemberSeries { metric: hist_metric, vals },
+                        );
+                    }
+                }
+            }
+            Ok(raw)
         } else {
             // Non-blocking drain of the Proxmox background thread channel.
             // We take the latest packet (skipping any stale intermediate ones)
@@ -1183,6 +1406,9 @@ fn run_daemon(interval: Duration) -> Result<()> {
     let mut snap: Option<local::Snapshot> = None;
     let mut prev_sys: Option<local::SysSample> = None;
     let mut snap_count = 0usize;
+    // Previous /proc/stat jiffy counts for system-wide CPU% delta computation.
+    let mut prev_cpu_total: Option<u64> = None;
+    let mut prev_cpu_idle: Option<u64> = None;
 
     loop {
         let (mut entries, new_snap) = local::sample(snap, &opts, GroupBy::Comm)?;
@@ -1205,6 +1431,31 @@ fn run_daemon(interval: Duration) -> Result<()> {
         };
         prev_sys = Some(new_sys);
 
+        // Compute system-wide CPU% from /proc/stat jiffy deltas.
+        let sys_cpu_pct: Option<f64> = if let Ok((now_total, now_idle)) = local::cpu_total_and_idle() {
+            let result = match (prev_cpu_total, prev_cpu_idle) {
+                (Some(pt), Some(pi)) => {
+                    let d_total = now_total.saturating_sub(pt) as f64;
+                    let d_idle  = now_idle.saturating_sub(pi) as f64;
+                    if d_total > 0.0 {
+                        Some(((d_total - d_idle) / d_total * 100.0).clamp(0.0, 100.0))
+                    } else {
+                        None
+                    }
+                }
+                _ => None, // first iteration: no previous sample yet
+            };
+            prev_cpu_total = Some(now_total);
+            prev_cpu_idle  = Some(now_idle);
+            result
+        } else {
+            None
+        };
+
+        // Compute memory-in-use from MemAvailable.
+        let mem_avail = local::mem_available_bytes();
+        let sys_mem_used_bytes = total_ram_bytes.saturating_sub(mem_avail);
+
         // Distribute RAPL package watts across groups proportionally to CPU share.
         if rapl_w > 0.0 {
             let total_cpu: f64 = entries.iter().map(|e| e.value).sum();
@@ -1226,6 +1477,8 @@ fn run_daemon(interval: Duration) -> Result<()> {
             sys_psi_cpu: psi_cpu,
             sys_psi_mem: psi_mem,
             sys_psi_io: psi_io,
+            sys_cpu_pct,
+            sys_mem_used_bytes,
         };
 
         // Emit the snapshot as a single JSON line, then flush immediately so the
@@ -1397,7 +1650,9 @@ fn main() -> Result<()> {
                             state.group_by = state.group_by.next();
                             // Discard snapshot so the next collect() uses the new strategy.
                             state.snap = None;
-                        } else {
+                            state.stable_order.clear();
+                            state.entries.clear();
+                        } else if matches!(state.mode, AppMode::Proxmox { .. }) {
                             state.pve_group_by = state.pve_group_by.next();
                             // Publish new grouping to the background thread atomically.
                             state.pve_group_by_shared.store(
@@ -1406,9 +1661,10 @@ fn main() -> Result<()> {
                             );
                             // Clear member vals so the overlay doesn't show stale data.
                             state.group_member_vals.clear();
+                            state.stable_order.clear();
+                            state.entries.clear();
                         }
-                        state.stable_order.clear();
-                        state.entries.clear();
+                        // Fleet: no grouping to cycle; ignore silently.
                     }
                     // Cursor navigation: arrow keys (and vim j/k); also manual scroll
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -1485,10 +1741,46 @@ fn main() -> Result<()> {
                             });
                         }
                     }
-                    // Enter: drill down — threads (local), SSH daemon (proxmox)
+                    // Enter: drill down — threads (local), SSH daemon (proxmox/fleet)
                     KeyCode::Enter => {
                         if matches!(state.view, AppView::Groups) {
-                            if let Some(e) = state.entries.get(state.cursor) {
+                            if matches!(state.mode, AppMode::Fleet { .. }) {
+                                // Fleet: drill into the selected host's per-process view.
+                                if let Some(conn) = state.fleet_clients.get(state.cursor) {
+                                    if conn.thin {
+                                        state.error = Some(
+                                            "thin probe mode — no per-process drill-down; remove --thin to enable".into()
+                                        );
+                                    } else if conn.client.is_none() {
+                                        state.error = Some(format!("not connected to {}", conn.hostname));
+                                    } else if !state.enable_remote {
+                                        state.error = Some("remote drill-down disabled — re-run with --enable-remote".into());
+                                    } else {
+                                        let ssh_user = state.ssh_user.clone();
+                                        let host = conn.hostname.clone();
+                                        let policy = if state.ssh_accept_new {
+                                            remote::SshHostKeyPolicy::AcceptNew
+                                        } else {
+                                            remote::SshHostKeyPolicy::Strict
+                                        };
+                                        state.view = AppView::Connecting { label: host.clone() };
+                                        terminal.draw(|f| ui::render(f, &state))?;
+                                        match remote::connect_direct(&host, &ssh_user, policy) {
+                                            Ok(client) => {
+                                                state.remote_client = Some(client);
+                                                state.view = AppView::Remote { label: host };
+                                                state.entries = vec![];
+                                                state.snap_count = 0;
+                                                state.error = None;
+                                            }
+                                            Err(e) => {
+                                                state.view = AppView::Groups;
+                                                state.error = Some(format!("drill-down failed: {e}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(e) = state.entries.get(state.cursor) {
                                 let label = e.label.clone();
                                 if matches!(state.mode, AppMode::Local) {
                                     // Local: open per-thread heat-map view.

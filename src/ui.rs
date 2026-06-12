@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, Metric, PeakVals, Side};
+use crate::{AppMode, AppState, AppView, BarEntry, FleetConn, Metric, PeakVals, Side};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -72,6 +72,13 @@ fn metric_selector_line(state: &AppState) -> Line<'static> {
         } else if matches!(state.mode, AppMode::Proxmox { .. }) {
             spans.push(Span::styled(
                 format!("  [{}]", state.pve_group_by.name()),
+                dim_style,
+            ));
+        } else if matches!(state.mode, AppMode::Fleet { .. }) {
+            let connected = state.fleet_clients.iter().filter(|c| c.snap.is_some()).count();
+            let total = state.fleet_clients.len();
+            spans.push(Span::styled(
+                format!("  [{connected}/{total} hosts]"),
                 dim_style,
             ));
         }
@@ -994,6 +1001,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let mode_label = match &state.mode {
         AppMode::Local => "local /proc".to_string(),
         AppMode::Proxmox { url, .. } => format!("proxmox {url}"),
+        AppMode::Fleet { .. } => "fleet".to_string(),
     };
     let interval_s = state.interval.as_secs_f64();
     // Format the interval: "0.50" for sub-second, "2" for whole seconds, "1.5" for fractions.
@@ -1081,8 +1089,22 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
                 String::new()
             };
 
-            // System metrics: local /proc data in local mode; node/storage summary in Proxmox mode.
-            let sys_parts = if matches!(state.mode, AppMode::Local) {
+            // System metrics: local /proc data in local mode; node/storage summary in Proxmox mode;
+            // connected host count in Fleet mode.
+            let sys_parts = if matches!(state.mode, AppMode::Fleet { .. }) {
+                let total = state.fleet_clients.len();
+                let connected = state.fleet_clients.iter().filter(|c: &&FleetConn| c.snap.is_some()).count();
+                let errors = state.fleet_clients.iter().filter(|c: &&FleetConn| c.err.is_some() && c.client.is_some()).count();
+                let thin_count = state.fleet_clients.iter().filter(|c: &&FleetConn| c.thin).count();
+                let mut s = format!("  │  {connected}/{total} hosts connected");
+                if thin_count > 0 {
+                    s.push_str(&format!("  │  {thin_count} thin"));
+                }
+                if errors > 0 {
+                    s.push_str(&format!("  │  {errors} disconnected"));
+                }
+                s
+            } else if matches!(state.mode, AppMode::Local) {
                 sys_metrics(state)
             } else {
                 // Append per-node CPU/mem and per-storage fill to the Proxmox status line.
@@ -1106,7 +1128,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 
             let enter_hint = if matches!(state.mode, AppMode::Local) {
                 "[Enter] threads"
-            } else if state.enable_remote {
+            } else if matches!(state.mode, AppMode::Fleet { .. }) || state.enable_remote {
                 "[Enter] drill down"
             } else {
                 ""
@@ -1400,6 +1422,27 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("  (CPU, disk I/O, page faults, context switches, power) are zeroed during"),
         b("  the fade.  Static metrics (fds, swap, threads) retain their last value."),
         b("  The row is removed once the 5-second retention window expires."),
+        blank(),
+        // ── Fleet mode ────────────────────────────────────────────────────────
+        h("FLEET MODE  (--enable-remote --hosts h1,h2,h3)"),
+        b("  Monitor multiple SSH hosts simultaneously. Each host appears as one row;"),
+        b("  the bar shows the host's system-wide CPU% and memory."),
+        blank(),
+        b("  The distribution-heat overlay ([h]) on any host row shows the process"),
+        b("  distribution within that host — which processes are driving load."),
+        blank(),
+        b("  [Enter] drills into the selected host's per-process view (daemon mode only)."),
+        blank(),
+        kv("  --hosts h1,h2,h3  ", "comma-separated list of hostnames or IPs"),
+        kv("  --hosts @/file    ", "read one host per line from a file (# = comment)"),
+        kv("  --thin            ", "use a minimal /proc shell probe instead of apptop --daemon;"),
+        d("                       provides CPU% and memory only; no drill-down"),
+        blank(),
+        b("  The disk-r / disk-w metrics show system-wide network rx/tx bytes/s in fleet mode."),
+        blank(),
+        b("  Hosts must be accessible via SSH. Key auth required (BatchMode=yes)."),
+        b("  Use --ssh-accept-new for first-time TOFU connection; always validates host keys."),
+        b("  For daemon mode, apptop must be installed and in PATH on each host."),
         blank(),
         // ── GroupBy ───────────────────────────────────────────────────────────
         h("GROUPING STRATEGY  [g]"),
