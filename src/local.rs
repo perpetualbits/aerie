@@ -100,12 +100,12 @@ pub struct GroupData {
     pub cg_nr_throttled: u64,
     /// Current memory use from memory.current (bytes). 0 = unread.
     pub cg_memory: u64,
-    /// PSI "some avg10" from cpu.pressure [0.0, 100.0]. 0.0 = unread/absent.
-    pub cg_psi_cpu: f64,
-    /// PSI "some avg10" from memory.pressure.
-    pub cg_psi_mem: f64,
-    /// PSI "some avg10" from io.pressure.
-    pub cg_psi_io: f64,
+    /// PSI "some avg10" from cpu.pressure [0.0, 100.0]. None = unread/absent.
+    pub cg_psi_cpu: Option<f64>,
+    /// PSI "some avg10" from memory.pressure. None = unread/absent.
+    pub cg_psi_mem: Option<f64>,
+    /// PSI "some avg10" from io.pressure. None = unread/absent.
+    pub cg_psi_io: Option<f64>,
     /// True when cgroup v2 files were successfully read in the last sample pass.
     /// Drives `cg_v2_complete` on BarEntry to distinguish "no throttle/stall" from
     /// "cgroup v2 data unavailable".
@@ -456,12 +456,12 @@ fn read_pid_gpu_fdinfo(pid: u32) -> HashMap<String, (u64, u64)> {
         for line in text.lines() {
             if line.starts_with("drm-pdev:") {
                 // Format: "drm-pdev:\t0000:00:02.0"
-                if let Some(val_part) = line.splitn(2, ':').nth(1) {
+                if let Some(val_part) = line.split_once(':').map(|x| x.1) {
                     pci_addr = val_part.trim().to_string();
                 }
             } else if line.starts_with("drm-engine-") {
                 // Format: "drm-engine-gfx:   14523000 ns"
-                if let Some(val_part) = line.splitn(2, ':').nth(1) {
+                if let Some(val_part) = line.split_once(':').map(|x| x.1) {
                     let ns: u64 = val_part.split_whitespace()
                         .next()
                         .and_then(|s| s.parse().ok())
@@ -470,7 +470,7 @@ fn read_pid_gpu_fdinfo(pid: u32) -> HashMap<String, (u64, u64)> {
                 }
             } else if line.starts_with("drm-memory-vram:") {
                 // Format: "drm-memory-vram:   104857600 B"
-                if let Some(val_part) = line.splitn(2, ':').nth(1) {
+                if let Some(val_part) = line.split_once(':').map(|x| x.1) {
                     let b: u64 = val_part.split_whitespace()
                         .next()
                         .and_then(|s| s.parse().ok())
@@ -1030,9 +1030,9 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
             // memory.current: instantaneous, no delta needed.
             g.cg_memory = read_cg_memory_current(&path).unwrap_or(0);
             // PSI avg10: already a rolling average — read directly.
-            g.cg_psi_cpu = read_cg_psi(&path, "cpu").unwrap_or(0.0);
-            g.cg_psi_mem = read_cg_psi(&path, "memory").unwrap_or(0.0);
-            g.cg_psi_io  = read_cg_psi(&path, "io").unwrap_or(0.0);
+            g.cg_psi_cpu = read_cg_psi(&path, "cpu");
+            g.cg_psi_mem = read_cg_psi(&path, "memory");
+            g.cg_psi_io  = read_cg_psi(&path, "io");
             // Mark this group as having valid cgroup v2 data.
             g.cg_data_ok = true;
         }

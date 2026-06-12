@@ -1,1 +1,16 @@
-# Run 'makepkg --printsrcinfo > .SRCINFO' to regenerate
+pkgbase = apptop
+	pkgdesc = Process-group performance monitor with Proxmox VM support and SSH drill-down
+	pkgver = 1.0.3
+	pkgrel = 1
+	url = https://github.com/perpetualbits/apptop
+	arch = x86_64
+	arch = aarch64
+	arch = riscv64
+	license = GPL3
+	makedepends = rust
+	makedepends = cargo
+	options = !lto
+	source = apptop-1.0.3.tar.gz::https://github.com/perpetualbits/apptop/archive/refs/tags/v1.0.3.tar.gz
+	sha256sums = SKIP
+
+pkgname = apptop

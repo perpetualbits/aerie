@@ -556,16 +556,17 @@ pub struct BarEntry {
     #[serde(default)]
     pub cfs_throttle_pct: f64,
     /// CPU PSI "some avg10" [0, 100] from cgroup cpu.pressure.
+    /// None when the pressure file was absent or unreadable (unknown, not zero pressure).
     #[serde(default)]
-    pub psi_cpu_avg10: f64,
-    /// Memory PSI "some avg10" from cgroup memory.pressure.
+    pub psi_cpu_avg10: Option<f64>,
+    /// Memory PSI "some avg10" from cgroup memory.pressure. None = unread.
     #[serde(default)]
-    pub psi_mem_avg10: f64,
-    /// I/O PSI "some avg10" from cgroup io.pressure.
+    pub psi_mem_avg10: Option<f64>,
+    /// I/O PSI "some avg10" from cgroup io.pressure. None = unread.
     #[serde(default)]
-    pub psi_io_avg10: f64,
+    pub psi_io_avg10: Option<f64>,
     /// True when cgroup v2 accounting files were successfully read for this group.
-    /// When false, cfs_throttle_pct and psi_* are 0.0 and should be shown as `?`.
+    /// When false, cfs_throttle_pct should be shown as `?`.
     #[serde(default)]
     pub cg_v2_complete: bool,
     /// GPU engine time % (delta drm-engine-* ns / elapsed ns × 100).
@@ -656,9 +657,9 @@ pub fn metric_sort_val(e: &BarEntry, m: Metric, total_ram: u64) -> f64 {
         Metric::SchedWait => e.sched_wait_pct,
         Metric::Power => e.power_w,
         Metric::CfsThrottle => e.cfs_throttle_pct,
-        Metric::PsiCpu => e.psi_cpu_avg10,
-        Metric::PsiMem => e.psi_mem_avg10,
-        Metric::PsiIo => e.psi_io_avg10,
+        Metric::PsiCpu => e.psi_cpu_avg10.unwrap_or(0.0),
+        Metric::PsiMem => e.psi_mem_avg10.unwrap_or(0.0),
+        Metric::PsiIo => e.psi_io_avg10.unwrap_or(0.0),
         Metric::GpuPct => e.gpu_pct,
         Metric::Vram => e.gpu_vram_bytes as f64,
     }
@@ -1444,7 +1445,7 @@ impl AppState {
                 if !nvidia_data.is_empty() {
                     let is_nvidia_selected = self.selected_gpu > 0
                         && self.gpu_devices.get(self.selected_gpu - 1)
-                            .map_or(false, |d| d.driver == "nvidia");
+                            .is_some_and(|d| d.driver == "nvidia");
                     let show_nvidia = self.selected_gpu == 0 || is_nvidia_selected;
 
                     if show_nvidia {
@@ -1551,9 +1552,9 @@ impl AppState {
                     sched_complete: true,
                     rss_complete: true,
                     cfs_throttle_pct: 0.0,
-                    psi_cpu_avg10: 0.0,
-                    psi_mem_avg10: 0.0,
-                    psi_io_avg10: 0.0,
+                    psi_cpu_avg10: None,
+                    psi_mem_avg10: None,
+                    psi_io_avg10: None,
                     cg_v2_complete: false,
                     gpu_pct: 0.0,
                     gpu_vram_bytes: 0,
@@ -1646,9 +1647,9 @@ impl AppState {
                     sched_complete: true,
                     rss_complete: true,
                     cfs_throttle_pct: 0.0,
-                    psi_cpu_avg10: 0.0,
-                    psi_mem_avg10: 0.0,
-                    psi_io_avg10: 0.0,
+                    psi_cpu_avg10: None,
+                    psi_mem_avg10: None,
+                    psi_io_avg10: None,
                     cg_v2_complete: false,
                     gpu_pct: 0.0,
                     gpu_vram_bytes: 0,
@@ -1980,7 +1981,7 @@ impl AppState {
                 Some(ps) => {
                     !ps.alerting
                         || ps.last_alert_at
-                            .map_or(true, |t| t.elapsed().as_secs() >= ALERT_RATE_LIMIT_S)
+                            .is_none_or(|t| t.elapsed().as_secs() >= ALERT_RATE_LIMIT_S)
                 }
             };
 
@@ -2530,21 +2531,19 @@ fn main() -> Result<()> {
                         }
                     }
                     // Cycle GPU device selection ([ = previous, ] = next)
-                    KeyCode::Char('[') => {
-                        if state.gpu_enabled && !state.gpu_devices.is_empty() {
-                            let n = state.gpu_devices.len() + 1; // 0=all, 1..=N=specific
-                            state.selected_gpu = if state.selected_gpu == 0 {
-                                n - 1
-                            } else {
-                                state.selected_gpu - 1
-                            };
-                        }
+                    KeyCode::Char('[')
+                        if state.gpu_enabled && !state.gpu_devices.is_empty() => {
+                        let n = state.gpu_devices.len() + 1; // 0=all, 1..=N=specific
+                        state.selected_gpu = if state.selected_gpu == 0 {
+                            n - 1
+                        } else {
+                            state.selected_gpu - 1
+                        };
                     }
-                    KeyCode::Char(']') => {
-                        if state.gpu_enabled && !state.gpu_devices.is_empty() {
-                            let n = state.gpu_devices.len() + 1;
-                            state.selected_gpu = (state.selected_gpu + 1) % n;
-                        }
+                    KeyCode::Char(']')
+                        if state.gpu_enabled && !state.gpu_devices.is_empty() => {
+                        let n = state.gpu_devices.len() + 1;
+                        state.selected_gpu = (state.selected_gpu + 1) % n;
                     }
                     // Toggle pause/scrub mode for the replay ring buffer.
                     KeyCode::Char('p')

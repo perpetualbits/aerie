@@ -1,6 +1,6 @@
 # Maintainer: Epsilon Null Operation <perpetualbits@gmail.com>
 pkgname=apptop
-pkgver=0.1.0
+pkgver=1.0.3
 pkgrel=1
 pkgdesc="Process-group performance monitor with Proxmox VM support and SSH drill-down"
 arch=('x86_64' 'aarch64' 'riscv64')

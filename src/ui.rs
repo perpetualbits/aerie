@@ -519,7 +519,12 @@ fn entry_complete(e: &BarEntry, m: Metric) -> bool {
         Metric::OpenFds => e.fds_complete,
         Metric::SchedWait => e.sched_complete,
         Metric::Memory => e.rss_complete,
-        Metric::CfsThrottle | Metric::PsiCpu | Metric::PsiMem | Metric::PsiIo => e.cg_v2_complete,
+        Metric::CfsThrottle => e.cg_v2_complete,
+        // PSI completeness is per-field: the pressure controller may be absent even
+        // when other cgroup v2 files are readable, so each field carries its own Option.
+        Metric::PsiCpu => e.psi_cpu_avg10.is_some(),
+        Metric::PsiMem => e.psi_mem_avg10.is_some(),
+        Metric::PsiIo  => e.psi_io_avg10.is_some(),
         Metric::GpuPct | Metric::Vram => true,
         // GPU metrics show 0.0 when --enable-gpu is off or no GPU fds; never show '?'
         // because 0 is accurate (the process genuinely has no GPU allocation/time).
@@ -558,9 +563,9 @@ fn metric_display_str(e: &BarEntry, m: Metric, total_ram: u64) -> String {
         // Power is an estimate derived from RAPL; the ≈ prefix makes this explicit.
         Metric::Power => format!("≈{}", fmt_watts(e.power_w)),
         Metric::CfsThrottle => format!("{:.1}%", e.cfs_throttle_pct),
-        Metric::PsiCpu => format!("{:.1}%", e.psi_cpu_avg10),
-        Metric::PsiMem => format!("{:.1}%", e.psi_mem_avg10),
-        Metric::PsiIo => format!("{:.1}%", e.psi_io_avg10),
+        Metric::PsiCpu => e.psi_cpu_avg10.map_or("-.-%".into(), |v| format!("{v:.1}%")),
+        Metric::PsiMem => e.psi_mem_avg10.map_or("-.-%".into(), |v| format!("{v:.1}%")),
+        Metric::PsiIo  => e.psi_io_avg10 .map_or("-.-%".into(), |v| format!("{v:.1}%")),
         Metric::GpuPct => format!("{:.1}%", e.gpu_pct),
         Metric::Vram   => human_bytes(e.gpu_vram_bytes),
     };
@@ -611,9 +616,11 @@ fn metric_frac(e: &BarEntry, m: Metric, total_ram: u64, peaks: &PeakVals) -> f64
         Metric::Power       => log2_frac(e.power_w,                   peaks.power_w),
         // CFS throttle and PSI: linear 0–100%.
         Metric::CfsThrottle => e.cfs_throttle_pct / 100.0,
-        Metric::PsiCpu      => e.psi_cpu_avg10    / 100.0,
-        Metric::PsiMem      => e.psi_mem_avg10    / 100.0,
-        Metric::PsiIo       => e.psi_io_avg10     / 100.0,
+        // PSI: linear 0–100%. unwrap_or(0.0) is safe because entry_complete()
+        // returns false for None, causing the bar to be rendered dimmed anyway.
+        Metric::PsiCpu      => e.psi_cpu_avg10.unwrap_or(0.0) / 100.0,
+        Metric::PsiMem      => e.psi_mem_avg10.unwrap_or(0.0) / 100.0,
+        Metric::PsiIo       => e.psi_io_avg10 .unwrap_or(0.0) / 100.0,
         // GpuPct can theoretically exceed 100% on multi-engine GPUs; cap bar at 1.0.
         Metric::GpuPct      => (e.gpu_pct / 100.0).clamp(0.0, 1.0),
         Metric::Vram        => if peaks.gpu_vram_bytes > 0.0 { e.gpu_vram_bytes as f64 / peaks.gpu_vram_bytes } else { 0.0 },
@@ -758,7 +765,7 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
 
             // Check anomaly state for this entry.
             let anomaly = state.anomaly_states.get(&e.label);
-            let is_anomaly = anomaly.map_or(false, |s: &AnomalyState| s.alerting);
+            let is_anomaly = anomaly.is_some_and(|s: &AnomalyState| s.alerting);
 
             let label_style = if is_selected {
                 // Selected row: black text on cyan background for high contrast.
