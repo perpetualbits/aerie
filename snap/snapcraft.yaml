@@ -1,5 +1,5 @@
 name: apptop
-version: '0.1.0'
+version: '1.0.0'
 summary: Process-group performance monitor with Proxmox VM support
 description: |
   apptop monitors Linux process groups by reading /proc, displaying a
