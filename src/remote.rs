@@ -540,6 +540,141 @@ impl ThinProbe {
     }
 }
 
+/// Validate a pod name, namespace, or context for use as a `kubectl exec` argument.
+///
+/// Kubernetes naming rules require pod and namespace names to start with an alphanumeric
+/// character, which prevents leading-dash option injection into kubectl. Context names
+/// follow a similar convention. We also reject control characters as defence-in-depth;
+/// kubectl receives these as positional arguments (not shell-expanded), but clean inputs
+/// are always safer.
+///
+/// Returns `Ok(())` when the name is acceptable, or an error with a diagnostic message.
+pub fn validate_kube_target(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("kubectl {kind}: name is empty");
+    }
+    if name.starts_with('-') {
+        anyhow::bail!(
+            "kubectl {kind}: name {:?} starts with '-' (option injection guard)", name
+        );
+    }
+    if name.chars().any(|c| c.is_control()) {
+        anyhow::bail!("kubectl {kind}: name {:?} contains control characters", name);
+    }
+    Ok(())
+}
+
+/// Connect to a Kubernetes pod via `kubectl exec` and run `apptop --daemon`.
+///
+/// The command spawned is:
+/// ```text
+/// kubectl exec POD -n NAMESPACE [--context CTX] -- apptop --daemon
+/// ```
+/// Pod and namespace are passed as separate positional arguments (never concatenated
+/// into a shell string) to prevent option injection even for unusual pod names.
+/// The `--` separator ensures the subsequent tokens are never parsed as kubectl flags.
+///
+/// The 600 ms fast-fail check detects immediate failures: pod not found, RBAC denied,
+/// or `apptop` not installed in the container image. Returns a `RemoteClient` that
+/// reads JSON `DaemonSnapshot` lines from the kubectl stdout, identical to the SSH-based
+/// `connect_direct`.
+pub fn connect_kube_daemon(pod: &str, namespace: &str, context: Option<&str>) -> Result<RemoteClient> {
+    validate_kube_target("pod", pod)?;
+    validate_kube_target("namespace", namespace)?;
+    if let Some(ctx) = context { validate_kube_target("context", ctx)?; }
+
+    let mut args: Vec<&str> = vec!["exec", pod, "-n", namespace];
+    if let Some(ctx) = context { args.push("--context"); args.push(ctx); }
+    args.extend_from_slice(&["--", "apptop", "--daemon"]);
+
+    let mut child = Command::new("kubectl")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow!("could not run kubectl: {e} — is kubectl in PATH?"))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(snap) = serde_json::from_str::<DaemonSnapshot>(&line) {
+                if tx.send(snap).is_err() { break; }
+            }
+        }
+    });
+
+    // Allow 600 ms for kubectl to fail fast (pod not found, RBAC error, apptop absent).
+    std::thread::sleep(Duration::from_millis(600));
+    match child.try_wait() {
+        Ok(Some(status)) => Err(anyhow!(
+            "kubectl exec exited immediately ({status}) — check RBAC and that apptop is in the container image"
+        )),
+        Err(e) => Err(anyhow!("process error: {e}")),
+        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: pod.to_string() }),
+    }
+}
+
+/// Establish a thin `/proc` shell probe to a Kubernetes pod via `kubectl exec`.
+///
+/// Runs the same fixed `/proc` reader command as the SSH `connect_thin`, but using
+/// `kubectl exec` as the transport. Only `sh`, `cat`, `printf`, and `sleep` are
+/// required inside the container image; no `apptop` binary is needed.
+///
+/// Command run inside the pod:
+/// ```text
+/// sh -c "while true; do cat /proc/stat /proc/meminfo; printf '===\n'; sleep 1; done"
+/// ```
+/// This is the same line-protocol as `connect_thin`; `parse_thin_block` processes it.
+pub fn connect_kube_thin(pod: &str, namespace: &str, context: Option<&str>) -> Result<ThinProbe> {
+    validate_kube_target("pod", pod)?;
+    validate_kube_target("namespace", namespace)?;
+    if let Some(ctx) = context { validate_kube_target("context", ctx)?; }
+
+    let mut args: Vec<&str> = vec!["exec", pod, "-n", namespace];
+    if let Some(ctx) = context { args.push("--context"); args.push(ctx); }
+    // Fixed shell command — not user-supplied; no injection risk.
+    let shell_cmd = "while true; do cat /proc/stat /proc/meminfo; printf '===\\n'; sleep 1; done";
+    args.extend_from_slice(&["--", "sh", "-c", shell_cmd]);
+
+    let mut child = Command::new("kubectl")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow!("could not run kubectl: {e} — is kubectl in PATH?"))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
+    let (tx, rx) = mpsc::channel::<DaemonSnapshot>();
+    let thread = std::thread::spawn(move || {
+        let mut block: Vec<String> = Vec::new();
+        let mut prev_total: Option<u64> = None;
+        let mut prev_idle:  Option<u64> = None;
+        let mut snap_count: usize = 0;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.trim() == "===" {
+                if let Some(snap) = parse_thin_block(&block, &mut prev_total, &mut prev_idle, &mut snap_count) {
+                    if tx.send(snap).is_err() { break; }
+                }
+                block.clear();
+            } else {
+                block.push(line);
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(600));
+    match child.try_wait() {
+        Ok(Some(status)) => Err(anyhow!(
+            "kubectl exec exited immediately ({status}) — check RBAC and pod accessibility"
+        )),
+        Err(e) => Err(anyhow!("process error: {e}")),
+        Ok(None) => Ok(ThinProbe { child, recv: rx, _thread: thread, host: pod.to_string() }),
+    }
+}
+
 /// Establish a thin `/proc` shell probe to the given host over SSH.
 ///
 /// Runs the fixed command:
@@ -812,5 +947,25 @@ mod tests {
     fn gating_predicate() {
         assert!(!remote_enabled_for_vm(false));
         assert!(remote_enabled_for_vm(true));
+    }
+
+    #[test]
+    fn validate_kube_target_rejects_dash_prefix() {
+        assert!(validate_kube_target("pod", "-exploit").is_err());
+        assert!(validate_kube_target("namespace", "-admin").is_err());
+        assert!(validate_kube_target("context", "-flag").is_err());
+    }
+
+    #[test]
+    fn validate_kube_target_rejects_empty() {
+        assert!(validate_kube_target("pod", "").is_err());
+    }
+
+    #[test]
+    fn validate_kube_target_accepts_valid_names() {
+        assert!(validate_kube_target("pod", "nginx-abc12-xyz99").is_ok());
+        assert!(validate_kube_target("namespace", "monitoring").is_ok());
+        assert!(validate_kube_target("context", "prod-cluster").is_ok());
+        assert!(validate_kube_target("selector", "app=prometheus").is_ok());
     }
 }

@@ -111,6 +111,25 @@ struct Cli {
     /// Without this flag, gpu% and vram always show 0 and fdinfo is never read.
     #[arg(long, default_value_t = false)]
     enable_gpu: bool,
+
+    /// [EXPERIMENTAL] Monitor Kubernetes pods via kubectl exec.
+    /// Accepts NAMESPACE or NAMESPACE/SELECTOR (label selector).
+    /// Examples: --kube default   --kube monitoring/app=prometheus
+    /// Requires kubectl in PATH and RBAC permission to exec into pods.
+    #[arg(long)]
+    kube: Option<String>,
+
+    /// kubectl context name from kubeconfig (default: current context).
+    /// Used with --kube.
+    #[arg(long)]
+    kube_context: Option<String>,
+
+    /// Use a thin /proc shell probe instead of apptop --daemon in the pod.
+    /// Works without apptop installed in the container image; provides CPU%
+    /// and memory only — no per-process breakdown or drill-down.
+    /// Used with --kube.
+    #[arg(long)]
+    kube_thin: bool,
 }
 
 /// Metric displayed on one side of the combined meter bar.
@@ -251,6 +270,18 @@ pub enum AppMode {
         /// SSH login user.
         ssh_user: String,
         /// When true, use thin /proc probe; when false, use apptop --daemon.
+        thin: bool,
+    },
+    /// Monitor Kubernetes pods via `kubectl exec`.
+    /// Experimental — requires kubectl in PATH and appropriate RBAC.
+    Kube {
+        /// Kubernetes namespace to query.
+        namespace: String,
+        /// Optional label selector (e.g. "app=nginx"). None = all pods in namespace.
+        selector: Option<String>,
+        /// kubectl context name from kubeconfig. None = current context.
+        context: Option<String>,
+        /// When true, use thin /proc shell probe; when false, use apptop --daemon.
         thin: bool,
     },
 }
@@ -661,6 +692,28 @@ pub struct FleetConn {
     pub thin: bool,
 }
 
+/// One Kubernetes pod connection in --kube mode.
+///
+/// Analogous to `FleetConn` but keyed by pod name. The `app_label` field groups
+/// pods by their workload (Deployment, DaemonSet, etc.) for the fair-share histogram
+/// overlay — so you can see whether a Deployment's replicas share the load evenly.
+pub struct KubeConn {
+    /// Pod name — used as the BarEntry label and as the kubectl exec target.
+    pub pod_name: String,
+    /// Workload/app label for histogram overlay grouping.
+    /// From the pod's `app` or `app.kubernetes.io/name` label; derived from the
+    /// pod name as a heuristic fallback when neither label is present.
+    pub app_label: String,
+    /// Active kubectl exec connection, or None if connection failed at startup.
+    pub client: Option<FleetClient>,
+    /// Most recent snapshot received from this pod.
+    pub snap: Option<remote::DaemonSnapshot>,
+    /// Error from the most recent connection attempt (shown in the footer).
+    pub err: Option<String>,
+    /// Whether this connection uses the thin /proc shell probe.
+    pub thin: bool,
+}
+
 /// All mutable state owned by the main event loop.
 pub struct AppState {
     pub mode: AppMode,
@@ -785,6 +838,8 @@ pub struct AppState {
     pub sys_psi_io: Option<f64>,
     /// Fleet connections (AppMode::Fleet only). One entry per host in --hosts.
     pub fleet_clients: Vec<FleetConn>,
+    /// Kubernetes pod connections (AppMode::Kube only). One entry per discovered pod.
+    pub kube_conns: Vec<KubeConn>,
     /// Ring buffer of recent snapshots for replay. Oldest at front, newest at back.
     pub history: std::collections::VecDeque<HistoryEntry>,
     /// Maximum history entries kept (from --history-depth, default 120).
@@ -829,6 +884,97 @@ fn parse_hosts_arg(arg: &str) -> Result<Vec<String>> {
     Ok(raw)
 }
 
+/// Parse the --kube argument into a (namespace, optional_selector) pair.
+///
+/// Format: "NAMESPACE" or "NAMESPACE/SELECTOR" where SELECTOR is a kubectl
+/// label selector (e.g. "app=nginx", "tier=frontend,env=prod").
+/// Both parts are validated for option-injection safety before returning.
+fn parse_kube_arg(arg: &str) -> Result<(String, Option<String>)> {
+    let (ns, sel) = match arg.split_once('/') {
+        Some((ns, sel)) => (ns.trim().to_string(), Some(sel.trim().to_string())),
+        None => (arg.trim().to_string(), None),
+    };
+    remote::validate_kube_target("namespace", &ns)?;
+    if let Some(ref s) = sel {
+        remote::validate_kube_target("selector", s)?;
+    }
+    Ok((ns, sel))
+}
+
+/// Derive a workload label from a pod name by stripping ReplicaSet/Pod hash suffixes.
+///
+/// Kubernetes appends hash segments to pods managed by Deployments and DaemonSets.
+/// We strip trailing segments that are ≥ 5 characters and entirely alphanumeric
+/// (the heuristic for a k8s-generated hash), up to a maximum of two segments.
+///
+/// Examples:
+///   "nginx-deployment-7d6fb9f9-xl5gr" → "nginx-deployment"  (2 hash segments)
+///   "fluentd-ds-abc12"                → "fluentd-ds"         (1 hash segment)
+///   "my-pod"                          → "my-pod"             (no hash suffix)
+///
+/// Falls back to the full pod name when no hash-like suffix is detected.
+/// This is a heuristic; the `app` label (when present) is always preferred.
+fn derive_app_label(pod_name: &str) -> String {
+    let parts: Vec<&str> = pod_name.split('-').collect();
+    let is_hash = |s: &&str| s.len() >= 5 && s.chars().all(|c| c.is_ascii_alphanumeric());
+    let mut end = parts.len();
+    for _ in 0..2 {
+        if end > 1 && is_hash(&parts[end - 1]) { end -= 1; } else { break; }
+    }
+    if end == 0 { return pod_name.to_string(); }
+    parts[..end].join("-")
+}
+
+/// Discover pods in a Kubernetes namespace via `kubectl get pods -o json`.
+///
+/// Returns a Vec of `(pod_name, app_label)` pairs. The `app_label` is used to
+/// group pods of the same Deployment in the fair-share histogram overlay.
+///
+/// Label resolution order:
+/// 1. `app` label (most common for Deployments)
+/// 2. `app.kubernetes.io/name` label (CNCF recommended standard)
+/// 3. Derived from pod name by stripping trailing hash segments (heuristic)
+///
+/// Uses `serde_json` (already a dependency) to parse the kubectl JSON output.
+fn discover_pods(
+    namespace: &str,
+    selector: Option<&str>,
+    context: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let mut cmd = std::process::Command::new("kubectl");
+    cmd.arg("get").arg("pods");
+    cmd.arg("-n").arg(namespace);
+    if let Some(sel) = selector { cmd.arg("-l").arg(sel); }
+    if let Some(ctx) = context { cmd.arg("--context").arg(ctx); }
+    cmd.arg("-o").arg("json");
+
+    let output = cmd.output()
+        .context("kubectl get pods failed — is kubectl in PATH?")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "kubectl get pods: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("kubectl get pods: invalid JSON response")?;
+    let items = v["items"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("kubectl get pods: response missing 'items' field"))?;
+
+    let pods = items.iter().filter_map(|item| {
+        let name = item["metadata"]["name"].as_str()?.to_string();
+        if name.is_empty() { return None; }
+        // Prefer explicit `app` label, then the CNCF-standard name label, then heuristic.
+        let labels = &item["metadata"]["labels"];
+        let app_label = labels["app"].as_str()
+            .or_else(|| labels["app.kubernetes.io/name"].as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| derive_app_label(&name));
+        Some((name, app_label))
+    }).collect();
+    Ok(pods)
+}
+
 impl AppState {
     /// Construct a new `AppState` from parsed CLI arguments.
     ///
@@ -838,7 +984,15 @@ impl AppState {
     ///
     /// Returns an error if Proxmox mode is requested but `--token` is missing.
     fn new(cli: &Cli) -> Result<Self> {
-        let mode = if let Some(hosts_arg) = &cli.hosts {
+        let mode = if let Some(kube_arg) = &cli.kube {
+            let (namespace, selector) = parse_kube_arg(kube_arg)?;
+            AppMode::Kube {
+                namespace,
+                selector,
+                context: cli.kube_context.clone(),
+                thin: cli.kube_thin,
+            }
+        } else if let Some(hosts_arg) = &cli.hosts {
             if !cli.enable_remote {
                 anyhow::bail!("--hosts requires --enable-remote");
             }
@@ -981,6 +1135,50 @@ impl AppState {
             vec![]
         };
 
+        let kube_conns: Vec<KubeConn> = if let AppMode::Kube { ref namespace, ref selector, ref context, thin } = mode {
+            // Discover pods synchronously at startup. On failure (no kubectl, RBAC denied),
+            // log to stderr and start with an empty pod list so the UI can show the error.
+            let pods = discover_pods(namespace, selector.as_deref(), context.as_deref())
+                .unwrap_or_else(|e| {
+                    eprintln!("apptop: kubectl discover: {e}");
+                    vec![]
+                });
+            let ns = namespace.clone();
+            let ctx = context.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<(String, String, Result<FleetClient>)>();
+            for (pod_name, app_label) in pods {
+                let tx = tx.clone();
+                let ns2 = ns.clone();
+                let ctx2 = ctx.clone();
+                let pn = pod_name.clone();
+                let al = app_label.clone();
+                let is_thin = thin;
+                std::thread::spawn(move || {
+                    let result: Result<FleetClient> = if is_thin {
+                        remote::connect_kube_thin(&pn, &ns2, ctx2.as_deref()).map(FleetClient::Thin)
+                    } else {
+                        remote::connect_kube_daemon(&pn, &ns2, ctx2.as_deref()).map(FleetClient::Daemon)
+                    };
+                    let _ = tx.send((pn, al, result));
+                });
+            }
+            drop(tx);
+            rx.into_iter().map(|(pod_name, app_label, result)| {
+                match result {
+                    Ok(client) => KubeConn {
+                        pod_name, app_label, client: Some(client),
+                        snap: None, err: None, thin,
+                    },
+                    Err(e) => KubeConn {
+                        pod_name, app_label, client: None,
+                        snap: None, err: Some(e.to_string()), thin,
+                    },
+                }
+            }).collect()
+        } else {
+            vec![]
+        };
+
         Ok(Self {
             mode,
             proxmox_rx,
@@ -1036,6 +1234,7 @@ impl AppState {
             sys_psi_mem: None,
             sys_psi_io: None,
             fleet_clients,
+            kube_conns,
             history: std::collections::VecDeque::new(),
             history_depth: cli.history_depth.max(10),
             history_cursor: None,
@@ -1297,6 +1496,108 @@ impl AppState {
                     }
                 }
             }
+            Ok(raw)
+        } else if matches!(self.mode, AppMode::Kube { .. }) {
+            // Poll each pod connection for new snapshots.
+            let hist_metric = match self.active_side {
+                Side::Left => self.left_metric,
+                Side::Right => self.right_metric,
+            };
+            for conn in &mut self.kube_conns {
+                let new_snap = match &mut conn.client {
+                    Some(FleetClient::Daemon(c)) => c.try_recv(),
+                    Some(FleetClient::Thin(t))   => t.try_recv(),
+                    None => None,
+                };
+                if let Some(snap) = new_snap {
+                    conn.snap = Some(snap);
+                    conn.err = None;
+                }
+                // Mark connection lost if the kubectl process exited unexpectedly.
+                let alive = match &mut conn.client {
+                    Some(FleetClient::Daemon(c)) => c.is_alive(),
+                    Some(FleetClient::Thin(t))   => t.is_alive(),
+                    None => false,
+                };
+                if !alive && conn.client.is_some() {
+                    conn.err = Some("connection lost".into());
+                }
+            }
+            // Build BarEntries: one row per pod.
+            let raw: Vec<BarEntry> = self.kube_conns.iter().map(|conn| {
+                let (cpu, mem_pct, mem_used, has_data) = if let Some(ref snap) = conn.snap {
+                    let cpu = snap.sys_cpu_pct.unwrap_or_else(|| {
+                        snap.entries.iter().map(|e| e.value).sum::<f64>().min(100.0)
+                    });
+                    let mem_pct = if snap.total_ram_bytes > 0 {
+                        snap.sys_mem_used_bytes as f64 / snap.total_ram_bytes as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    (cpu, mem_pct, snap.sys_mem_used_bytes, true)
+                } else {
+                    (0.0, 0.0, 0u64, false)
+                };
+                let extra = if conn.err.is_some() {
+                    "error".into()
+                } else if conn.thin {
+                    "(thin)".into()
+                } else if !has_data {
+                    "connecting…".into()
+                } else {
+                    conn.app_label.clone()
+                };
+                BarEntry {
+                    label: conn.pod_name.clone(),
+                    value: cpu,
+                    count: None,
+                    extra,
+                    fading: false,
+                    fade_t: 0.0,
+                    rss_bytes: mem_used,
+                    mem_pct,
+                    page_faults_s: 0.0,
+                    disk_read_s: 0.0,
+                    disk_write_s: 0.0,
+                    ctx_switches_s: 0.0,
+                    open_fds: 0,
+                    swap_bytes: 0,
+                    sched_wait_pct: 0.0,
+                    power_w: 0.0,
+                    disk_complete: true,
+                    status_complete: true,
+                    fds_complete: true,
+                    sched_complete: true,
+                    rss_complete: true,
+                    cfs_throttle_pct: 0.0,
+                    psi_cpu_avg10: 0.0,
+                    psi_mem_avg10: 0.0,
+                    psi_io_avg10: 0.0,
+                    cg_v2_complete: false,
+                    gpu_pct: 0.0,
+                    gpu_vram_bytes: 0,
+                }
+            }).collect();
+
+            // Fair-share overlay: group pods by app_label.
+            // Each group's MemberSeries has one entry per pod; pods with data only.
+            // Shows whether replicas of a Deployment share load evenly.
+            self.group_member_vals.clear();
+            let mut by_app: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
+            for conn in &self.kube_conns {
+                if let Some(ref snap) = conn.snap {
+                    let cpu = snap.sys_cpu_pct.unwrap_or(0.0);
+                    by_app.entry(conn.app_label.clone()).or_default().push(cpu);
+                }
+            }
+            for (app_label, vals) in by_app {
+                // Only insert groups with >= 2 pods: single-replica groups have no
+                // distribution to visualise and would produce meaningless heat.
+                if vals.len() >= 2 {
+                    self.group_member_vals.insert(app_label, MemberSeries { metric: hist_metric, vals });
+                }
+            }
+
             Ok(raw)
         } else {
             // Non-blocking drain of the Proxmox background thread channel.
@@ -1900,7 +2201,7 @@ fn main() -> Result<()> {
                             state.stable_order.clear();
                             state.entries.clear();
                         }
-                        // Fleet: no grouping to cycle; ignore silently.
+                        // Fleet / Kube: no grouping to cycle; ignore silently.
                     }
                     // Cursor navigation: arrow keys (and vim j/k); also manual scroll
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -1994,10 +2295,44 @@ fn main() -> Result<()> {
                             });
                         }
                     }
-                    // Enter: drill down — threads (local), SSH daemon (proxmox/fleet)
+                    // Enter: drill down — threads (local), SSH daemon (proxmox/fleet), kubectl exec (kube)
                     KeyCode::Enter => {
                         if matches!(state.view, AppView::Groups) {
-                            if matches!(state.mode, AppMode::Fleet { .. }) {
+                            if matches!(state.mode, AppMode::Kube { .. }) {
+                                // Kube drill-down: connect to the selected pod for per-process detail.
+                                if let Some(conn) = state.kube_conns.get(state.cursor) {
+                                    if conn.thin {
+                                        state.error = Some(
+                                            "thin probe mode — no per-process drill-down; remove --kube-thin to enable".into()
+                                        );
+                                    } else if conn.client.is_none() {
+                                        state.error = Some(format!("not connected to pod {}", conn.pod_name));
+                                    } else {
+                                        let pod = conn.pod_name.clone();
+                                        // Extract namespace and context from the current AppMode.
+                                        let (ns, ctx) = if let AppMode::Kube { ref namespace, ref context, .. } = state.mode {
+                                            (namespace.clone(), context.clone())
+                                        } else {
+                                            unreachable!()
+                                        };
+                                        state.view = AppView::Connecting { label: pod.clone() };
+                                        terminal.draw(|f| ui::render(f, &state))?;
+                                        match remote::connect_kube_daemon(&pod, &ns, ctx.as_deref()) {
+                                            Ok(client) => {
+                                                state.remote_client = Some(client);
+                                                state.view = AppView::Remote { label: pod };
+                                                state.entries = vec![];
+                                                state.snap_count = 0;
+                                                state.error = None;
+                                            }
+                                            Err(e) => {
+                                                state.view = AppView::Groups;
+                                                state.error = Some(format!("drill-down failed: {e}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if matches!(state.mode, AppMode::Fleet { .. }) {
                                 // Fleet: drill into the selected host's per-process view.
                                 if let Some(conn) = state.fleet_clients.get(state.cursor) {
                                     if conn.thin {
@@ -2151,5 +2486,42 @@ mod tests {
     fn n_eff_all_zero_returns_n() {
         let vals = vec![0.0f64; 4];
         assert!((n_eff(&vals) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_kube_arg_namespace_only() {
+        let (ns, sel) = parse_kube_arg("default").unwrap();
+        assert_eq!(ns, "default");
+        assert!(sel.is_none());
+    }
+
+    #[test]
+    fn parse_kube_arg_with_selector() {
+        let (ns, sel) = parse_kube_arg("monitoring/app=prometheus").unwrap();
+        assert_eq!(ns, "monitoring");
+        assert_eq!(sel.unwrap(), "app=prometheus");
+    }
+
+    #[test]
+    fn parse_kube_arg_rejects_dash_namespace() {
+        assert!(parse_kube_arg("-bad").is_err());
+    }
+
+    #[test]
+    fn derive_app_label_strips_two_hash_segments() {
+        // Standard Deployment pod: name + replicaset hash + pod hash
+        assert_eq!(derive_app_label("nginx-deployment-7d6fb9f9-xl5gr"), "nginx-deployment");
+    }
+
+    #[test]
+    fn derive_app_label_strips_one_hash_segment() {
+        // DaemonSet-style pod with one hash suffix
+        assert_eq!(derive_app_label("fluentd-ds-abc12"), "fluentd-ds");
+    }
+
+    #[test]
+    fn derive_app_label_no_hash_returns_full() {
+        // Bare pod with no hash suffix
+        assert_eq!(derive_app_label("mypod"), "mypod");
     }
 }

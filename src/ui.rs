@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, FleetConn, Metric, PeakVals, Side, AnomalyState};
+use crate::{AppMode, AppState, AppView, BarEntry, FleetConn, KubeConn, Metric, PeakVals, Side, AnomalyState};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -95,6 +95,13 @@ fn metric_selector_line(state: &AppState) -> Line<'static> {
             let total = state.fleet_clients.len();
             spans.push(Span::styled(
                 format!("  [{connected}/{total} hosts]"),
+                dim_style,
+            ));
+        } else if matches!(state.mode, AppMode::Kube { .. }) {
+            let connected = state.kube_conns.iter().filter(|c| c.snap.is_some()).count();
+            let total = state.kube_conns.len();
+            spans.push(Span::styled(
+                format!("  [{connected}/{total} pods]  [EXPERIMENTAL]"),
                 dim_style,
             ));
         }
@@ -1053,6 +1060,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         AppMode::Local => "local /proc".to_string(),
         AppMode::Proxmox { url, .. } => format!("proxmox {url}"),
         AppMode::Fleet { .. } => "fleet".to_string(),
+        AppMode::Kube { namespace, .. } => format!("kube/{namespace}"),
     };
     let interval_s = state.interval.as_secs_f64();
     // Format the interval: "0.50" for sub-second, "2" for whole seconds, "1.5" for fractions.
@@ -1150,8 +1158,17 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             };
 
             // System metrics: local /proc data in local mode; node/storage summary in Proxmox mode;
-            // connected host count in Fleet mode.
-            let sys_parts = if matches!(state.mode, AppMode::Fleet { .. }) {
+            // connected host count in Fleet mode; pod count in Kube mode.
+            let sys_parts = if matches!(state.mode, AppMode::Kube { .. }) {
+                let total = state.kube_conns.len();
+                let connected = state.kube_conns.iter().filter(|c: &&KubeConn| c.client.is_some() && c.snap.is_some()).count();
+                let errored = state.kube_conns.iter().filter(|c: &&KubeConn| c.err.is_some()).count();
+                let mut s = format!("  │  pods {connected}/{total}");
+                if errored > 0 {
+                    s.push_str(&format!("  │  {errored} err"));
+                }
+                s
+            } else if matches!(state.mode, AppMode::Fleet { .. }) {
                 let total = state.fleet_clients.len();
                 let connected = state.fleet_clients.iter().filter(|c: &&FleetConn| c.snap.is_some()).count();
                 let errors = state.fleet_clients.iter().filter(|c: &&FleetConn| c.err.is_some() && c.client.is_some()).count();
@@ -1188,7 +1205,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 
             let enter_hint = if matches!(state.mode, AppMode::Local) {
                 "[Enter] threads"
-            } else if matches!(state.mode, AppMode::Fleet { .. }) || state.enable_remote {
+            } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. }) || state.enable_remote {
                 "[Enter] drill down"
             } else {
                 ""
@@ -1517,6 +1534,31 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("  Hosts must be accessible via SSH. Key auth required (BatchMode=yes)."),
         b("  Use --ssh-accept-new for first-time TOFU connection; always validates host keys."),
         b("  For daemon mode, apptop must be installed and in PATH on each host."),
+        blank(),
+        // ── Kubernetes ────────────────────────────────────────────────────────
+        h("KUBERNETES (EXPERIMENTAL)  (--kube NAMESPACE[/SELECTOR])"),
+        b("  Monitor all pods in a Kubernetes namespace via kubectl exec."),
+        b("  Each pod appears as one row; the bar shows system-wide CPU% and memory."),
+        blank(),
+        kv("  --kube NAMESPACE           ", "monitor all pods in a namespace"),
+        kv("  --kube NAMESPACE/SELECTOR  ", "filter by label selector (e.g. app=nginx)"),
+        kv("  --kube-context CTX         ", "kubectl context from kubeconfig"),
+        kv("  --kube-thin                ", "thin /proc probe (no apptop binary required in image)"),
+        blank(),
+        b("  One row per pod, ordered by the active sort metric. The histogram overlay"),
+        b("  groups pods by their 'app' / 'app.kubernetes.io/name' label and shows"),
+        b("  load distribution across replicas of the same Deployment — the original"),
+        b("  consul-pool fairness question, answered for Kubernetes."),
+        blank(),
+        kv("  [Enter]  ", "drill into the selected pod (daemon mode only, not --kube-thin)"),
+        kv("  [Esc]    ", "exit drill-down back to the pod list"),
+        blank(),
+        b("  Requirements:"),
+        b("    • kubectl in PATH with RBAC permission to exec into pods"),
+        b("    • For daemon mode: apptop binary in the container image (same arch)"),
+        b("    • Host-network or /proc visibility inside the container for thin mode"),
+        blank(),
+        b("  Pod list is discovered once at startup; press [r] to re-query."),
         blank(),
         // ── GroupBy ───────────────────────────────────────────────────────────
         h("GROUPING STRATEGY  [g]"),
