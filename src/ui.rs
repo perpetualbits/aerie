@@ -535,12 +535,12 @@ fn log2_frac(value: f64, reference: f64) -> f64 {
 
 /// Compute the bar fill fraction (0.0–1.0) for a given metric on a given entry.
 ///
-/// CPU and memory use linear scales (0–100% of a core; 0–100% of RAM).
+/// CPU and memory use linear scales (0–100% of the whole machine; 0–100% of RAM).
 /// All other metrics use `log2_frac` relative to the current rolling peak.
 /// The result is clamped to [0, 1] so the bar never overflows its half.
 fn metric_frac(e: &BarEntry, m: Metric, total_ram: u64, peaks: &PeakVals) -> f64 {
     match m {
-        // CPU: linear 0–100%; value is already a percent.
+        // CPU: linear 0–100% of whole-machine capacity; value is already machine-normalised.
         Metric::Cpu => e.value / 100.0,
         Metric::Memory => {
             if total_ram > 0 {
@@ -1240,10 +1240,13 @@ fn manual_lines() -> Vec<Line<'static>> {
         // ── Metrics ───────────────────────────────────────────────────────────
         h("METRICS  (per process group)"),
         blank(),
-        b("  cpu%      CPU time / second, all threads summed."),
-        b("             100% = one full core pegged; N×100% = all N cores fully saturated."),
-        b("             Normalised to the whole machine — 100% means all CPU time is consumed."),
-        d("             Linear scale  0–100%."),
+        b("  cpu% mach CPU time consumed by this group, normalised to the whole machine."),
+        b("             100% = every CPU core fully saturated (all threads combined)."),
+        b("             Note: this differs from top(1), which shows per-core percent"),
+        b("             (a process pinned to one core reads 100% in apptop, but 25% in"),
+        b("             top(1) on a 4-core machine).  apptop's convention makes groups"),
+        b("             comparable regardless of thread count."),
+        d("             Linear scale  0–100% of whole-machine CPU."),
         blank(),
         b("  mem       Resident set size — RAM pages physically in use (not virtual memory)."),
         b("             Bar length = group RSS / total physical RAM (linear scale)."),
@@ -1329,7 +1332,7 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("  bound), and the value is marked with a trailing '?' and the bar is dimmed."),
         blank(),
         b("  Affected metrics: disk-r, disk-w, ctx-sw, swap, fds, runq, mem"),
-        b("  Unaffected: cpu% (reads /proc/<pid>/stat, world-readable)"),
+        b("  Unaffected: cpu% mach (reads /proc/<pid>/stat, world-readable)"),
         blank(),
         // ── Log scale ─────────────────────────────────────────────────────────
         h("LOG SCALE"),

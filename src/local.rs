@@ -1380,4 +1380,69 @@ mod tests {
         let content = "0::/\n";
         assert_eq!(cgroup_full_path_from_str(content), None);
     }
+
+    // ── /proc/net/dev parsing (without filesystem calls) ─────────────────
+
+    /// Mirror of read_net_bytes parsing logic, minus the sysfs master-file check.
+    /// Tests the /proc/net/dev field layout: field 0 = rx_bytes, field 8 = tx_bytes.
+    fn parse_net_dev(content: &str) -> (u64, u64) {
+        let mut rx_total = 0u64;
+        let mut tx_total = 0u64;
+        for line in content.lines().skip(2) {
+            let line = line.trim();
+            let colon = match line.find(':') {
+                Some(i) => i,
+                None => continue,
+            };
+            let iface = line[..colon].trim();
+            if iface == "lo" {
+                continue;
+            }
+            let fields: Vec<&str> = line[colon + 1..].split_whitespace().collect();
+            let rx: u64 = fields.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let tx: u64 = fields.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);
+            rx_total += rx;
+            tx_total += tx;
+        }
+        (rx_total, tx_total)
+    }
+
+    #[test]
+    fn net_dev_single_interface_parses_rx_tx() {
+        // /proc/net/dev: 2 header lines, then "iface: rx_bytes rx_pkt ... tx_bytes ..."
+        // (tx is field index 8 after the colon, 0-indexed).
+        let content = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev(content), (1000, 2000));
+    }
+
+    #[test]
+    fn net_dev_skips_loopback() {
+        let content = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 9999 99 0 0 0 0 0 0 9999 99 0 0 0 0 0 0
+  eth0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev(content), (1000, 2000));
+    }
+
+    #[test]
+    fn net_dev_multi_interface_sums() {
+        let content = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0
+  eth1: 500  5  0 0 0 0 0 0 300  3  0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev(content), (1500, 2300));
+    }
+
+    #[test]
+    fn net_dev_empty_after_headers_gives_zeros() {
+        let content = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";
+        assert_eq!(parse_net_dev(content), (0, 0));
+    }
 }

@@ -123,7 +123,7 @@ impl Metric {
     /// Short display label shown in the header bar and column headings.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Cpu => "cpu%",
+            Self::Cpu => "cpu% mach",
             Self::Memory => "mem",
             Self::PageFaults => "faults/s",
             Self::Threads => "threads",
