@@ -338,6 +338,28 @@ fn bar_color(m: Metric, frac: f64) -> Color {
             lerp_u8(30, 100, f),
             lerp_u8(0, 0, f),
         ),
+        // CFS throttle: dark olive → bright yellow.
+        Metric::CfsThrottle => Color::Rgb(
+            lerp_u8(60, 230, f),
+            lerp_u8(60, 230, f),
+            lerp_u8(0, 0, f),
+        ),
+        // PSI metrics: shades of teal (cpu), violet (mem), salmon (io).
+        Metric::PsiCpu => Color::Rgb(
+            lerp_u8(0, 0, f),
+            lerp_u8(80, 210, f),
+            lerp_u8(80, 180, f),
+        ),
+        Metric::PsiMem => Color::Rgb(
+            lerp_u8(80, 180, f),
+            lerp_u8(0, 50, f),
+            lerp_u8(80, 210, f),
+        ),
+        Metric::PsiIo => Color::Rgb(
+            lerp_u8(180, 255, f),
+            lerp_u8(80, 120, f),
+            lerp_u8(60, 80, f),
+        ),
     }
 }
 
@@ -455,6 +477,7 @@ fn entry_complete(e: &BarEntry, m: Metric) -> bool {
         Metric::OpenFds => e.fds_complete,
         Metric::SchedWait => e.sched_complete,
         Metric::Memory => e.rss_complete,
+        Metric::CfsThrottle | Metric::PsiCpu | Metric::PsiMem | Metric::PsiIo => e.cg_v2_complete,
         _ => true,
     }
 }
@@ -489,6 +512,10 @@ fn metric_display_str(e: &BarEntry, m: Metric, total_ram: u64) -> String {
         Metric::SchedWait => format!("{:.1}%", e.sched_wait_pct),
         // Power is an estimate derived from RAPL; the ≈ prefix makes this explicit.
         Metric::Power => format!("≈{}", fmt_watts(e.power_w)),
+        Metric::CfsThrottle => format!("{:.1}%", e.cfs_throttle_pct),
+        Metric::PsiCpu => format!("{:.1}%", e.psi_cpu_avg10),
+        Metric::PsiMem => format!("{:.1}%", e.psi_mem_avg10),
+        Metric::PsiIo => format!("{:.1}%", e.psi_io_avg10),
     };
     if incomplete { format!("{base}?") } else { base }
 }
@@ -535,6 +562,11 @@ fn metric_frac(e: &BarEntry, m: Metric, total_ram: u64, peaks: &PeakVals) -> f64
         // SchedWait: linear 0–100% (but can exceed 100 for multi-threaded groups).
         Metric::SchedWait   => e.sched_wait_pct / 100.0,
         Metric::Power       => log2_frac(e.power_w,                   peaks.power_w),
+        // CFS throttle and PSI: linear 0–100%.
+        Metric::CfsThrottle => e.cfs_throttle_pct / 100.0,
+        Metric::PsiCpu      => e.psi_cpu_avg10    / 100.0,
+        Metric::PsiMem      => e.psi_mem_avg10    / 100.0,
+        Metric::PsiIo       => e.psi_io_avg10     / 100.0,
     }
     .clamp(0.0, 1.0)
 }
@@ -591,6 +623,7 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
             hist_metric,
             Metric::Cpu | Metric::Memory | Metric::PageFaults | Metric::DiskRead
                 | Metric::DiskWrite | Metric::CtxSwitches | Metric::SchedWait
+                | Metric::CfsThrottle | Metric::PsiCpu | Metric::PsiMem | Metric::PsiIo
         );
 
     // Label column width: widest label, clamped to [8, 28] chars.
@@ -972,7 +1005,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         format!("{interval_s:.1}")
     };
 
-    // Build the system metrics string (net, GPU, RAPL total) for the footer.
+    // Build the system metrics string (net, GPU, RAPL total, PSI) for the footer.
     let sys_metrics = |state: &AppState| -> String {
         let mut s = String::new();
         s.push_str(&format!(
@@ -985,6 +1018,19 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         if state.sys_rapl_w > 0.0 {
             s.push_str(&format!("  │  {} total", fmt_watts(state.sys_rapl_w)));
+        }
+        // Show system PSI only when at least one value is available.
+        let any_psi = state.sys_psi_cpu.is_some()
+            || state.sys_psi_mem.is_some()
+            || state.sys_psi_io.is_some();
+        if any_psi {
+            let fmt_psi = |v: Option<f64>| v.map_or("?".into(), |x| format!("{:.1}%", x));
+            s.push_str(&format!(
+                "  │  psi cpu:{} mem:{} io:{}",
+                fmt_psi(state.sys_psi_cpu),
+                fmt_psi(state.sys_psi_mem),
+                fmt_psi(state.sys_psi_io),
+            ));
         }
         s
     };
@@ -1240,12 +1286,40 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("             measured package watts."),
         d("             Log scale, relative to the current busiest group."),
         blank(),
+        // ── cgroup v2 metrics ─────────────────────────────────────────────────
+        h("CGROUP v2 METRICS  (group-by cgroup mode only, requires cgroup v2)"),
+        b("  These metrics are only available when:"),
+        b("    • the kernel uses cgroup v2 (/sys/fs/cgroup/cgroup.controllers exists)"),
+        b("    • group-by is set to 'cgroup' ([g] in local mode)"),
+        b("  When unavailable, the value shows '?' and the bar is dimmed."),
+        blank(),
+        b("  throttle  CFS CPU bandwidth throttle %.  When a cgroup has a CPU quota set"),
+        b("             (cpu.max), the scheduler throttles it once the quota is exhausted."),
+        b("             Calculated as: nr_throttled / nr_periods × 100 from cgroup cpu.stat."),
+        b("             A non-zero value means the cgroup is consistently hitting its limit."),
+        b("             Linear scale 0–100%."),
+        blank(),
+        b("  psi-cpu   CPU Pressure Stall Information — 'some avg10' from cpu.pressure."),
+        b("  psi-mem   Memory PSI — 'some avg10' from memory.pressure."),
+        b("  psi-io    I/O PSI — 'some avg10' from io.pressure."),
+        b("             'some avg10' = % of time at least one task in the cgroup was"),
+        b("             stalled waiting for that resource, averaged over the last 10 s."),
+        b("             Linear scale 0–100%.  System-wide PSI appears in the footer."),
+        d("             Per-cgroup PSI also requires that the kernel compiled with CONFIG_PSI."),
+        blank(),
+        b("  cgroup v2 also provides more accurate disk I/O accounting (io.stat) and"),
+        b("  RSS memory (memory.current) when group-by=cgroup.  These replace the"),
+        b("  /proc/PID/io and /proc/PID/statm values which are per-process and"),
+        b("  can miss I/O done by short-lived subprocesses."),
+        blank(),
         // ── System metrics ────────────────────────────────────────────────────
         h("SYSTEM METRICS  (footer only — not per-process)"),
         kv("  net ↓/↑  ", "system-wide network receive / transmit  bytes / second"),
         kv("  gpu      ", "total GPU utilisation %  (DRM sysfs; shown when GPU detected)"),
         d("             reads /sys/class/drm/card*/device/gpu_busy_percent"),
         kv("  total    ", "system-wide RAPL power draw in watts  (Intel / AMD only)"),
+        kv("  psi      ", "system-wide CPU/memory/I/O pressure from /proc/pressure/{cpu,memory,io}"),
+        d("             shown as 'psi cpu:N.N% mem:N.N% io:N.N%' when PSI is available"),
         blank(),
         // ── Incomplete data ───────────────────────────────────────────────────
         h("INCOMPLETE DATA  (running without root)"),

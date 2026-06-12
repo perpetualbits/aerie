@@ -79,6 +79,33 @@ pub struct GroupData {
     pub fds_denied: bool,
     pub sched_denied: bool,
     pub rss_denied: bool,
+    // ── cgroup v2 fields (only populated in GroupBy::Cgroup mode on cgroup v2 hosts) ──
+    /// Full cgroup v2 filesystem path for this group
+    /// (e.g. "/sys/fs/cgroup/system.slice/nginx.service").
+    /// Set by collect() for the first PID encountered; used by sample() to read
+    /// the group's own accounting files instead of summing per-PID /proc entries.
+    pub cgroup_path: Option<String>,
+    /// Cumulative bytes read from this cgroup's io.stat (sum across all devices).
+    /// Written by sample()'s pre-pass; used for delta computation next call.
+    pub cg_diskread: u64,
+    /// Cumulative bytes written from this cgroup's io.stat.
+    pub cg_diskwrite: u64,
+    /// Cumulative CFS periods from cpu.stat (bandwidth controller total).
+    pub cg_nr_periods: u64,
+    /// Cumulative throttled periods from cpu.stat.
+    pub cg_nr_throttled: u64,
+    /// Current memory use from memory.current (bytes). 0 = unread.
+    pub cg_memory: u64,
+    /// PSI "some avg10" from cpu.pressure [0.0, 100.0]. 0.0 = unread/absent.
+    pub cg_psi_cpu: f64,
+    /// PSI "some avg10" from memory.pressure.
+    pub cg_psi_mem: f64,
+    /// PSI "some avg10" from io.pressure.
+    pub cg_psi_io: f64,
+    /// True when cgroup v2 files were successfully read in the last sample pass.
+    /// Drives `cg_v2_complete` on BarEntry to distinguish "no throttle/stall" from
+    /// "cgroup v2 data unavailable".
+    pub cg_data_ok: bool,
 }
 
 /// Counters for one thread, populated according to ThreadFields.
@@ -151,6 +178,13 @@ pub struct SysSample {
     /// Note: this counter wraps (hardware-defined max, typically ~65 kJ); use
     /// `wrapping_sub` when computing the delta.
     pub rapl_uj: Option<u64>,
+    /// System-wide CPU PSI "some avg10" from /proc/pressure/cpu.
+    /// None if the kernel was compiled without CONFIG_PSI or the file is absent.
+    pub psi_cpu: Option<f64>,
+    /// System-wide memory PSI "some avg10" from /proc/pressure/memory.
+    pub psi_mem: Option<f64>,
+    /// System-wide I/O PSI "some avg10" from /proc/pressure/io.
+    pub psi_io: Option<f64>,
     pub at: Instant,
 }
 
@@ -488,11 +522,15 @@ fn read_rapl_uj() -> Option<u64> {
 /// The caller stores the previous sample and computes per-second rates from the delta.
 pub fn sample_sys() -> SysSample {
     let (net_rx_bytes, net_tx_bytes) = read_net_bytes();
+    let (psi_cpu, psi_mem, psi_io) = read_system_psi();
     SysSample {
         net_rx_bytes,
         net_tx_bytes,
         gpu_pct: read_gpu_pct(),
         rapl_uj: read_rapl_uj(),
+        psi_cpu,
+        psi_mem,
+        psi_io,
         at: Instant::now(),
     }
 }
@@ -540,6 +578,153 @@ fn read_exe_key(pid: u32) -> Option<String> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
+/// Return true when the system uses cgroup v2 (unified hierarchy).
+///
+/// The presence of `/sys/fs/cgroup/cgroup.controllers` is the canonical indicator.
+/// On pure cgroup v2 systems this file lists the available controllers (e.g.
+/// "cpuset cpu io memory hugetlb pids rdma"). It is absent on cgroup v1 and
+/// partially absent on hybrid v1+v2 systems (where we treat as v1 for safety).
+fn is_cgroup_v2() -> bool {
+    Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+}
+
+/// Read the raw cgroup v2 path component for a process from /proc/PID/cgroup.
+///
+/// On a pure cgroup v2 system, /proc/PID/cgroup has exactly one line:
+///   `0::/system.slice/nginx.service`
+/// We extract the path after "0::" (e.g. "/system.slice/nginx.service").
+/// Returns None for the root cgroup ("/"), for cgroup v1 (no "0::" prefix),
+/// or when the file can't be read.
+fn read_cgroup_full_path(pid: u32) -> Option<String> {
+    let content = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            let p = rest.trim();
+            if p != "/" && !p.is_empty() {
+                return Some(p.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse /sys/fs/cgroup/.../io.stat and return (rbytes, wbytes) summed across all devices.
+///
+/// io.stat format — one line per device, space-separated key=value pairs:
+///   `8:0 rbytes=1234 wbytes=5678 rios=10 wios=20 dbytes=0 dios=0`
+///
+/// The first token is the device MAJ:MIN and is skipped. All other tokens are
+/// parsed as key=value. Returns None if the file can't be read (e.g. cgroup root
+/// or the kernel doesn't support io accounting for this cgroup).
+fn read_cg_io_stat(cg_path: &str) -> Option<(u64, u64)> {
+    let content = fs::read_to_string(format!("{cg_path}/io.stat")).ok()?;
+    let mut rb = 0u64;
+    let mut wb = 0u64;
+    for line in content.lines() {
+        for tok in line.split_whitespace().skip(1) {
+            // tok is "key=value"
+            if let Some(v) = tok.strip_prefix("rbytes=") {
+                rb += v.parse::<u64>().unwrap_or(0);
+            } else if let Some(v) = tok.strip_prefix("wbytes=") {
+                wb += v.parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    Some((rb, wb))
+}
+
+/// Cumulative CFS bandwidth accounting from /sys/fs/cgroup/.../cpu.stat.
+struct CgCpuStat {
+    /// Total number of CFS periods since the cgroup was created.
+    nr_periods: u64,
+    /// Number of periods in which the cgroup exhausted its CPU quota and was throttled.
+    nr_throttled: u64,
+}
+
+/// Parse /sys/fs/cgroup/.../cpu.stat for CFS throttle data.
+///
+/// cpu.stat format — one "key value" pair per line (subset shown):
+///   `usage_usec 12345678`
+///   `nr_periods 1000`
+///   `nr_throttled 100`
+///   `throttled_usec 50000`
+///
+/// Returns None if the file is absent (cgroup root, or CPU controller not enabled).
+fn read_cg_cpu_stat(cg_path: &str) -> Option<CgCpuStat> {
+    let content = fs::read_to_string(format!("{cg_path}/cpu.stat")).ok()?;
+    let mut nr_periods = 0u64;
+    let mut nr_throttled = 0u64;
+    for line in content.lines() {
+        let mut parts = line.splitn(2, ' ');
+        let key = parts.next().unwrap_or("");
+        let val: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        match key {
+            "nr_periods"   => nr_periods = val,
+            "nr_throttled" => nr_throttled = val,
+            _              => {}
+        }
+    }
+    Some(CgCpuStat { nr_periods, nr_throttled })
+}
+
+/// Read current memory use from /sys/fs/cgroup/.../memory.current (bytes).
+///
+/// Returns None if the file is absent, not a number (the value "max" is used
+/// for the root cgroup), or otherwise unreadable.
+fn read_cg_memory_current(cg_path: &str) -> Option<u64> {
+    fs::read_to_string(format!("{cg_path}/memory.current"))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Read PSI "some avg10" from a cgroup pressure file (cpu.pressure / memory.pressure / io.pressure).
+///
+/// Pressure file format:
+///   `some avg10=N.NN avg60=N.NN avg300=N.NN total=N`
+///   `full avg10=N.NN avg60=N.NN avg300=N.NN total=N`
+///
+/// We return the "some avg10" value [0.0, 100.0]: the percentage of the last 10 s
+/// during which at least one task in the cgroup was stalled on this resource.
+/// "full" (all tasks stalled) is a stricter condition not returned here.
+///
+/// Returns None if the file is absent (CONFIG_PSI not compiled in, or the
+/// cgroup controller does not expose pressure data).
+fn read_cg_psi(cg_path: &str, resource: &str) -> Option<f64> {
+    let content = fs::read_to_string(format!("{cg_path}/{resource}.pressure")).ok()?;
+    parse_psi_some_avg10(&content)
+}
+
+/// Read system-wide PSI for all three resources from /proc/pressure/{cpu,memory,io}.
+///
+/// Returns (cpu_some_avg10, mem_some_avg10, io_some_avg10); each is None if
+/// the corresponding file is absent (kernel built without CONFIG_PSI).
+fn read_system_psi() -> (Option<f64>, Option<f64>, Option<f64>) {
+    let cpu = fs::read_to_string("/proc/pressure/cpu").ok().and_then(|s| parse_psi_some_avg10(&s));
+    let mem = fs::read_to_string("/proc/pressure/memory").ok().and_then(|s| parse_psi_some_avg10(&s));
+    let io  = fs::read_to_string("/proc/pressure/io").ok().and_then(|s| parse_psi_some_avg10(&s));
+    (cpu, mem, io)
+}
+
+/// Extract the "some avg10" value from a PSI file's content string.
+///
+/// Searches for a line beginning with "some " and parses the "avg10=N.NN" token.
+/// This is factored out so tests can call it directly on fixture strings without
+/// touching the filesystem.
+fn parse_psi_some_avg10(content: &str) -> Option<f64> {
+    for line in content.lines() {
+        if line.starts_with("some ") {
+            for tok in line.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("avg10=") {
+                    return v.parse::<f64>().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Scan /proc and accumulate per-group counters into a `Snapshot`.
 ///
 /// Iterates all numeric directories in /proc, reads each process's stat file,
@@ -581,6 +766,15 @@ fn collect(opts: &CollectOpts, group_by: GroupBy) -> Result<Snapshot> {
         };
 
         let g = groups.entry(name).or_default();
+
+        // In cgroup mode, store the cgroup v2 filesystem path for the first PID seen
+        // in this group. sample() uses it to read the group's own accounting files
+        // (io.stat, cpu.stat, *.pressure) which are more accurate and avoid EACCES.
+        if matches!(group_by, GroupBy::Cgroup) && g.cgroup_path.is_none() {
+            g.cgroup_path = read_cgroup_full_path(pid)
+                .map(|p| format!("/sys/fs/cgroup{p}"));
+        }
+
         // utime = user-mode jiffies, stime = kernel-mode jiffies.
         g.jiffies += s.utime + s.stime;
         // num_threads can theoretically be -1 on very unusual kernels; clamp to 1.
@@ -655,7 +849,43 @@ fn collect(opts: &CollectOpts, group_by: GroupBy) -> Result<Snapshot> {
 /// by dividing the counter delta by `elapsed_secs` (wall-clock time between
 /// snapshots), not by jiffy count, so they are in SI units (bytes/s, events/s).
 pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> Result<(Vec<BarEntry>, Snapshot)> {
-    let now = collect(opts, group_by)?;
+    let mut now = collect(opts, group_by)?;
+
+    // ── cgroup v2 pre-pass ────────────────────────────────────────────────
+    // When running in Cgroup mode on a cgroup v2 host, read each group's own
+    // accounting files. This replaces summed per-PID /proc data with the
+    // kernel's authoritative aggregate, and eliminates EACCES issues because
+    // /sys/fs/cgroup files are world-readable.
+    //
+    // We collect the paths first (to avoid holding a mutable borrow and a
+    // shared borrow simultaneously), then mutate the GroupData entries.
+    let cg_v2 = is_cgroup_v2() && matches!(group_by, GroupBy::Cgroup);
+    if cg_v2 {
+        let paths: Vec<(String, String)> = now.groups.iter()
+            .filter_map(|(label, g)| g.cgroup_path.as_ref().map(|p| (label.clone(), p.clone())))
+            .collect();
+        for (label, path) in paths {
+            let Some(g) = now.groups.get_mut(&label) else { continue };
+            // Cumulative disk I/O: stored for next-call delta computation.
+            if let Some((rb, wb)) = read_cg_io_stat(&path) {
+                g.cg_diskread = rb;
+                g.cg_diskwrite = wb;
+            }
+            // CFS throttle counters: also cumulative.
+            if let Some(cpu) = read_cg_cpu_stat(&path) {
+                g.cg_nr_periods  = cpu.nr_periods;
+                g.cg_nr_throttled = cpu.nr_throttled;
+            }
+            // memory.current: instantaneous, no delta needed.
+            g.cg_memory = read_cg_memory_current(&path).unwrap_or(0);
+            // PSI avg10: already a rolling average — read directly.
+            g.cg_psi_cpu = read_cg_psi(&path, "cpu").unwrap_or(0.0);
+            g.cg_psi_mem = read_cg_psi(&path, "memory").unwrap_or(0.0);
+            g.cg_psi_io  = read_cg_psi(&path, "io").unwrap_or(0.0);
+            // Mark this group as having valid cgroup v2 data.
+            g.cg_data_ok = true;
+        }
+    }
 
     let entries = match prev {
         None => vec![],
@@ -690,11 +920,25 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
                     let delta_faults = (g.minflt + g.majflt).saturating_sub(prev_faults);
                     let page_faults_s = delta_faults as f64 / elapsed_secs;
 
-                    let prev_dr = p.map_or(0, |p| p.disk_read);
-                    let disk_read_s = g.disk_read.saturating_sub(prev_dr) as f64 / elapsed_secs;
-
-                    let prev_dw = p.map_or(0, |p| p.disk_write);
-                    let disk_write_s = g.disk_write.saturating_sub(prev_dw) as f64 / elapsed_secs;
+                    // Disk I/O: prefer cgroup io.stat when available (world-readable,
+                    // authoritative); fall back to per-PID /proc/PID/io summation.
+                    let (disk_read_s, disk_write_s, disk_complete) = if cg_v2 && g.cg_data_ok {
+                        let prev_rb = p.map_or(0, |p| p.cg_diskread);
+                        let prev_wb = p.map_or(0, |p| p.cg_diskwrite);
+                        (
+                            g.cg_diskread.saturating_sub(prev_rb) as f64 / elapsed_secs,
+                            g.cg_diskwrite.saturating_sub(prev_wb) as f64 / elapsed_secs,
+                            true, // cgroup files are always readable
+                        )
+                    } else {
+                        let prev_dr = p.map_or(0, |p| p.disk_read);
+                        let prev_dw = p.map_or(0, |p| p.disk_write);
+                        (
+                            g.disk_read.saturating_sub(prev_dr) as f64 / elapsed_secs,
+                            g.disk_write.saturating_sub(prev_dw) as f64 / elapsed_secs,
+                            !g.disk_denied,
+                        )
+                    };
 
                     let prev_vol = p.map_or(0, |p| p.vol_ctxt);
                     let prev_nonvol = p.map_or(0, |p| p.nonvol_ctxt);
@@ -712,6 +956,25 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
                     let sched_wait_pct =
                         (delta_wait_ns / (elapsed_secs * 1e9) * 100.0).clamp(0.0, f64::MAX);
 
+                    // CFS throttle %: delta_throttled / delta_periods × 100.
+                    // Only meaningful when cgroup v2 is active; 0.0 otherwise.
+                    let cfs_throttle_pct = if cg_v2 && g.cg_data_ok {
+                        let prev_periods   = p.map_or(0, |p| p.cg_nr_periods);
+                        let prev_throttled = p.map_or(0, |p| p.cg_nr_throttled);
+                        let dp = g.cg_nr_periods.saturating_sub(prev_periods);
+                        let dt = g.cg_nr_throttled.saturating_sub(prev_throttled);
+                        if dp > 0 { (dt as f64 / dp as f64 * 100.0).clamp(0.0, 100.0) } else { 0.0 }
+                    } else {
+                        0.0
+                    };
+
+                    // Memory: prefer cgroup v2 memory.current (authoritative aggregate).
+                    let (rss_bytes, rss_complete) = if cg_v2 && g.cg_data_ok && g.cg_memory > 0 {
+                        (g.cg_memory, true)
+                    } else {
+                        (g.rss_pages * 4096, !g.rss_denied)
+                    };
+
                     Some(BarEntry {
                         label: name.clone(),
                         value: cpu,
@@ -719,8 +982,7 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
                         extra: format!("{} thr", g.threads),
                         fading: false,
                         fade_t: 0.0,
-                        // rss_pages × PAGE_SIZE (4096) = bytes.
-                        rss_bytes: g.rss_pages * 4096,
+                        rss_bytes,
                         page_faults_s,
                         mem_pct: 0.0, // local mode: use rss_bytes / total_ram instead
                         disk_read_s,
@@ -730,11 +992,16 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
                         swap_bytes: g.swap_kib * 1024,
                         sched_wait_pct,
                         power_w: 0.0, // filled in by AppState::refresh() after RAPL is computed
-                        disk_complete: !g.disk_denied,
+                        disk_complete,
                         status_complete: !g.status_denied,
                         fds_complete: !g.fds_denied,
                         sched_complete: !g.sched_denied,
-                        rss_complete: !g.rss_denied,
+                        rss_complete,
+                        cfs_throttle_pct,
+                        psi_cpu_avg10: g.cg_psi_cpu,
+                        psi_mem_avg10: g.cg_psi_mem,
+                        psi_io_avg10:  g.cg_psi_io,
+                        cg_v2_complete: g.cg_data_ok,
                     })
                 })
                 .collect()
@@ -987,5 +1254,130 @@ mod tests {
     fn cgroup_key_docker_container() {
         let cgroup = "0::/system.slice/docker-abc123.service\n";
         assert_eq!(cgroup_key_from_str(cgroup), Some("docker-abc123".to_string()));
+    }
+
+    // ── parse_psi_some_avg10 ──────────────────────────────────────────────
+
+    #[test]
+    fn psi_some_avg10_happy_path() {
+        let content = "some avg10=1.23 avg60=0.45 avg300=0.10 total=12345\n\
+                       full avg10=0.01 avg60=0.00 avg300=0.00 total=100\n";
+        let v = super::parse_psi_some_avg10(content).expect("should parse");
+        assert!((v - 1.23).abs() < 1e-9, "expected 1.23, got {v}");
+    }
+
+    #[test]
+    fn psi_some_avg10_full_line_only_returns_none() {
+        // "full" lines must not be mistaken for "some" lines.
+        let content = "full avg10=5.00 avg60=4.00 avg300=3.00 total=9999\n";
+        assert_eq!(super::parse_psi_some_avg10(content), None);
+    }
+
+    #[test]
+    fn psi_some_avg10_absent_returns_none() {
+        assert_eq!(super::parse_psi_some_avg10(""), None);
+    }
+
+    #[test]
+    fn psi_some_avg10_zero() {
+        let content = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        let v = super::parse_psi_some_avg10(content).expect("should parse zero");
+        assert!((v - 0.0).abs() < 1e-9);
+    }
+
+    // ── read_cg_io_stat (pure-parse variant) ─────────────────────────────
+
+    fn cg_io_stat_from_str(content: &str) -> Option<(u64, u64)> {
+        let mut rb = 0u64;
+        let mut wb = 0u64;
+        for line in content.lines() {
+            for tok in line.split_whitespace().skip(1) {
+                if let Some(v) = tok.strip_prefix("rbytes=") {
+                    rb += v.parse::<u64>().unwrap_or(0);
+                } else if let Some(v) = tok.strip_prefix("wbytes=") {
+                    wb += v.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+        Some((rb, wb))
+    }
+
+    #[test]
+    fn io_stat_multi_device_sums_correctly() {
+        let content = "8:0 rbytes=1000 wbytes=2000 rios=5 wios=3 dbytes=0 dios=0\n\
+                       8:16 rbytes=500 wbytes=300 rios=2 wios=1 dbytes=0 dios=0\n";
+        assert_eq!(cg_io_stat_from_str(content), Some((1500, 2300)));
+    }
+
+    #[test]
+    fn io_stat_empty_gives_zeros() {
+        assert_eq!(cg_io_stat_from_str(""), Some((0, 0)));
+    }
+
+    // ── read_cg_cpu_stat (pure-parse variant) ────────────────────────────
+
+    fn cg_cpu_stat_from_str(content: &str) -> Option<(u64, u64)> {
+        let mut nr_periods = 0u64;
+        let mut nr_throttled = 0u64;
+        for line in content.lines() {
+            let mut parts = line.splitn(2, ' ');
+            let key = parts.next().unwrap_or("");
+            let val: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            match key {
+                "nr_periods"   => nr_periods = val,
+                "nr_throttled" => nr_throttled = val,
+                _              => {}
+            }
+        }
+        Some((nr_periods, nr_throttled))
+    }
+
+    #[test]
+    fn cpu_stat_with_throttle_parses() {
+        let content = "usage_usec 100000000\nnr_periods 1000\nnr_throttled 250\nthrottled_usec 5000\n";
+        assert_eq!(cg_cpu_stat_from_str(content), Some((1000, 250)));
+    }
+
+    #[test]
+    fn cpu_stat_no_throttle_keys_gives_zeros() {
+        let content = "usage_usec 9999\nuser_usec 8888\n";
+        assert_eq!(cg_cpu_stat_from_str(content), Some((0, 0)));
+    }
+
+    // ── read_cgroup_full_path (pure-parse variant) ────────────────────────
+
+    fn cgroup_full_path_from_str(content: &str) -> Option<String> {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("0::") {
+                let p = rest.trim();
+                if p != "/" && !p.is_empty() {
+                    return Some(p.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn cgroup_full_path_pure_v2() {
+        let content = "0::/system.slice/myservice.service\n";
+        assert_eq!(
+            cgroup_full_path_from_str(content),
+            Some("/system.slice/myservice.service".into())
+        );
+    }
+
+    #[test]
+    fn cgroup_full_path_hybrid_v1_ignored() {
+        // Hybrid/v1 systems have "0::/" for the unified hierarchy root;
+        // non-zero hierarchy IDs must be ignored and "/" must return None.
+        let content = "12:memory:/user.slice/user-1000.slice\n0::/\n";
+        assert_eq!(cgroup_full_path_from_str(content), None);
+    }
+
+    #[test]
+    fn cgroup_full_path_root_returns_none() {
+        let content = "0::/\n";
+        assert_eq!(cgroup_full_path_from_str(content), None);
     }
 }

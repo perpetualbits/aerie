@@ -105,6 +105,18 @@ pub enum Metric {
     SwapMem,
     SchedWait,
     Power,
+    /// CFS bandwidth throttle percentage (cgroup v2, Cgroup mode only).
+    /// Fraction of CFS scheduler periods in which this cgroup exhausted its
+    /// CPU quota and was throttled: nr_throttled / nr_periods × 100.
+    CfsThrottle,
+    /// CPU pressure stall: "some avg10" from cgroup cpu.pressure [0, 100].
+    /// Percentage of the last 10 s in which at least one task in this cgroup
+    /// was stalled waiting for a CPU. Requires cgroup v2 + Cgroup mode.
+    PsiCpu,
+    /// Memory pressure stall: "some avg10" from cgroup memory.pressure.
+    PsiMem,
+    /// I/O pressure stall: "some avg10" from cgroup io.pressure.
+    PsiIo,
 }
 
 impl Metric {
@@ -122,11 +134,17 @@ impl Metric {
             Self::SwapMem => "swap",
             Self::SchedWait => "runq",
             Self::Power => "power",
+            Self::CfsThrottle => "throttle",
+            Self::PsiCpu => "psi-cpu",
+            Self::PsiMem => "psi-mem",
+            Self::PsiIo => "psi-io",
         }
     }
 
     /// Ordered list of metrics available in local (/proc) mode.
     /// CPU and Memory lead because they are the most commonly needed.
+    /// The four cgroup v2 metrics appear at the end; they show 0.0 / `?` when
+    /// not in cgroup v2 Cgroup mode, making them self-documenting.
     fn local_options() -> &'static [Self] {
         &[
             Self::Cpu,
@@ -140,6 +158,10 @@ impl Metric {
             Self::SwapMem,
             Self::OpenFds,
             Self::Threads,
+            Self::CfsThrottle,
+            Self::PsiCpu,
+            Self::PsiMem,
+            Self::PsiIo,
         ]
     }
 
@@ -365,6 +387,24 @@ pub struct BarEntry {
     pub sched_complete: bool,
     #[serde(default = "default_true")]
     pub rss_complete: bool,
+    // ── cgroup v2 metrics ─────────────────────────────────────────────────
+    /// CFS bandwidth throttle %: nr_throttled / nr_periods × 100.
+    /// 0.0 when cgroup v2 is unavailable or group_by ≠ Cgroup.
+    #[serde(default)]
+    pub cfs_throttle_pct: f64,
+    /// CPU PSI "some avg10" [0, 100] from cgroup cpu.pressure.
+    #[serde(default)]
+    pub psi_cpu_avg10: f64,
+    /// Memory PSI "some avg10" from cgroup memory.pressure.
+    #[serde(default)]
+    pub psi_mem_avg10: f64,
+    /// I/O PSI "some avg10" from cgroup io.pressure.
+    #[serde(default)]
+    pub psi_io_avg10: f64,
+    /// True when cgroup v2 accounting files were successfully read for this group.
+    /// When false, cfs_throttle_pct and psi_* are 0.0 and should be shown as `?`.
+    #[serde(default)]
+    pub cg_v2_complete: bool,
 }
 
 /// Rolling peak values across visible (non-fading) entries.
@@ -441,6 +481,10 @@ pub fn metric_sort_val(e: &BarEntry, m: Metric, total_ram: u64) -> f64 {
         Metric::SwapMem => e.swap_bytes as f64,
         Metric::SchedWait => e.sched_wait_pct,
         Metric::Power => e.power_w,
+        Metric::CfsThrottle => e.cfs_throttle_pct,
+        Metric::PsiCpu => e.psi_cpu_avg10,
+        Metric::PsiMem => e.psi_mem_avg10,
+        Metric::PsiIo => e.psi_io_avg10,
     }
 }
 
@@ -579,6 +623,13 @@ pub struct AppState {
     /// Set to true once we observe any entry with an incomplete metric (EACCES).
     /// Drives the "running unprivileged" notice in the footer.
     pub running_unprivileged: bool,
+    // ── system-wide PSI (local mode) ──────────────────────────────────────
+    /// System-level CPU PSI "some avg10" from /proc/pressure/cpu.
+    pub sys_psi_cpu: Option<f64>,
+    /// System-level memory PSI "some avg10" from /proc/pressure/memory.
+    pub sys_psi_mem: Option<f64>,
+    /// System-level I/O PSI "some avg10" from /proc/pressure/io.
+    pub sys_psi_io: Option<f64>,
 }
 
 impl AppState {
@@ -728,6 +779,9 @@ impl AppState {
             pve_storage_status: vec![],
             peak_vals: PeakVals::default(),
             running_unprivileged: false,
+            sys_psi_cpu: None,
+            sys_psi_mem: None,
+            sys_psi_io: None,
         })
     }
 
@@ -952,6 +1006,9 @@ impl AppState {
                     self.sys_rapl_w = delta_uj / 1_000_000.0 / dt;
                 }
             }
+            self.sys_psi_cpu = new_sys.psi_cpu;
+            self.sys_psi_mem = new_sys.psi_mem;
+            self.sys_psi_io  = new_sys.psi_io;
             self.prev_sys = Some(new_sys);
         }
 
@@ -1133,7 +1190,7 @@ fn run_daemon(interval: Duration) -> Result<()> {
         snap_count += 1;
 
         let new_sys = local::sample_sys();
-        let (rx_s, tx_s, gpu, rapl_w) = if let Some(ref ps) = prev_sys {
+        let (rx_s, tx_s, gpu, rapl_w, psi_cpu, psi_mem, psi_io) = if let Some(ref ps) = prev_sys {
             let dt = new_sys.at.duration_since(ps.at).as_secs_f64().max(0.001);
             let rx = new_sys.net_rx_bytes.saturating_sub(ps.net_rx_bytes) as f64 / dt;
             let tx = new_sys.net_tx_bytes.saturating_sub(ps.net_tx_bytes) as f64 / dt;
@@ -1142,9 +1199,9 @@ fn run_daemon(interval: Duration) -> Result<()> {
                 (Some(n), Some(p)) => n.wrapping_sub(p) as f64 / 1_000_000.0 / dt,
                 _ => 0.0,
             };
-            (rx, tx, new_sys.gpu_pct, rapl)
+            (rx, tx, new_sys.gpu_pct, rapl, new_sys.psi_cpu, new_sys.psi_mem, new_sys.psi_io)
         } else {
-            (0.0, 0.0, new_sys.gpu_pct, 0.0)
+            (0.0, 0.0, new_sys.gpu_pct, 0.0, new_sys.psi_cpu, new_sys.psi_mem, new_sys.psi_io)
         };
         prev_sys = Some(new_sys);
 
@@ -1166,6 +1223,9 @@ fn run_daemon(interval: Duration) -> Result<()> {
             sys_net_tx_s: tx_s,
             sys_gpu_pct: gpu,
             sys_rapl_w: rapl_w,
+            sys_psi_cpu: psi_cpu,
+            sys_psi_mem: psi_mem,
+            sys_psi_io: psi_io,
         };
 
         // Emit the snapshot as a single JSON line, then flush immediately so the
@@ -1223,6 +1283,9 @@ fn main() -> Result<()> {
                     state.sys_net_tx_s = snap.sys_net_tx_s;
                     state.sys_gpu_pct = snap.sys_gpu_pct;
                     state.sys_rapl_w = snap.sys_rapl_w;
+                    state.sys_psi_cpu = snap.sys_psi_cpu;
+                    state.sys_psi_mem = snap.sys_psi_mem;
+                    state.sys_psi_io  = snap.sys_psi_io;
                     state.snap_count = snap.snap_count;
                 }
             }

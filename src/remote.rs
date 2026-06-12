@@ -40,6 +40,15 @@ pub struct DaemonSnapshot {
     pub sys_gpu_pct: Option<f64>,
     /// Total RAPL package power draw on the remote machine in watts.
     pub sys_rapl_w: f64,
+    /// System-level CPU PSI "some avg10" from /proc/pressure/cpu.
+    #[serde(default)]
+    pub sys_psi_cpu: Option<f64>,
+    /// System-level memory PSI "some avg10" from /proc/pressure/memory.
+    #[serde(default)]
+    pub sys_psi_mem: Option<f64>,
+    /// System-level I/O PSI "some avg10" from /proc/pressure/io.
+    #[serde(default)]
+    pub sys_psi_io: Option<f64>,
 }
 
 /// SSH host-key checking policy.
@@ -396,6 +405,9 @@ mod tests {
             sys_net_tx_s: 2000.0,
             sys_gpu_pct: Some(50.0),
             sys_rapl_w: 35.0,
+            sys_psi_cpu: Some(1.5),
+            sys_psi_mem: None,
+            sys_psi_io: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: DaemonSnapshot = serde_json::from_str(&json).unwrap();
