@@ -1338,7 +1338,7 @@ fn manual_lines() -> Vec<Line<'static>> {
         kv("  [g]                      ", "cycle grouping: comm→cgroup→exe (local) or flat→pool→tag→node (Proxmox)"),
         d("                             current grouping shown in brackets in the header"),
         kv("  [r]                      ", "force an immediate data refresh"),
-        kv("  [m]                      ", "toggle this manual  (↑/↓ to scroll)"),
+        kv("  [m]                      ", "toggle this manual  (↑/↓ line, PgUp/PgDn page)"),
         blank(),
         // ── Meter bar ─────────────────────────────────────────────────────────
         h("THE METER BAR"),
@@ -1653,6 +1653,10 @@ fn manual_lines() -> Vec<Line<'static>> {
         blank(),
         d("  apptop — GPLv3-or-later — Copyright (C) 2026 Epsilon Null Operation — see LICENSE"),
     ]
+}
+
+pub fn manual_line_count() -> usize {
+    manual_lines().len()
 }
 
 pub fn manual_text() -> String {

@@ -2233,7 +2233,25 @@ fn main() -> Result<()> {
                         {
                             state.cursor += 1;
                         } else if matches!(state.view, AppView::Manual) {
-                            state.manual_scroll = state.manual_scroll.saturating_add(1);
+                            let max_scroll = ui::manual_line_count()
+                                .saturating_sub(state.last_body_height);
+                            state.manual_scroll =
+                                state.manual_scroll.saturating_add(1).min(max_scroll);
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if matches!(state.view, AppView::Manual) {
+                            let page = state.last_body_height.max(1);
+                            state.manual_scroll = state.manual_scroll.saturating_sub(page);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if matches!(state.view, AppView::Manual) {
+                            let page = state.last_body_height.max(1);
+                            let max_scroll = ui::manual_line_count()
+                                .saturating_sub(state.last_body_height);
+                            state.manual_scroll =
+                                state.manual_scroll.saturating_add(page).min(max_scroll);
                         }
                     }
                     // Metric cycling for the active side (left/right arrows),
