@@ -427,6 +427,13 @@ fn fire_alert_cmd(cmd: &str, label: &str, kind: &str, balance_frac: f64) {
         .spawn();
 }
 
+/// A GPU device discovered on this machine.
+#[derive(Clone)]
+pub struct GpuDevice {
+    pub pci_addr: String,
+    pub driver: String,
+}
+
 /// Label identifying a group across all display levels.
 ///
 /// In local mode this is the process-group name (comm/cgroup/exe key).
@@ -857,6 +864,11 @@ pub struct AppState {
     pub alert_cmd: Option<String>,
     /// True when --enable-gpu was passed; gates fdinfo reads and GPU metric display.
     pub gpu_enabled: bool,
+    /// GPU devices discovered on first refresh (empty until then).
+    pub gpu_devices: Vec<GpuDevice>,
+    /// Index into gpu_devices for the selected device. 0 = aggregate all.
+    /// 1..=N selects gpu_devices[selected_gpu-1].
+    pub selected_gpu: usize,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1246,6 +1258,8 @@ impl AppState {
             anomaly_states: HashMap::new(),
             alert_cmd: cli.alert_cmd.clone(),
             gpu_enabled: cli.enable_gpu,
+            gpu_devices: Vec::new(),
+            selected_gpu: 0,
         })
     }
 
@@ -1366,6 +1380,11 @@ impl AppState {
     /// the user is only looking at CPU and memory.
     fn collect_opts(&self) -> local::CollectOpts {
         let metrics = [self.left_metric, self.right_metric, self.sort_metric];
+        let selected_gpu_pci = if self.selected_gpu == 0 {
+            None
+        } else {
+            self.gpu_devices.get(self.selected_gpu - 1).map(|d| d.pci_addr.clone())
+        };
         local::CollectOpts {
             need_io: metrics.iter().any(|m| matches!(m, Metric::DiskRead | Metric::DiskWrite)),
             need_status: metrics.iter().any(|m| matches!(m, Metric::CtxSwitches | Metric::SwapMem)),
@@ -1373,6 +1392,7 @@ impl AppState {
             need_schedstat: metrics.iter().any(|m| matches!(m, Metric::SchedWait)),
             need_rss: metrics.iter().any(|m| matches!(m, Metric::Memory)),
             need_gpu: self.gpu_enabled && metrics.iter().any(|m| matches!(m, Metric::GpuPct | Metric::Vram)),
+            selected_gpu_pci,
         }
     }
 
@@ -1400,9 +1420,60 @@ impl AppState {
 
         let is_local = matches!(self.mode, AppMode::Local);
         let result: Result<Vec<BarEntry>> = if is_local {
+            // Discover GPU devices once
+            if self.gpu_enabled && self.gpu_devices.is_empty() {
+                self.gpu_devices = local::discover_gpu_devices()
+                    .into_iter()
+                    .map(|d| GpuDevice { pci_addr: d.pci_addr, driver: d.driver })
+                    .collect();
+            }
+
+            // Sample NVIDIA pmon each tick if any NVIDIA device present
+            let nvidia_data: HashMap<u32, (f64, u64)> = if self.gpu_enabled
+                && self.gpu_devices.iter().any(|d| d.driver == "nvidia")
+            {
+                local::sample_nvidia_pmon()
+            } else {
+                HashMap::new()
+            };
+
             let opts = self.collect_opts();
             let group_by = self.group_by;
-            local::sample(self.snap.take(), &opts, group_by).map(|(entries, snap)| {
+            local::sample(self.snap.take(), &opts, group_by).map(|(mut entries, snap)| {
+                // Merge NVIDIA pmon data into entries
+                if !nvidia_data.is_empty() {
+                    let is_nvidia_selected = self.selected_gpu > 0
+                        && self.gpu_devices.get(self.selected_gpu - 1)
+                            .map_or(false, |d| d.driver == "nvidia");
+                    let show_nvidia = self.selected_gpu == 0 || is_nvidia_selected;
+
+                    if show_nvidia {
+                        for entry in &mut entries {
+                            if let Some(group) = snap.groups.get(&entry.label) {
+                                let mut sm_sum = 0f64;
+                                let mut vram_sum = 0u64;
+                                for &pid in &group.pids {
+                                    if let Some(&(sm, vram)) = nvidia_data.get(&pid) {
+                                        sm_sum += sm;
+                                        vram_sum += vram;
+                                    }
+                                }
+                                if sm_sum > 0.0 || vram_sum > 0 {
+                                    if is_nvidia_selected {
+                                        // replace with nvidia-only data
+                                        entry.gpu_pct = sm_sum;
+                                        entry.gpu_vram_bytes = vram_sum * 1024 * 1024;
+                                    } else {
+                                        // aggregate mode: add nvidia on top of DRM
+                                        entry.gpu_pct += sm_sum;
+                                        entry.gpu_vram_bytes = entry.gpu_vram_bytes
+                                            .saturating_add(vram_sum * 1024 * 1024);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 self.snap = Some(snap);
                 entries
             })
@@ -2456,6 +2527,23 @@ fn main() -> Result<()> {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Cycle GPU device selection ([ = previous, ] = next)
+                    KeyCode::Char('[') => {
+                        if state.gpu_enabled && !state.gpu_devices.is_empty() {
+                            let n = state.gpu_devices.len() + 1; // 0=all, 1..=N=specific
+                            state.selected_gpu = if state.selected_gpu == 0 {
+                                n - 1
+                            } else {
+                                state.selected_gpu - 1
+                            };
+                        }
+                    }
+                    KeyCode::Char(']') => {
+                        if state.gpu_enabled && !state.gpu_devices.is_empty() {
+                            let n = state.gpu_devices.len() + 1;
+                            state.selected_gpu = (state.selected_gpu + 1) % n;
                         }
                     }
                     // Toggle pause/scrub mode for the replay ring buffer.

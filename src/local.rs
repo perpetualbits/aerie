@@ -73,12 +73,10 @@ pub struct GroupData {
     pub swap_kib: u64,
     /// Cumulative nanoseconds spent waiting in the run queue (/proc/PID/schedstat field 1).
     pub sched_wait_ns: u64,
-    /// Cumulative GPU engine nanoseconds across all PIDs in this group.
-    /// Summed from drm-engine-* fdinfo lines. Zero when --enable-gpu is off or no DRM fds.
-    pub gpu_engine_ns: u64,
-    /// GPU VRAM in use by this group, bytes. Summed from drm-memory-vram fdinfo lines.
-    /// Instantaneous (no delta needed); may slightly over-count with multiple DRM contexts.
-    pub gpu_vram_bytes: u64,
+    /// Per-device GPU data keyed by PCI address (e.g. "0000:00:02.0").
+    /// Each value is (cumulative_engine_ns, instantaneous_vram_bytes).
+    /// Empty when --enable-gpu is off or no DRM fds are found.
+    pub gpu_drm: HashMap<String, (u64, u64)>,
     // Denial flags: true if any PID in the group had EACCES for this metric.
     pub disk_denied: bool,
     pub status_denied: bool,
@@ -428,19 +426,21 @@ fn count_fds(pid: u32) -> ProcRead<usize> {
 /// Read GPU engine time and VRAM for one process from /proc/PID/fdinfo/*.
 ///
 /// Scans all fdinfo entries for DRM file descriptors (identified by "drm-driver:"
-/// in the file contents). Accumulates across all DRM fds:
-///   - engine_ns:  sum of all `drm-engine-* N ns` lines — cumulative GPU engine time.
-///   - vram_bytes: sum of `drm-memory-vram N B` lines — instantaneous VRAM allocation.
+/// in the file contents). Returns a map from PCI address to (engine_ns, vram_bytes)
+/// where engine_ns is cumulative GPU engine time and vram_bytes is the instantaneous
+/// VRAM allocation for that device. The PCI address is taken from the "drm-pdev:"
+/// fdinfo line (e.g. "0000:00:02.0").
 ///
-/// Returns None when the fdinfo directory is unreadable (EACCES: process belongs to
-/// another user; ENOENT: process exited) or when no DRM fds are present.
+/// Returns an empty map when the fdinfo directory is unreadable (EACCES/ENOENT) or
+/// when no DRM fds are present.
 ///
-/// Requires kernel ≥ 5.14 (amdgpu/i915/xe). Returns None gracefully on older kernels.
-fn read_pid_gpu_fdinfo(pid: u32) -> Option<(u64, u64)> {
-    let dir = fs::read_dir(format!("/proc/{pid}/fdinfo")).ok()?;
-    let mut engine_ns: u64 = 0;
-    let mut vram_bytes: u64 = 0;
-    let mut found_drm = false;
+/// Requires kernel ≥ 5.14 (amdgpu/i915/xe). Returns empty map gracefully on older kernels.
+fn read_pid_gpu_fdinfo(pid: u32) -> HashMap<String, (u64, u64)> {
+    let dir = match fs::read_dir(format!("/proc/{pid}/fdinfo")) {
+        Ok(d) => d,
+        Err(_) => return HashMap::new(),
+    };
+    let mut result: HashMap<String, (u64, u64)> = HashMap::new();
     for entry in dir.flatten() {
         // Read the fdinfo file; skip on any error (process may have exited).
         let text = match fs::read_to_string(entry.path()) {
@@ -450,11 +450,17 @@ fn read_pid_gpu_fdinfo(pid: u32) -> Option<(u64, u64)> {
         if !text.contains("drm-driver:") {
             continue; // not a DRM fd — skip without parsing
         }
-        found_drm = true;
+        let mut engine_ns: u64 = 0;
+        let mut vram_bytes: u64 = 0;
+        let mut pci_addr = String::new();
         for line in text.lines() {
-            if line.starts_with("drm-engine-") {
+            if line.starts_with("drm-pdev:") {
+                // Format: "drm-pdev:\t0000:00:02.0"
+                if let Some(val_part) = line.splitn(2, ':').nth(1) {
+                    pci_addr = val_part.trim().to_string();
+                }
+            } else if line.starts_with("drm-engine-") {
                 // Format: "drm-engine-gfx:   14523000 ns"
-                // Split on ':' to get the value half, then take the first token.
                 if let Some(val_part) = line.splitn(2, ':').nth(1) {
                     let ns: u64 = val_part.split_whitespace()
                         .next()
@@ -473,8 +479,15 @@ fn read_pid_gpu_fdinfo(pid: u32) -> Option<(u64, u64)> {
                 }
             }
         }
+        // Use "unknown" as fallback PCI address if drm-pdev: was not present.
+        if pci_addr.is_empty() {
+            pci_addr = "unknown".to_string();
+        }
+        let e = result.entry(pci_addr).or_insert((0, 0));
+        e.0 = e.0.saturating_add(engine_ns);
+        e.1 = e.1.saturating_add(vram_bytes);
     }
-    if found_drm { Some((engine_ns, vram_bytes)) } else { None }
+    result
 }
 
 /// Which expensive optional metrics to collect in each snapshot.
@@ -496,12 +509,23 @@ pub struct CollectOpts {
     /// GPU engine time + VRAM from /proc/PID/fdinfo (requires --enable-gpu).
     /// Only set when GpuPct or Vram is an active display metric.
     pub need_gpu: bool,
+    /// When Some(pci), report metrics for that PCI device only.
+    /// When None, aggregate across all DRM devices.
+    pub selected_gpu_pci: Option<String>,
 }
 
 impl Default for CollectOpts {
     /// All metrics enabled — used by the daemon, which must support all display combinations.
     fn default() -> Self {
-        Self { need_io: true, need_status: true, need_fds: true, need_schedstat: true, need_rss: true, need_gpu: true }
+        Self {
+            need_io: true,
+            need_status: true,
+            need_fds: true,
+            need_schedstat: true,
+            need_rss: true,
+            need_gpu: true,
+            selected_gpu_pci: None,
+        }
     }
 }
 
@@ -950,9 +974,10 @@ fn collect(opts: &CollectOpts, group_by: GroupBy) -> Result<Snapshot> {
         }
 
         if opts.need_gpu {
-            if let Some((eng_ns, vram)) = read_pid_gpu_fdinfo(pid) {
-                g.gpu_engine_ns = g.gpu_engine_ns.saturating_add(eng_ns);
-                g.gpu_vram_bytes = g.gpu_vram_bytes.saturating_add(vram);
+            for (pci, (eng, vram)) in read_pid_gpu_fdinfo(pid) {
+                let e = g.gpu_drm.entry(pci).or_insert((0, 0));
+                e.0 = e.0.saturating_add(eng);
+                e.1 = e.1.saturating_add(vram);
             }
         }
     }
@@ -1086,14 +1111,31 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
                     // Can exceed 100% when multiple GPU engines are active simultaneously.
                     // Zero when --enable-gpu is off or the process has no DRM file descriptors.
                     let elapsed_ns = elapsed_secs * 1e9;
-                    let prev_eng = p.map_or(0, |p| p.gpu_engine_ns);
-                    let delta_eng = g.gpu_engine_ns.saturating_sub(prev_eng) as f64;
-                    let gpu_pct = if opts.need_gpu && elapsed_ns > 0.0 {
-                        (delta_eng / elapsed_ns * 100.0).max(0.0)
+                    let (gpu_pct, gpu_vram_bytes) = if opts.need_gpu && elapsed_ns > 0.0 {
+                        let prev_drm = p.map(|p| &p.gpu_drm);
+                        match &opts.selected_gpu_pci {
+                            Some(pci) => {
+                                // single device
+                                let (cur_eng, cur_vram) = g.gpu_drm.get(pci).copied().unwrap_or((0, 0));
+                                let prev_eng = prev_drm.and_then(|m| m.get(pci)).map_or(0, |&(e, _)| e);
+                                let delta = cur_eng.saturating_sub(prev_eng) as f64;
+                                ((delta / elapsed_ns * 100.0).max(0.0), cur_vram)
+                            }
+                            None => {
+                                // aggregate across all devices
+                                let mut delta_eng = 0f64;
+                                let mut vram = 0u64;
+                                for (pci, &(cur_eng, cur_vram)) in &g.gpu_drm {
+                                    let prev_eng = prev_drm.and_then(|m| m.get(pci)).map_or(0, |&(e, _)| e);
+                                    delta_eng += cur_eng.saturating_sub(prev_eng) as f64;
+                                    vram = vram.saturating_add(cur_vram);
+                                }
+                                ((delta_eng / elapsed_ns * 100.0).max(0.0), vram)
+                            }
+                        }
                     } else {
-                        0.0
+                        (0.0, 0)
                     };
-                    let gpu_vram_bytes = g.gpu_vram_bytes; // instantaneous — no delta
 
                     // CFS throttle %: delta_throttled / delta_periods × 100.
                     // Only meaningful when cgroup v2 is active; 0.0 otherwise.
@@ -1350,6 +1392,158 @@ pub fn sample_member_vals(
         })
         .collect();
     Ok((crate::MemberSeries { metric, vals }, snap))
+}
+
+/// One GPU device visible to the system.
+pub struct GpuDevice {
+    /// Canonical PCI address "DDDD:BB:SS.F" (4-digit domain), e.g. "0000:00:02.0".
+    pub pci_addr: String,
+    /// Kernel driver name: "i915", "xe", "amdgpu", "nvidia", "nouveau", etc.
+    pub driver: String,
+}
+
+/// Normalise a PCI address to 4-digit domain form "DDDD:BB:SS.F".
+fn normalise_pci(s: &str) -> String {
+    // NVIDIA sometimes uses 8-digit domain; trim leading zeros to 4 digits
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("00000000:") {
+        format!("0000:{rest}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Discover GPU devices from sysfs.
+///
+/// Scans /sys/class/drm/card* for DRM-registered devices (Intel, AMD, nouveau).
+/// Also scans /sys/bus/pci/drivers/nvidia/ for NVIDIA proprietary-driver devices
+/// that do not appear as DRM cards.
+/// Returns a deduplicated, sorted list.
+pub fn discover_gpu_devices() -> Vec<GpuDevice> {
+    let mut devices: Vec<GpuDevice> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // DRM devices (Intel i915/xe, AMD amdgpu, nouveau, etc.)
+    if let Ok(dir) = fs::read_dir("/sys/class/drm") {
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let n = name.to_string_lossy();
+            // Only card* entries, not renderD*
+            if !n.starts_with("card") || n.contains('-') {
+                continue;
+            }
+            // Resolve symlink to get PCI address from path component
+            let real = match fs::canonicalize(entry.path()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            // Path looks like .../0000:00:02.0/drm/card0 — PCI addr is 3rd from end
+            let pci_addr = real
+                .iter()
+                .rev()
+                .nth(2)
+                .map(|c| c.to_string_lossy().into_owned())
+                .filter(|s| s.len() >= 7 && s.contains(':'))
+                .unwrap_or_default();
+            if pci_addr.is_empty() {
+                continue;
+            }
+            // Normalise to 4-digit domain (NVIDIA sysfs uses 8 digits)
+            let pci_addr = normalise_pci(&pci_addr);
+            if !seen.insert(pci_addr.clone()) {
+                continue;
+            }
+            // Read driver name from driver symlink
+            let driver_path = entry.path().join("device/driver");
+            let driver = fs::canonicalize(&driver_path)
+                .ok()
+                .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "unknown".into());
+            devices.push(GpuDevice { pci_addr, driver });
+        }
+    }
+
+    // NVIDIA proprietary driver — not a DRM card, lives in its own PCI driver dir
+    if let Ok(dir) = fs::read_dir("/sys/bus/pci/drivers/nvidia") {
+        for entry in dir.flatten() {
+            let n = entry.file_name();
+            let s = n.to_string_lossy();
+            // Entries that are PCI addresses look like "0000:02:00.0"
+            if !s.contains(':') {
+                continue;
+            }
+            let pci_addr = normalise_pci(&s);
+            if seen.insert(pci_addr.clone()) {
+                devices.push(GpuDevice { pci_addr, driver: "nvidia".into() });
+            }
+        }
+    }
+
+    devices.sort_by(|a, b| a.pci_addr.cmp(&b.pci_addr));
+    devices
+}
+
+/// Per-PID NVIDIA GPU sample from nvidia-smi pmon.
+/// Key: pid. Value: (sm_pct, vram_mib).
+/// Only covers NVIDIA GPUs; DRM-based GPUs are handled via fdinfo.
+pub fn sample_nvidia_pmon() -> HashMap<u32, (f64, u64)> {
+    // SM utilisation per PID
+    let pmon = std::process::Command::new("nvidia-smi")
+        .args(["pmon", "-c", "1", "-s", "u"])
+        .output();
+
+    // VRAM per PID (compute apps only)
+    let vram_out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+
+    let mut result: HashMap<u32, (f64, u64)> = HashMap::new();
+
+    // Parse pmon output for SM%
+    if let Ok(out) = pmon {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // Fields: gpu_idx pid type sm mem enc dec [jpg ofa] command
+            if fields.len() < 4 {
+                continue;
+            }
+            let pid: u32 = match fields[1].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if pid == 0 {
+                continue;
+            }
+            let sm: f64 = fields[3].parse().unwrap_or(0.0);
+            result.entry(pid).or_insert((0.0, 0)).0 += sm;
+        }
+    }
+
+    // Parse --query-compute-apps output for VRAM MiB
+    if let Ok(out) = vram_out {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, ',');
+            let pid: u32 = match parts.next().and_then(|s| s.trim().parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+            let mib: u64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            result.entry(pid).or_insert((0.0, 0)).1 += mib;
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]

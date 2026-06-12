@@ -1240,18 +1240,66 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             (s, k)
         }
     };
+    // Build GPU device selector line (shown below status/keys when gpu is enabled and devices exist)
+    let gpu_device_line: Option<Line<'static>> = if state.gpu_enabled
+        && !state.gpu_devices.is_empty()
+        && matches!(state.view, AppView::Groups | AppView::Remote { .. })
+    {
+        let mut spans = vec![Span::styled(
+            " GPU [/]: ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+        // "all" entry (selected_gpu == 0)
+        if state.selected_gpu == 0 {
+            spans.push(Span::styled(
+                "[all]".to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "all".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        for (i, dev) in state.gpu_devices.iter().enumerate() {
+            spans.push(Span::styled("  ".to_string(), Style::default()));
+            let label = format!("{}:{}", dev.driver, dev.pci_addr);
+            if state.selected_gpu == i + 1 {
+                spans.push(Span::styled(
+                    format!("[{label}]"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    label,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+        Some(Line::from(spans))
+    } else {
+        None
+    };
+
     let keys_style = if state.history_cursor.is_some() {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Rgb(60, 60, 60))
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(status, Style::default().fg(Color::DarkGray)),
-            Line::styled(keys, keys_style),
-        ]),
-        area,
-    );
+
+    let mut lines = vec![
+        Line::styled(status, Style::default().fg(Color::DarkGray)),
+        Line::styled(keys, keys_style),
+    ];
+    if let Some(gpu_line) = gpu_device_line {
+        // Replace the last line with the GPU selector (footer is only 2 rows in layout,
+        // so we insert it as the second line and drop keys to the combined line)
+        // Actually, we only have 2 rows — show GPU line instead of keys when devices present,
+        // or append it to the status line.
+        // Since footer is 2 rows, put gpu line as line 2 (replacing key hints) when devices present.
+        lines[1] = gpu_line;
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 // ── Manual ────────────────────────────────────────────────────────────────────
@@ -1625,7 +1673,7 @@ fn manual_lines() -> Vec<Line<'static>> {
         blank(),
         blank(),
         // ── GPU metrics ───────────────────────────────────────────────────────
-        h("GPU METRICS  (--enable-gpu, AMD/Intel DRM, kernel ≥ 5.14)"),
+        h("GPU METRICS  (--enable-gpu, AMD/Intel DRM + NVIDIA via nvidia-smi)"),
         b("  GPU metrics are disabled by default to avoid reading /proc/PID/fdinfo for every"),
         b("  process.  Pass --enable-gpu to enable them.  Without this flag, gpu% and vram"),
         b("  always show 0.0; the bar is not dimmed and no '?' is appended — the value is"),
@@ -1636,20 +1684,39 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("            Summed across all GPU engines (gfx, compute, enc, dec) and all"),
         b("            DRM file descriptors held by PIDs in the group."),
         b("            Can exceed 100% when multiple GPU engines run simultaneously."),
+        b("            For NVIDIA: SM% from nvidia-smi pmon (per-PID)."),
         d("            Linear scale, capped at 1.0 in the bar display."),
         blank(),
         b("  vram      GPU VRAM in use by this group (instantaneous, bytes)."),
-        b("            Summed from drm-memory-vram lines across all DRM fds."),
+        b("            Summed from drm-memory-vram lines across all DRM fds (AMD/Intel)."),
+        b("            For NVIDIA: used_gpu_memory from nvidia-smi --query-compute-apps."),
         b("            May slightly over-count when multiple DRM contexts share allocations."),
         d("            Log scale, relative to the current busiest group."),
         blank(),
-        b("  Supported drivers: AMD amdgpu, Intel i915/xe (kernel ≥ 5.14)."),
-        b("  NVIDIA (NVML): not yet supported in this release."),
+        b("  Supported drivers:"),
+        b("    • AMD amdgpu — DRM fdinfo (kernel ≥ 5.14)"),
+        b("    • Intel i915 / xe — DRM fdinfo (kernel ≥ 5.14)"),
+        b("    • NVIDIA proprietary — nvidia-smi pmon (nvidia-smi must be in PATH)"),
+        b("    • nouveau (NVIDIA open) — DRM fdinfo where supported"),
         blank(),
-        b("  How it works: each open DRM file descriptor exposes lines in"),
+        b("  Multi-GPU: apptop discovers all GPUs at startup via sysfs.  When multiple"),
+        b("  GPUs are present, a device selector appears at the bottom of the screen."),
+        blank(),
+        kv("  [         ", "cycle GPU selector backward (all → last device → … → first device)"),
+        kv("  ]         ", "cycle GPU selector forward  (all → first device → … → last device)"),
+        blank(),
+        b("  'all' aggregates data from all discovered GPUs (DRM + NVIDIA combined)."),
+        b("  Selecting a specific device shows only that device's gpu% and vram."),
+        blank(),
+        b("  How DRM metrics work: each open DRM file descriptor exposes lines in"),
         b("  /proc/PID/fdinfo/N.  A fd is a DRM fd if 'drm-driver:' appears in the file."),
+        b("  The 'drm-pdev:' field identifies the PCI device."),
         b("  drm-engine-* values are cumulative nanoseconds (like CPU jiffies) — the"),
         b("  delta divided by elapsed time gives GPU%.  drm-memory-vram is instantaneous."),
+        blank(),
+        b("  How NVIDIA metrics work: nvidia-smi pmon -c 1 -s u is called each tick."),
+        b("  This requires the nvidia-smi binary in PATH.  If absent, NVIDIA data is"),
+        b("  silently omitted (no error shown)."),
         blank(),
         d("  apptop — GPLv3-or-later — Copyright (C) 2026 Epsilon Null Operation — see LICENSE"),
     ]
