@@ -1880,15 +1880,19 @@ impl AppState {
                 vec![1.0 / n as f64; n]
             };
 
-            let concentrated = n >= 3 && balance_frac < BALANCE_ALERT_THRESHOLD;
+            let concentrated = n >= 5 && balance_frac < BALANCE_ALERT_THRESHOLD;
 
-            // Dropout: any member that was active (share > 15%) is now nearly idle (share < 3%).
+            // Dropout: the SAME member (by stable index) that was carrying significant
+            // load (>15% share) has dropped to near-zero (<3%).  We use index-stable
+            // comparison rather than any()/any() to avoid false positives in groups like
+            // chrome or kworker where some members are always idle while others are active.
             let prev = self.anomaly_states.get(&label);
             let dropout = if let Some(ps) = prev {
                 if ps.prev_shares.len() == n {
-                    let had_active = ps.prev_shares.iter().any(|&s| s > 0.15);
-                    let now_idle = shares.iter().any(|&s| s < 0.03);
-                    had_active && now_idle
+                    ps.prev_shares
+                        .iter()
+                        .zip(shares.iter())
+                        .any(|(&prev_s, &now_s)| prev_s > 0.15 && now_s < 0.03)
                 } else {
                     false
                 }
