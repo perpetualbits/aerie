@@ -73,6 +73,12 @@ pub struct GroupData {
     pub swap_kib: u64,
     /// Cumulative nanoseconds spent waiting in the run queue (/proc/PID/schedstat field 1).
     pub sched_wait_ns: u64,
+    /// Cumulative GPU engine nanoseconds across all PIDs in this group.
+    /// Summed from drm-engine-* fdinfo lines. Zero when --enable-gpu is off or no DRM fds.
+    pub gpu_engine_ns: u64,
+    /// GPU VRAM in use by this group, bytes. Summed from drm-memory-vram fdinfo lines.
+    /// Instantaneous (no delta needed); may slightly over-count with multiple DRM contexts.
+    pub gpu_vram_bytes: u64,
     // Denial flags: true if any PID in the group had EACCES for this metric.
     pub disk_denied: bool,
     pub status_denied: bool,
@@ -419,6 +425,58 @@ fn count_fds(pid: u32) -> ProcRead<usize> {
     }
 }
 
+/// Read GPU engine time and VRAM for one process from /proc/PID/fdinfo/*.
+///
+/// Scans all fdinfo entries for DRM file descriptors (identified by "drm-driver:"
+/// in the file contents). Accumulates across all DRM fds:
+///   - engine_ns:  sum of all `drm-engine-* N ns` lines — cumulative GPU engine time.
+///   - vram_bytes: sum of `drm-memory-vram N B` lines — instantaneous VRAM allocation.
+///
+/// Returns None when the fdinfo directory is unreadable (EACCES: process belongs to
+/// another user; ENOENT: process exited) or when no DRM fds are present.
+///
+/// Requires kernel ≥ 5.14 (amdgpu/i915/xe). Returns None gracefully on older kernels.
+fn read_pid_gpu_fdinfo(pid: u32) -> Option<(u64, u64)> {
+    let dir = fs::read_dir(format!("/proc/{pid}/fdinfo")).ok()?;
+    let mut engine_ns: u64 = 0;
+    let mut vram_bytes: u64 = 0;
+    let mut found_drm = false;
+    for entry in dir.flatten() {
+        // Read the fdinfo file; skip on any error (process may have exited).
+        let text = match fs::read_to_string(entry.path()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !text.contains("drm-driver:") {
+            continue; // not a DRM fd — skip without parsing
+        }
+        found_drm = true;
+        for line in text.lines() {
+            if line.starts_with("drm-engine-") {
+                // Format: "drm-engine-gfx:   14523000 ns"
+                // Split on ':' to get the value half, then take the first token.
+                if let Some(val_part) = line.splitn(2, ':').nth(1) {
+                    let ns: u64 = val_part.split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    engine_ns = engine_ns.saturating_add(ns);
+                }
+            } else if line.starts_with("drm-memory-vram:") {
+                // Format: "drm-memory-vram:   104857600 B"
+                if let Some(val_part) = line.splitn(2, ':').nth(1) {
+                    let b: u64 = val_part.split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    vram_bytes = vram_bytes.saturating_add(b);
+                }
+            }
+        }
+    }
+    if found_drm { Some((engine_ns, vram_bytes)) } else { None }
+}
+
 /// Which expensive optional metrics to collect in each snapshot.
 ///
 /// Callers set flags based on which metrics are currently displayed or sorted by.
@@ -435,12 +493,15 @@ pub struct CollectOpts {
     pub need_schedstat: bool,
     /// RSS memory pages (reads /proc/PID/statm).
     pub need_rss: bool,
+    /// GPU engine time + VRAM from /proc/PID/fdinfo (requires --enable-gpu).
+    /// Only set when GpuPct or Vram is an active display metric.
+    pub need_gpu: bool,
 }
 
 impl Default for CollectOpts {
     /// All metrics enabled — used by the daemon, which must support all display combinations.
     fn default() -> Self {
-        Self { need_io: true, need_status: true, need_fds: true, need_schedstat: true, need_rss: true }
+        Self { need_io: true, need_status: true, need_fds: true, need_schedstat: true, need_rss: true, need_gpu: true }
     }
 }
 
@@ -887,6 +948,13 @@ fn collect(opts: &CollectOpts, group_by: GroupBy) -> Result<Snapshot> {
                 ProcRead::Gone => {}
             }
         }
+
+        if opts.need_gpu {
+            if let Some((eng_ns, vram)) = read_pid_gpu_fdinfo(pid) {
+                g.gpu_engine_ns = g.gpu_engine_ns.saturating_add(eng_ns);
+                g.gpu_vram_bytes = g.gpu_vram_bytes.saturating_add(vram);
+            }
+        }
     }
 
     Ok(Snapshot { total, collected_at, groups })
@@ -1014,6 +1082,19 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
                     let sched_wait_pct =
                         (delta_wait_ns / (elapsed_secs * 1e9) * 100.0).clamp(0.0, f64::MAX);
 
+                    // GPU%: delta engine ns / elapsed wall-clock ns × 100.
+                    // Can exceed 100% when multiple GPU engines are active simultaneously.
+                    // Zero when --enable-gpu is off or the process has no DRM file descriptors.
+                    let elapsed_ns = elapsed_secs * 1e9;
+                    let prev_eng = p.map_or(0, |p| p.gpu_engine_ns);
+                    let delta_eng = g.gpu_engine_ns.saturating_sub(prev_eng) as f64;
+                    let gpu_pct = if opts.need_gpu && elapsed_ns > 0.0 {
+                        (delta_eng / elapsed_ns * 100.0).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    let gpu_vram_bytes = g.gpu_vram_bytes; // instantaneous — no delta
+
                     // CFS throttle %: delta_throttled / delta_periods × 100.
                     // Only meaningful when cgroup v2 is active; 0.0 otherwise.
                     let cfs_throttle_pct = if cg_v2 && g.cg_data_ok {
@@ -1060,6 +1141,8 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
                         psi_mem_avg10: g.cg_psi_mem,
                         psi_io_avg10:  g.cg_psi_io,
                         cg_v2_complete: g.cg_data_ok,
+                        gpu_pct,
+                        gpu_vram_bytes,
                     })
                 })
                 .collect()
@@ -1517,6 +1600,84 @@ Inter-|   Receive                                                |  Transmit
         let idle = fields.get(3).copied().unwrap_or(0)
             + fields.get(4).copied().unwrap_or(0);
         Some((total, idle))
+    }
+
+    // ── read_pid_gpu_fdinfo (pure-parse variants) ─────────────────────────
+
+    fn parse_fdinfo(text: &str) -> Option<(u64, u64)> {
+        if !text.contains("drm-driver:") { return None; }
+        let mut eng = 0u64;
+        let mut vram = 0u64;
+        for line in text.lines() {
+            if line.starts_with("drm-engine-") {
+                if let Some(v) = line.splitn(2, ':').nth(1) {
+                    eng += v.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                }
+            } else if line.starts_with("drm-memory-vram:") {
+                if let Some(v) = line.splitn(2, ':').nth(1) {
+                    vram += v.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                }
+            }
+        }
+        Some((eng, vram))
+    }
+
+    #[test]
+    fn fdinfo_drm_engine_and_vram_parsed() {
+        // Simulate two DRM fdinfo files for one process.
+        let fdinfo1 = "\
+drm-driver:\tamdgpu\n\
+drm-client-id:\t42\n\
+drm-engine-gfx:\t14523000 ns\n\
+drm-engine-compute:\t0 ns\n\
+drm-memory-vram:\t104857600 B\n\
+drm-memory-gtt:\t2097152 B\n";
+
+        let fdinfo2 = "\
+drm-driver:\tamdgpu\n\
+drm-client-id:\t43\n\
+drm-engine-gfx:\t1000000 ns\n\
+drm-memory-vram:\t52428800 B\n";
+
+        let fdinfo_non_drm = "pos:\t0\nflags:\t02\nmnt_id:\t12\n";
+
+        let r1 = parse_fdinfo(fdinfo1).unwrap();
+        assert_eq!(r1.0, 14523000, "gfx engine ns");
+        assert_eq!(r1.1, 104857600, "vram bytes");
+
+        let r2 = parse_fdinfo(fdinfo2).unwrap();
+        assert_eq!(r2.0, 1000000);
+        assert_eq!(r2.1, 52428800);
+
+        // Combine (as collect() does: saturating_add across PIDs)
+        let total_eng = r1.0 + r2.0;
+        let total_vram = r1.1 + r2.1;
+        assert_eq!(total_eng, 15523000);
+        assert_eq!(total_vram, 157286400);
+
+        // Non-DRM fdinfo returns None
+        assert!(parse_fdinfo(fdinfo_non_drm).is_none());
+    }
+
+    #[test]
+    fn fdinfo_engine_with_space_separator_parsed() {
+        // Some kernels use spaces, not tabs, between key and value.
+        let fdinfo = "drm-driver: amdgpu\ndrm-engine-gfx: 99999 ns\ndrm-memory-vram: 8388608 B\n";
+        let mut eng = 0u64;
+        let mut vram = 0u64;
+        for line in fdinfo.lines() {
+            if line.starts_with("drm-engine-") {
+                if let Some(v) = line.splitn(2, ':').nth(1) {
+                    eng += v.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                }
+            } else if line.starts_with("drm-memory-vram:") {
+                if let Some(v) = line.splitn(2, ':').nth(1) {
+                    vram += v.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                }
+            }
+        }
+        assert_eq!(eng, 99999);
+        assert_eq!(vram, 8388608);
     }
 
     #[test]

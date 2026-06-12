@@ -383,6 +383,18 @@ fn bar_color(m: Metric, frac: f64) -> Color {
             lerp_u8(80, 120, f),
             lerp_u8(60, 80, f),
         ),
+        // GPU engine time: dark magenta → bright magenta/pink.
+        Metric::GpuPct => Color::Rgb(
+            lerp_u8(100, 255, f),
+            lerp_u8(0, 0, f),
+            lerp_u8(80, 200, f),
+        ),
+        // GPU VRAM: dark purple → deep purple.
+        Metric::Vram => Color::Rgb(
+            lerp_u8(60, 148, f),
+            lerp_u8(0, 0, f),
+            lerp_u8(80, 211, f),
+        ),
     }
 }
 
@@ -501,6 +513,9 @@ fn entry_complete(e: &BarEntry, m: Metric) -> bool {
         Metric::SchedWait => e.sched_complete,
         Metric::Memory => e.rss_complete,
         Metric::CfsThrottle | Metric::PsiCpu | Metric::PsiMem | Metric::PsiIo => e.cg_v2_complete,
+        Metric::GpuPct | Metric::Vram => true,
+        // GPU metrics show 0.0 when --enable-gpu is off or no GPU fds; never show '?'
+        // because 0 is accurate (the process genuinely has no GPU allocation/time).
         _ => true,
     }
 }
@@ -539,6 +554,8 @@ fn metric_display_str(e: &BarEntry, m: Metric, total_ram: u64) -> String {
         Metric::PsiCpu => format!("{:.1}%", e.psi_cpu_avg10),
         Metric::PsiMem => format!("{:.1}%", e.psi_mem_avg10),
         Metric::PsiIo => format!("{:.1}%", e.psi_io_avg10),
+        Metric::GpuPct => format!("{:.1}%", e.gpu_pct),
+        Metric::Vram   => human_bytes(e.gpu_vram_bytes),
     };
     if incomplete { format!("{base}?") } else { base }
 }
@@ -590,6 +607,9 @@ fn metric_frac(e: &BarEntry, m: Metric, total_ram: u64, peaks: &PeakVals) -> f64
         Metric::PsiCpu      => e.psi_cpu_avg10    / 100.0,
         Metric::PsiMem      => e.psi_mem_avg10    / 100.0,
         Metric::PsiIo       => e.psi_io_avg10     / 100.0,
+        // GpuPct can theoretically exceed 100% on multi-engine GPUs; cap bar at 1.0.
+        Metric::GpuPct      => (e.gpu_pct / 100.0).clamp(0.0, 1.0),
+        Metric::Vram        => if peaks.gpu_vram_bytes > 0.0 { e.gpu_vram_bytes as f64 / peaks.gpu_vram_bytes } else { 0.0 },
     }
     .clamp(0.0, 1.0)
 }
@@ -1559,6 +1579,34 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("    Rate-limited to once per 60 s per group. CMD is split on whitespace;"),
         b("    no shell expansion. All stdio is suppressed (fire-and-forget)."),
         b("    Gate explicitly: the hook fires only when --alert-cmd is provided."),
+        blank(),
+        blank(),
+        // ── GPU metrics ───────────────────────────────────────────────────────
+        h("GPU METRICS  (--enable-gpu, AMD/Intel DRM, kernel ≥ 5.14)"),
+        b("  GPU metrics are disabled by default to avoid reading /proc/PID/fdinfo for every"),
+        b("  process.  Pass --enable-gpu to enable them.  Without this flag, gpu% and vram"),
+        b("  always show 0.0; the bar is not dimmed and no '?' is appended — the value is"),
+        b("  accurate (opt-in, not a permission failure)."),
+        blank(),
+        b("  gpu%      GPU engine time % for this process group.  Computed as:"),
+        b("              Δ(drm-engine-* nanoseconds) / elapsed_wall_clock_ns × 100"),
+        b("            Summed across all GPU engines (gfx, compute, enc, dec) and all"),
+        b("            DRM file descriptors held by PIDs in the group."),
+        b("            Can exceed 100% when multiple GPU engines run simultaneously."),
+        d("            Linear scale, capped at 1.0 in the bar display."),
+        blank(),
+        b("  vram      GPU VRAM in use by this group (instantaneous, bytes)."),
+        b("            Summed from drm-memory-vram lines across all DRM fds."),
+        b("            May slightly over-count when multiple DRM contexts share allocations."),
+        d("            Log scale, relative to the current busiest group."),
+        blank(),
+        b("  Supported drivers: AMD amdgpu, Intel i915/xe (kernel ≥ 5.14)."),
+        b("  NVIDIA (NVML): not yet supported in this release."),
+        blank(),
+        b("  How it works: each open DRM file descriptor exposes lines in"),
+        b("  /proc/PID/fdinfo/N.  A fd is a DRM fd if 'drm-driver:' appears in the file."),
+        b("  drm-engine-* values are cumulative nanoseconds (like CPU jiffies) — the"),
+        b("  delta divided by elapsed time gives GPU%.  drm-memory-vram is instantaneous."),
         blank(),
         d("  apptop — GPLv3-or-later — Copyright (C) 2026 Epsilon Null Operation — see LICENSE"),
     ]

@@ -106,6 +106,11 @@ struct Cli {
     /// Rate-limited to at most once per 60 seconds per group.
     #[arg(long)]
     alert_cmd: Option<String>,
+
+    /// Enable per-process GPU metrics via /proc/PID/fdinfo (AMD/Intel DRM, kernel ≥ 5.14).
+    /// Without this flag, gpu% and vram always show 0 and fdinfo is never read.
+    #[arg(long, default_value_t = false)]
+    enable_gpu: bool,
 }
 
 /// Metric displayed on one side of the combined meter bar.
@@ -139,6 +144,13 @@ pub enum Metric {
     PsiMem,
     /// I/O pressure stall: "some avg10" from cgroup io.pressure.
     PsiIo,
+    /// GPU engine time % — delta of drm-engine-* nanoseconds over elapsed time × 100.
+    /// Requires --enable-gpu. AMD/Intel DRM only (kernel ≥ 5.14). Can exceed 100%
+    /// when multiple GPU engines (gfx, compute, enc) run simultaneously.
+    GpuPct,
+    /// GPU VRAM in use, bytes — sum of drm-memory-vram across DRM file descriptors.
+    /// Instantaneous (no delta). Requires --enable-gpu.
+    Vram,
 }
 
 impl Metric {
@@ -160,6 +172,8 @@ impl Metric {
             Self::PsiCpu => "psi-cpu",
             Self::PsiMem => "psi-mem",
             Self::PsiIo => "psi-io",
+            Self::GpuPct => "gpu%",
+            Self::Vram => "vram",
         }
     }
 
@@ -184,6 +198,8 @@ impl Metric {
             Self::PsiCpu,
             Self::PsiMem,
             Self::PsiIo,
+            Self::GpuPct,
+            Self::Vram,
         ]
     }
 
@@ -509,6 +525,13 @@ pub struct BarEntry {
     /// When false, cfs_throttle_pct and psi_* are 0.0 and should be shown as `?`.
     #[serde(default)]
     pub cg_v2_complete: bool,
+    /// GPU engine time % (delta drm-engine-* ns / elapsed ns × 100).
+    /// 0.0 when --enable-gpu is off or process has no DRM file descriptors.
+    #[serde(default)]
+    pub gpu_pct: f64,
+    /// GPU VRAM in use, bytes (drm-memory-vram from fdinfo). 0 when --enable-gpu is off.
+    #[serde(default)]
+    pub gpu_vram_bytes: u64,
 }
 
 /// Rolling peak values across visible (non-fading) entries.
@@ -531,6 +554,8 @@ pub struct PeakVals {
     pub open_fds: f64,
     pub swap_bytes: f64,
     pub power_w: f64,
+    pub gpu_pct: f64,
+    pub gpu_vram_bytes: f64,
 }
 
 impl PeakVals {
@@ -555,6 +580,8 @@ impl PeakVals {
         self.open_fds      = smooth(self.open_fds,      entries.iter().filter(|e| nf(e)).map(|e| e.open_fds as f64).fold(0.0f64, f64::max));
         self.swap_bytes    = smooth(self.swap_bytes,    entries.iter().filter(|e| nf(e)).map(|e| e.swap_bytes as f64).fold(0.0f64, f64::max));
         self.power_w       = smooth(self.power_w,       entries.iter().filter(|e| nf(e)).map(|e| e.power_w).fold(0.0f64, f64::max));
+        self.gpu_pct        = smooth(self.gpu_pct,        entries.iter().filter(|e| nf(e)).map(|e| e.gpu_pct).fold(0.0f64, f64::max));
+        self.gpu_vram_bytes = smooth(self.gpu_vram_bytes, entries.iter().filter(|e| nf(e)).map(|e| e.gpu_vram_bytes as f64).fold(0.0f64, f64::max));
     }
 }
 
@@ -589,6 +616,8 @@ pub fn metric_sort_val(e: &BarEntry, m: Metric, total_ram: u64) -> f64 {
         Metric::PsiCpu => e.psi_cpu_avg10,
         Metric::PsiMem => e.psi_mem_avg10,
         Metric::PsiIo => e.psi_io_avg10,
+        Metric::GpuPct => e.gpu_pct,
+        Metric::Vram => e.gpu_vram_bytes as f64,
     }
 }
 
@@ -766,6 +795,8 @@ pub struct AppState {
     pub anomaly_states: HashMap<GroupLabel, AnomalyState>,
     /// Alert command string (from --alert-cmd), if provided.
     pub alert_cmd: Option<String>,
+    /// True when --enable-gpu was passed; gates fdinfo reads and GPU metric display.
+    pub gpu_enabled: bool,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1010,6 +1041,7 @@ impl AppState {
             history_cursor: None,
             anomaly_states: HashMap::new(),
             alert_cmd: cli.alert_cmd.clone(),
+            gpu_enabled: cli.enable_gpu,
         })
     }
 
@@ -1136,6 +1168,7 @@ impl AppState {
             need_fds: metrics.iter().any(|m| matches!(m, Metric::OpenFds)),
             need_schedstat: metrics.iter().any(|m| matches!(m, Metric::SchedWait)),
             need_rss: metrics.iter().any(|m| matches!(m, Metric::Memory)),
+            need_gpu: self.gpu_enabled && metrics.iter().any(|m| matches!(m, Metric::GpuPct | Metric::Vram)),
         }
     }
 
@@ -1247,6 +1280,8 @@ impl AppState {
                     psi_mem_avg10: 0.0,
                     psi_io_avg10: 0.0,
                     cg_v2_complete: false,
+                    gpu_pct: 0.0,
+                    gpu_vram_bytes: 0,
                 }
             }).collect();
             // Update MemberSeries: per-host process CPU distribution for the histogram overlay.
