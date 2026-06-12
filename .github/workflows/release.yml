@@ -14,11 +14,11 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -44,7 +44,7 @@ jobs:
       - name: Stage artifacts
         run: cp target/release/apptop "apptop-${GITHUB_REF_NAME}-x86_64-linux"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             apptop-*-x86_64-linux
@@ -61,11 +61,11 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -91,7 +91,7 @@ jobs:
       - name: Stage artifacts
         run: cp target/release/apptop "apptop-${GITHUB_REF_NAME}-aarch64-linux"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             apptop-*-aarch64-linux
@@ -109,7 +109,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -120,7 +120,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y gcc-riscv64-linux-gnu
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -157,7 +157,7 @@ jobs:
           cp target/riscv64gc-unknown-linux-gnu/release/apptop \
              "apptop-${GITHUB_REF_NAME}-riscv64-linux"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             apptop-*-riscv64-linux
@@ -175,7 +175,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set snap version from tag
         run: |
@@ -184,6 +184,6 @@ jobs:
       - uses: snapcore/action-build@v1
         id: build-snap
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.build-snap.outputs.snap }}
