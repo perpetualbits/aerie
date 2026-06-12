@@ -141,15 +141,28 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target riscv64gc-unknown-linux-gnu
 
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build --target riscv64gc-unknown-linux-gnu
+
+      - name: Build .rpm
+        run: |
+          cargo install cargo-generate-rpm --locked
+          riscv64-linux-gnu-strip target/riscv64gc-unknown-linux-gnu/release/apptop
+          cargo generate-rpm --target riscv64gc-unknown-linux-gnu
+
       - name: Stage artifact
         run: |
-          riscv64-linux-gnu-strip target/riscv64gc-unknown-linux-gnu/release/apptop
           cp target/riscv64gc-unknown-linux-gnu/release/apptop \
              "apptop-${GITHUB_REF_NAME}-riscv64-linux"
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: apptop-*-riscv64-linux
+          files: |
+            apptop-*-riscv64-linux
+            target/riscv64gc-unknown-linux-gnu/debian/*.deb
+            target/riscv64gc-unknown-linux-gnu/generate-rpm/*.rpm
 
   # ── Snap (x86_64 + aarch64 via remote builders) ───────────────────────────
   # snapcore/action-build spins up an LXD container to compile inside.
