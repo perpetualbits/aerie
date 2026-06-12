@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, FleetConn, Metric, PeakVals, Side};
+use crate::{AppMode, AppState, AppView, BarEntry, FleetConn, Metric, PeakVals, Side, AnomalyState};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -46,24 +46,40 @@ fn metric_selector_line(state: &AppState) -> Line<'static> {
             Style::default().fg(Color::Red),
         ))
     } else {
-        let left_style = if state.active_side == Side::Left {
+        let paused = state.history_cursor.is_some();
+        let left_style = if paused {
+            Style::default().fg(Color::DarkGray)
+        } else if state.active_side == Side::Left {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let right_style = if state.active_side == Side::Right {
+        let right_style = if paused {
+            Style::default().fg(Color::DarkGray)
+        } else if state.active_side == Side::Right {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
         let dim_style = Style::default().fg(Color::Rgb(60, 60, 60));
+        let arrow_style = if paused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let mut spans = vec![
-            Span::styled(" ← ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" ← ", arrow_style),
             Span::styled(state.left_metric.name().to_string(), left_style),
             Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
             Span::styled(state.right_metric.name().to_string(), right_style),
-            Span::styled(" →", Style::default().fg(Color::DarkGray)),
+            Span::styled(" →", arrow_style),
         ];
+        if paused {
+            spans.push(Span::styled(
+                "  [scrub]",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
         if matches!(state.mode, AppMode::Local) {
             spans.push(Span::styled(
                 format!("  [{}]", state.group_by.name()),
@@ -713,6 +729,10 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
             // Right bar starts at `right_start` and extends to the right edge.
             let right_start = bar_w - r_filled;
 
+            // Check anomaly state for this entry.
+            let anomaly = state.anomaly_states.get(&e.label);
+            let is_anomaly = anomaly.map_or(false, |s: &AnomalyState| s.alerting);
+
             let label_style = if is_selected {
                 // Selected row: black text on cyan background for high contrast.
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -723,8 +743,19 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
                 let g = lerp_u8(200, 80, e.fade_t);
                 let b = lerp_u8(200, 80, e.fade_t);
                 Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD)
+            } else if is_anomaly {
+                // Anomaly: highlight label in LightRed to signal concentration/dropout.
+                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            };
+
+            // Anomaly prefix: "! " prepended to the label when alerting.
+            let display_label = if is_anomaly && !e.fading && !is_selected {
+                let prefixed = format!("! {}", e.label);
+                truncate_label(&prefixed, label_w)
+            } else {
+                truncate_label(&e.label, label_w)
             };
 
             let l_str = metric_display_str(e, lm, state.total_ram_bytes);
@@ -774,7 +805,7 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
             };
 
             let mut spans = vec![
-                Span::styled(truncate_label(&e.label, label_w), label_style),
+                Span::styled(display_label, label_style),
                 Span::raw(" "),
                 Span::styled(l_arrow, a_style),
                 // Right-align the value in VAL_W columns so bar edges stay lined up.
@@ -1070,7 +1101,16 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
                 " remote: {label} ({host})  │  {} processes{sys}",
                 state.entries.len()
             );
-            let k = " [←/→] metric  [Tab] side  [s] sort  [↑/↓] cursor  [Esc] disconnect  [q] quit".to_string();
+            let k = if let Some(cursor) = state.history_cursor {
+                let age = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
+                let total = state.history.len();
+                format!(
+                    " PAUSED  ◀ {}s ago ▶  sample {}/{}  [←/→] scrub  [p] resume  [Esc] disconnect  [q] quit",
+                    age, cursor + 1, total
+                )
+            } else {
+                " [←/→] metric  [Tab] side  [s] sort  [↑/↓] cursor  [p] pause  [Esc] disconnect  [q] quit".to_string()
+            };
             (s, k)
         }
         AppView::Groups => {
@@ -1150,14 +1190,28 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 format!("  {enter_hint}")
             };
-            let k = format!(" [←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group-by  [↑/↓] cursor{enter_part}  [r] refresh  [m] manual  [q] quit");
+            let k = if let Some(cursor) = state.history_cursor {
+                let age = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
+                let total = state.history.len();
+                format!(
+                    " PAUSED  ◀ {}s ago ▶  sample {}/{}  [←/→] scrub  [p] resume  [q] quit",
+                    age, cursor + 1, total
+                )
+            } else {
+                format!(" [←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group-by  [↑/↓] cursor{enter_part}  [p] pause  [r] refresh  [m] manual  [q] quit")
+            };
             (s, k)
         }
+    };
+    let keys_style = if state.history_cursor.is_some() {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(60, 60, 60))
     };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(status, Style::default().fg(Color::DarkGray)),
-            Line::styled(keys, Style::default().fg(Color::Rgb(60, 60, 60))),
+            Line::styled(keys, keys_style),
         ]),
         area,
     );
@@ -1470,6 +1524,41 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("  Node/storage status is always shown in the footer in Proxmox mode."),
         blank(),
         b("  Switching strategy clears the current snapshot and resets the stable order."),
+        blank(),
+        // ── Replay / Scrub ────────────────────────────────────────────────────
+        h("REPLAY / SCRUB"),
+        blank(),
+        kv("  [p]       ", "toggle pause — freezes the display on the current snapshot"),
+        kv("  [← →]     ", "while paused: scrub backward/forward through buffered history"),
+        kv("  [p]        ", "again to resume live mode"),
+        blank(),
+        b("  apptop keeps the last N snapshots in memory (--history-depth N, default 120)."),
+        b("  At the default 2 s interval this is ~4 minutes of history."),
+        b("  While paused the footer shows how far back in time the current view is."),
+        b("  Metric cycling (← →) is suspended while paused; resume first, then cycle."),
+        blank(),
+        // ── Anomaly alerts ────────────────────────────────────────────────────
+        h("ANOMALY ALERTS"),
+        blank(),
+        b("  apptop watches the load-distribution shape within each group using the"),
+        b("  Herfindahl N_eff concentration measure:"),
+        blank(),
+        b("    N_eff = (Σv)² / Σ(v²)   — effective-participant count"),
+        blank(),
+        b("  N_eff = N  →  all members share the load equally  (balanced)"),
+        b("  N_eff = 1  →  one member carries everything        (concentrated)"),
+        blank(),
+        b("  Two anomaly conditions are flagged (row label turns red, \"! \" prefix):"),
+        blank(),
+        kv("    concentrated   ", "N_eff/N < 0.35 with ≥ 3 members — most load on one member"),
+        kv("    dropout        ", "a member that was active (>15% share) dropped to near-zero (<3%)"),
+        blank(),
+        b("  Optional alert hook (--alert-cmd CMD):"),
+        b("    CMD is called as:  CMD GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION"),
+        d("    e.g.  alert.sh \"nginx\" \"concentrated\" \"0.18\""),
+        b("    Rate-limited to once per 60 s per group. CMD is split on whitespace;"),
+        b("    no shell expansion. All stdio is suppressed (fire-and-forget)."),
+        b("    Gate explicitly: the hook fires only when --alert-cmd is provided."),
         blank(),
         d("  apptop — GPLv3-or-later — Copyright (C) 2026 Epsilon Null Operation — see LICENSE"),
     ]

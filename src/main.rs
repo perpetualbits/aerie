@@ -95,6 +95,17 @@ struct Cli {
     /// No per-process breakdown or drill-down available in thin mode.
     #[arg(long)]
     thin: bool,
+
+    /// Number of snapshots to keep in the replay ring buffer (default: 120).
+    /// At the default 2-second interval this is 4 minutes of history.
+    #[arg(long, default_value = "120")]
+    history_depth: usize,
+
+    /// Command to run when a load-distribution anomaly is detected.
+    /// Called as: CMD GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION
+    /// Rate-limited to at most once per 60 seconds per group.
+    #[arg(long)]
+    alert_cmd: Option<String>,
 }
 
 /// Metric displayed on one side of the combined meter bar.
@@ -313,6 +324,57 @@ impl PveGroupBy {
     }
 }
 
+/// Compute N_eff (inverse-participation / Herfindahl effective-participant count).
+///
+/// N_eff = (Σv)² / Σ(v²) — ranges from 1.0 (one member dominates)
+/// to N (all members carry equal load). Returns N for all-zero input
+/// (idle-but-balanced by convention).
+fn n_eff(vals: &[f64]) -> f64 {
+    let n = vals.len();
+    if n < 2 {
+        return n as f64;
+    }
+    let sum: f64 = vals.iter().sum();
+    if sum < 1e-9 {
+        return n as f64;
+    }
+    let sum_sq: f64 = vals.iter().map(|v| v * v).sum();
+    if sum_sq < 1e-12 {
+        return n as f64;
+    }
+    (sum * sum / sum_sq).clamp(1.0, n as f64)
+}
+
+/// Alert threshold: balance_frac below this flags a group as concentrated.
+/// 0.35 means the effective participants drop to 35% of the total member count.
+const BALANCE_ALERT_THRESHOLD: f64 = 0.35;
+
+/// Minimum seconds between consecutive --alert-cmd firings for the same group.
+const ALERT_RATE_LIMIT_S: u64 = 60;
+
+/// Spawn the --alert-cmd with three positional arguments: GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION.
+///
+/// The command string is split on whitespace (no shell expansion). The child is
+/// spawned non-blocking (fire-and-forget) with all stdio suppressed so it does
+/// not interfere with the TUI.
+fn fire_alert_cmd(cmd: &str, label: &str, kind: &str, balance_frac: f64) {
+    let mut parts = cmd.split_whitespace();
+    let program = match parts.next() {
+        Some(p) => p,
+        None => return,
+    };
+    let extra_args: Vec<&str> = parts.collect();
+    let _ = std::process::Command::new(program)
+        .args(&extra_args)
+        .arg(label)
+        .arg(kind)
+        .arg(format!("{:.3}", balance_frac))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// Label identifying a group across all display levels.
 ///
 /// In local mode this is the process-group name (comm/cgroup/exe key).
@@ -320,6 +382,27 @@ impl PveGroupBy {
 /// name, a node hostname, or a Kubernetes deployment label.
 /// Using a named alias makes the intent clear at every call site.
 pub type GroupLabel = String;
+
+/// One entry in the replay ring buffer.
+pub struct HistoryEntry {
+    pub at: std::time::Instant,
+    pub entries: Vec<BarEntry>,
+    pub member_vals: HashMap<GroupLabel, MemberSeries>,
+}
+
+/// Per-group concentration-anomaly tracking state.
+pub struct AnomalyState {
+    /// N_eff / N — effective balance fraction [0, 1]. 1.0 = perfectly balanced.
+    pub balance_frac: f64,
+    /// Previous sample's per-member shares (for dropout detection).
+    pub prev_shares: Vec<f64>,
+    /// Whether an anomaly condition is currently active (drives UI highlight).
+    pub alerting: bool,
+    /// "concentrated" or "dropout" (empty when not alerting).
+    pub kind: String,
+    /// When --alert-cmd was last fired for this group (rate limit: 60 s).
+    pub last_alert_at: Option<std::time::Instant>,
+}
 
 /// Per-group member values for the fair-share histogram overlay.
 ///
@@ -330,6 +413,7 @@ pub type GroupLabel = String;
 ///
 /// Only the one metric the overlay is currently showing is kept; storing a single
 /// metric per group bounds both memory and sampling work.
+#[derive(Clone)]
 pub struct MemberSeries {
     /// Which metric these values are for.
     /// Used by the UI to detect mid-flight metric switches (stale data shows
@@ -672,6 +756,16 @@ pub struct AppState {
     pub sys_psi_io: Option<f64>,
     /// Fleet connections (AppMode::Fleet only). One entry per host in --hosts.
     pub fleet_clients: Vec<FleetConn>,
+    /// Ring buffer of recent snapshots for replay. Oldest at front, newest at back.
+    pub history: std::collections::VecDeque<HistoryEntry>,
+    /// Maximum history entries kept (from --history-depth, default 120).
+    pub history_depth: usize,
+    /// When Some(i), display is paused showing history[i]. None = live.
+    pub history_cursor: Option<usize>,
+    /// Per-group anomaly tracking state.
+    pub anomaly_states: HashMap<GroupLabel, AnomalyState>,
+    /// Alert command string (from --alert-cmd), if provided.
+    pub alert_cmd: Option<String>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -911,6 +1005,11 @@ impl AppState {
             sys_psi_mem: None,
             sys_psi_io: None,
             fleet_clients,
+            history: std::collections::VecDeque::new(),
+            history_depth: cli.history_depth.max(10),
+            history_cursor: None,
+            anomaly_states: HashMap::new(),
+            alert_cmd: cli.alert_cmd.clone(),
         })
     }
 
@@ -1058,6 +1157,9 @@ impl AppState {
     fn refresh(&mut self) {
         self.last_refresh = Some(Instant::now());
         self.snap_count += 1;
+        if self.history_cursor.is_some() {
+            return; // paused: display frozen on selected history entry
+        }
 
         let is_local = matches!(self.mode, AppMode::Local);
         let result: Result<Vec<BarEntry>> = if is_local {
@@ -1384,6 +1486,105 @@ impl AppState {
                 }
             }
         }
+
+        // Push current state to the replay ring buffer.
+        {
+            let snap = HistoryEntry {
+                at: Instant::now(),
+                entries: self.entries.clone(),
+                member_vals: self.group_member_vals.clone(),
+            };
+            self.history.push_back(snap);
+            if self.history.len() > self.history_depth {
+                self.history.pop_front();
+            }
+        }
+        // Compute anomalies from the current group_member_vals.
+        self.compute_anomalies();
+    }
+
+    /// Compute per-group N_eff concentration and update anomaly_states.
+    ///
+    /// Flags groups where the effective load distribution becomes concentrated
+    /// (balance_frac < BALANCE_ALERT_THRESHOLD) or where a member's share
+    /// collapses from active to near-zero ("stopped pulling weight").
+    /// Fires --alert-cmd when an anomaly is first detected, or after the
+    /// 60-second rate-limit window expires.
+    fn compute_anomalies(&mut self) {
+        let now = Instant::now();
+        let alert_cmd = self.alert_cmd.clone();
+
+        // Collect (label, vals) to avoid borrow conflict with self.anomaly_states.
+        let items: Vec<(GroupLabel, Vec<f64>)> = self
+            .group_member_vals
+            .iter()
+            .map(|(k, v)| (k.clone(), v.vals.clone()))
+            .collect();
+
+        // Drop state for groups no longer in the member-vals map.
+        self.anomaly_states.retain(|k, _| self.group_member_vals.contains_key(k));
+
+        for (label, vals) in items {
+            let n = vals.len();
+            if n < 2 {
+                continue;
+            }
+            let eff = n_eff(&vals);
+            let balance_frac = (eff / n as f64).clamp(0.0, 1.0);
+
+            let sum: f64 = vals.iter().sum();
+            let shares: Vec<f64> = if sum > 1e-9 {
+                vals.iter().map(|v| v / sum).collect()
+            } else {
+                vec![1.0 / n as f64; n]
+            };
+
+            let concentrated = n >= 3 && balance_frac < BALANCE_ALERT_THRESHOLD;
+
+            // Dropout: any member that was active (share > 15%) is now nearly idle (share < 3%).
+            let prev = self.anomaly_states.get(&label);
+            let dropout = if let Some(ps) = prev {
+                if ps.prev_shares.len() == n {
+                    let had_active = ps.prev_shares.iter().any(|&s| s > 0.15);
+                    let now_idle = shares.iter().any(|&s| s < 0.03);
+                    had_active && now_idle
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let alerting = concentrated || dropout;
+            let kind = if dropout { "dropout" } else if concentrated { "concentrated" } else { "" };
+
+            // Determine whether to fire the alert command.
+            let should_fire = alerting && match prev {
+                None => true,
+                Some(ps) => {
+                    !ps.alerting
+                        || ps.last_alert_at
+                            .map_or(true, |t| t.elapsed().as_secs() >= ALERT_RATE_LIMIT_S)
+                }
+            };
+
+            let last_alert_at = if should_fire {
+                if let Some(ref cmd) = alert_cmd {
+                    fire_alert_cmd(cmd, &label, kind, balance_frac);
+                }
+                Some(now)
+            } else {
+                prev.and_then(|ps| ps.last_alert_at)
+            };
+
+            self.anomaly_states.insert(label, AnomalyState {
+                balance_frac,
+                prev_shares: shares,
+                alerting,
+                kind: kind.to_string(),
+                last_alert_at,
+            });
+        }
     }
 }
 
@@ -1685,27 +1886,44 @@ fn main() -> Result<()> {
                             state.manual_scroll = state.manual_scroll.saturating_add(1);
                         }
                     }
-                    // Metric cycling for the active side (left/right arrows)
+                    // Metric cycling for the active side (left/right arrows),
+                    // or scrub through history when paused.
                     KeyCode::Left => {
                         if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
-                            match state.active_side {
-                                Side::Left => {
-                                    state.left_metric = state.left_metric.cycle_prev(is_local)
+                            if let Some(cursor) = state.history_cursor {
+                                // Scrub backward in time (toward older samples).
+                                if cursor > 0 {
+                                    let new_cursor = cursor - 1;
+                                    state.history_cursor = Some(new_cursor);
+                                    if let Some(h) = state.history.get(new_cursor) {
+                                        state.entries = h.entries.clone();
+                                        state.group_member_vals = h.member_vals.clone();
+                                    }
                                 }
-                                Side::Right => {
-                                    state.right_metric = state.right_metric.cycle_prev(is_local)
+                            } else {
+                                match state.active_side {
+                                    Side::Left  => state.left_metric  = state.left_metric.cycle_prev(is_local),
+                                    Side::Right => state.right_metric = state.right_metric.cycle_prev(is_local),
                                 }
                             }
                         }
                     }
                     KeyCode::Right => {
                         if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
-                            match state.active_side {
-                                Side::Left => {
-                                    state.left_metric = state.left_metric.cycle_next(is_local)
+                            if let Some(cursor) = state.history_cursor {
+                                // Scrub forward in time (toward newer samples).
+                                if cursor + 1 < state.history.len() {
+                                    let new_cursor = cursor + 1;
+                                    state.history_cursor = Some(new_cursor);
+                                    if let Some(h) = state.history.get(new_cursor) {
+                                        state.entries = h.entries.clone();
+                                        state.group_member_vals = h.member_vals.clone();
+                                    }
                                 }
-                                Side::Right => {
-                                    state.right_metric = state.right_metric.cycle_next(is_local)
+                            } else {
+                                match state.active_side {
+                                    Side::Left  => state.left_metric  = state.left_metric.cycle_next(is_local),
+                                    Side::Right => state.right_metric = state.right_metric.cycle_next(is_local),
                                 }
                             }
                         }
@@ -1838,6 +2056,20 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    // Toggle pause/scrub mode for the replay ring buffer.
+                    KeyCode::Char('p')
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) =>
+                    {
+                        if state.history_cursor.is_some() {
+                            // Resume live mode.
+                            state.history_cursor = None;
+                        } else if !state.history.is_empty() {
+                            // Pause at the most recent snapshot.
+                            let idx = state.history.len() - 1;
+                            state.history_cursor = Some(idx);
+                            // entries/member_vals are already showing the latest — no reload needed.
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1849,4 +2081,40 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn n_eff_balanced_equals_n() {
+        let vals = vec![10.0f64; 5];
+        let eff = n_eff(&vals);
+        assert!((eff - 5.0).abs() < 1e-9, "balanced: expected N_eff=5, got {eff}");
+    }
+
+    #[test]
+    fn n_eff_concentrated_near_one() {
+        let mut vals = vec![0.1f64; 9];
+        vals[0] = 100.0;
+        let eff = n_eff(&vals);
+        assert!(eff < 1.5, "concentrated: expected N_eff≈1, got {eff}");
+    }
+
+    #[test]
+    fn n_eff_empty_returns_zero() {
+        assert_eq!(n_eff(&[]), 0.0);
+    }
+
+    #[test]
+    fn n_eff_single_returns_one() {
+        assert!((n_eff(&[42.0]) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn n_eff_all_zero_returns_n() {
+        let vals = vec![0.0f64; 4];
+        assert!((n_eff(&vals) - 4.0).abs() < 1e-9);
+    }
 }
