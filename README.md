@@ -58,7 +58,7 @@ chmod +x apptop-*-linux && sudo mv apptop-*-linux /usr/local/bin/apptop
 
 ### Build from source
 
-Requires Rust 1.70+:
+Requires Rust 1.85+:
 
 ```bash
 git clone https://github.com/perpetualbits/apptop
