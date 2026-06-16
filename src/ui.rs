@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, FleetConn, KubeConn, Metric, PeakVals, Side, AnomalyState};
+use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, Metric, PeakVals, Side, AnomalyState};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -17,9 +17,10 @@ use ratatui::{
 ///   - 2 rows: footer (status line + key hints).
 pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
+    let term_w = area.width as usize;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(header_height(state)), Constraint::Min(0), Constraint::Length(2)])
+        .constraints([Constraint::Length(header_height(state)), Constraint::Min(0), Constraint::Length(footer_height(state, term_w))])
         .split(area);
     render_header(frame, chunks[0], state);
     match &state.view {
@@ -1035,16 +1036,243 @@ fn render_connecting(frame: &mut Frame, area: Rect, label: &str) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Render the 2-row footer: status line (top) + key hints (bottom).
+/// Compute the footer height for the current view and terminal width.
 ///
-/// The status line content varies by view and includes metrics such as:
-/// - Number of visible groups, mode, interval, next refresh countdown.
-/// - System-wide network, GPU, and power totals (local/remote mode).
-/// - Thread count and total CPU% (thread view).
-/// - Remote host and process count (remote view).
+/// The Groups view status line is made of wrapping parts, so its height varies.
+/// All other views use a fixed 2-row footer.
+fn footer_height(state: &AppState, term_w: usize) -> u16 {
+    match &state.view {
+        AppView::Groups => {
+            let parts = groups_status_parts(state);
+            (packed_row_count(&parts, term_w) as u16 + 1).min(6)
+        }
+        _ => 2,
+    }
+}
+
+/// Build the status-line parts for the Groups footer.
 ///
-/// Key hints show only the keys relevant to the current view.
+/// Each element is a self-contained display chunk. Numeric values are
+/// right-aligned in fixed-width fields so their unit suffixes stay at a
+/// constant column offset — the number grows leftward, the unit stays put.
+fn groups_status_parts(state: &AppState) -> Vec<String> {
+    let mode_label = match &state.mode {
+        AppMode::Local                  => "local /proc".to_string(),
+        AppMode::Proxmox { url, .. }    => format!("proxmox {url}"),
+        AppMode::Fleet { .. }           => "fleet".to_string(),
+        AppMode::Kube { namespace, .. } => format!("kube/{namespace}"),
+    };
+    let interval_s = state.interval.as_secs_f64();
+    let interval_str = if interval_s < 1.0 {
+        format!("{interval_s:.2}")
+    } else if interval_s.fract() == 0.0 {
+        format!("{}", interval_s as u64)
+    } else {
+        format!("{interval_s:.1}")
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+
+    let n = state.entries.len();
+    let hidden = state.total_groups.saturating_sub(n);
+    if hidden > 0 {
+        parts.push(format!("{n:>4} groups  ({hidden} hidden)"));
+    } else {
+        parts.push(format!("{n:>4} groups"));
+    }
+    parts.push(mode_label);
+    parts.push(format!("{interval_str}s"));
+    parts.push(format!("sort:{}", state.sort_metric.name()));
+
+    match &state.mode {
+        AppMode::Local => {
+            // Right-align each rate in an 8-char field: unit stays fixed, number grows left.
+            parts.push(format!(
+                "net ↓{:>8}  ↑{:>8}",
+                fmt_bytes_rate(state.sys_net_rx_s),
+                fmt_bytes_rate(state.sys_net_tx_s),
+            ));
+            if let Some(gpu) = state.sys_gpu_pct {
+                parts.push(format!("gpu {:>3.0}%", gpu));
+            }
+            if state.sys_rapl_w > 0.0 {
+                parts.push(format!("{:>7} total", fmt_watts(state.sys_rapl_w)));
+            }
+            let any_psi = state.sys_psi_cpu.is_some()
+                || state.sys_psi_mem.is_some()
+                || state.sys_psi_io.is_some();
+            if any_psi {
+                let p = |v: Option<f64>| v.map_or("     ?".to_string(), |x| format!("{:>5.1}%", x));
+                parts.push(format!(
+                    "psi cpu:{}  mem:{}  io:{}",
+                    p(state.sys_psi_cpu), p(state.sys_psi_mem), p(state.sys_psi_io),
+                ));
+            }
+        }
+        AppMode::Fleet { .. } => {
+            let total = state.fleet_clients.len();
+            let conn  = state.fleet_clients.iter().filter(|c| c.snap.is_some()).count();
+            let errs  = state.fleet_clients.iter().filter(|c| c.err.is_some() && c.client.is_some()).count();
+            let thin  = state.fleet_clients.iter().filter(|c| c.thin).count();
+            let mut s = format!("{conn:>3}/{total} hosts");
+            if thin > 0 { s.push_str(&format!("  {thin} thin")); }
+            if errs > 0 { s.push_str(&format!("  {errs} disconnected")); }
+            parts.push(s);
+        }
+        AppMode::Kube { .. } => {
+            let total = state.kube_conns.len();
+            let conn  = state.kube_conns.iter().filter(|c: &&KubeConn| c.client.is_some() && c.snap.is_some()).count();
+            let errs  = state.kube_conns.iter().filter(|c: &&KubeConn| c.err.is_some()).count();
+            let mut s = format!("pods {conn:>3}/{total}");
+            if errs > 0 { s.push_str(&format!("  {errs} err")); }
+            parts.push(s);
+        }
+        AppMode::Proxmox { .. } => {
+            for ns in &state.pve_node_status {
+                let mem_g = ns.mem_used  as f64 / 1_073_741_824.0;
+                let max_g = ns.mem_total as f64 / 1_073_741_824.0;
+                parts.push(format!("{} {:>4.0}%cpu  {:>5.1}/{:>5.1}G",
+                    ns.node, ns.cpu_pct, mem_g, max_g));
+            }
+            for ss in &state.pve_storage_status {
+                if ss.total > 0 {
+                    let pct = ss.used as f64 / ss.total as f64 * 100.0;
+                    parts.push(format!("{} {:>3.0}%", ss.storage, pct));
+                }
+            }
+        }
+    }
+
+    if state.running_unprivileged {
+        parts.push("running unprivileged — disk/ctx/fds/swap/rss partial; rerun as root".to_string());
+    }
+
+    parts
+}
+
+/// Count how many display rows `parts` need when packed left-to-right with
+/// `"  │  "` separators and a 1-space left margin, wrapping at `width`.
+fn packed_row_count(parts: &[String], width: usize) -> usize {
+    if parts.is_empty() || width == 0 {
+        return 1;
+    }
+    const SEP: usize = 5; // "  │  "
+    let mut rows = 1usize;
+    let mut col  = 0usize;
+    for (i, p) in parts.iter().enumerate() {
+        if i == 0 {
+            col = 1 + p.len();
+        } else if col + SEP + p.len() > width {
+            rows += 1;
+            col   = 1 + p.len();
+        } else {
+            col  += SEP + p.len();
+        }
+    }
+    rows
+}
+
+/// Render `parts` into styled `Line`s, greedy-wrapping at `width`.
+fn render_packed_parts(parts: &[String], width: usize) -> Vec<Line<'static>> {
+    const SEP: &str = "  │  ";
+    let dim    = Style::default().fg(Color::DarkGray);
+    let sep_st = Style::default().fg(Color::Rgb(50, 50, 50));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>>  = Vec::new();
+    let mut col = 0usize;
+
+    for (i, p) in parts.iter().enumerate() {
+        if i == 0 {
+            spans.push(Span::styled(" ".to_string(), dim));
+            spans.push(Span::styled(p.clone(), dim));
+            col = 1 + p.len();
+        } else if col + SEP.len() + p.len() > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            spans.push(Span::styled(" ".to_string(), dim));
+            spans.push(Span::styled(p.clone(), dim));
+            col = 1 + p.len();
+        } else {
+            spans.push(Span::styled(SEP.to_string(), sep_st));
+            spans.push(Span::styled(p.clone(), dim));
+            col += SEP.len() + p.len();
+        }
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Build the GPU device selector line, shown instead of key hints when devices are present.
+fn build_gpu_selector_line(state: &AppState) -> Option<Line<'static>> {
+    if !state.gpu_enabled || state.gpu_devices.is_empty() {
+        return None;
+    }
+    let mut spans = vec![Span::styled(" GPU [/]: ".to_string(), Style::default().fg(Color::DarkGray))];
+    if state.selected_gpu == 0 {
+        spans.push(Span::styled("[all]".to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    } else {
+        spans.push(Span::styled("all".to_string(), Style::default().fg(Color::DarkGray)));
+    }
+    for (i, dev) in state.gpu_devices.iter().enumerate() {
+        spans.push(Span::styled("  ".to_string(), Style::default()));
+        let label = format!("{}:{}", dev.driver, dev.pci_addr);
+        if state.selected_gpu == i + 1 {
+            spans.push(Span::styled(format!("[{label}]"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        } else {
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+        }
+    }
+    Some(Line::from(spans))
+}
+
+/// Render the Groups-view footer: parts-based status rows + key hints (or GPU selector).
+fn render_footer_groups(frame: &mut Frame, area: Rect, state: &AppState) {
+    let w = area.width as usize;
+    let mut lines = render_packed_parts(&groups_status_parts(state), w);
+
+    let keys_style = if state.history_cursor.is_some() {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(60, 60, 60))
+    };
+
+    if let Some(gl) = build_gpu_selector_line(state) {
+        lines.push(gl);
+    } else if let Some(cursor) = state.history_cursor {
+        let age   = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
+        let total = state.history.len();
+        lines.push(Line::styled(
+            format!(" PAUSED  ◀ {age}s ago ▶  sample {}/{total}  [←/→] scrub  [p] resume  [q] quit",
+                cursor + 1),
+            keys_style,
+        ));
+    } else {
+        let enter_part = if matches!(state.mode, AppMode::Local) {
+            "  [Enter] threads"
+        } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. }) || state.enable_remote {
+            "  [Enter] drill down"
+        } else {
+            ""
+        };
+        lines.push(Line::styled(
+            format!(" [←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group-by  [↑/↓] cursor{enter_part}  [p] pause  [r] refresh  [m] manual  [q] quit"),
+            keys_style,
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the footer: status line(s) + key hints.
+///
+/// The Groups view uses a parts-based variable-height layout (see
+/// `render_footer_groups`). All other views use a fixed 2-row layout.
 fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
+    if matches!(state.view, AppView::Groups) {
+        render_footer_groups(frame, area, state);
+        return;
+    }
     let mode_label = match &state.mode {
         AppMode::Local => "local /proc".to_string(),
         AppMode::Proxmox { url, .. } => format!("proxmox {url}"),
@@ -1130,134 +1358,11 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             };
             (s, k)
         }
-        AppView::Groups => {
-            let hidden = state.total_groups.saturating_sub(state.entries.len());
-            let hidden_str = if hidden > 0 {
-                format!("  ({hidden} idle hidden)")
-            } else {
-                String::new()
-            };
-
-            // System metrics: local /proc data in local mode; node/storage summary in Proxmox mode;
-            // connected host count in Fleet mode; pod count in Kube mode.
-            let sys_parts = if matches!(state.mode, AppMode::Kube { .. }) {
-                let total = state.kube_conns.len();
-                let connected = state.kube_conns.iter().filter(|c: &&KubeConn| c.client.is_some() && c.snap.is_some()).count();
-                let errored = state.kube_conns.iter().filter(|c: &&KubeConn| c.err.is_some()).count();
-                let mut s = format!("  │  pods {connected}/{total}");
-                if errored > 0 {
-                    s.push_str(&format!("  │  {errored} err"));
-                }
-                s
-            } else if matches!(state.mode, AppMode::Fleet { .. }) {
-                let total = state.fleet_clients.len();
-                let connected = state.fleet_clients.iter().filter(|c: &&FleetConn| c.snap.is_some()).count();
-                let errors = state.fleet_clients.iter().filter(|c: &&FleetConn| c.err.is_some() && c.client.is_some()).count();
-                let thin_count = state.fleet_clients.iter().filter(|c: &&FleetConn| c.thin).count();
-                let mut s = format!("  │  {connected}/{total} hosts connected");
-                if thin_count > 0 {
-                    s.push_str(&format!("  │  {thin_count} thin"));
-                }
-                if errors > 0 {
-                    s.push_str(&format!("  │  {errors} disconnected"));
-                }
-                s
-            } else if matches!(state.mode, AppMode::Local) {
-                sys_metrics(state)
-            } else {
-                // Append per-node CPU/mem and per-storage fill to the Proxmox status line.
-                let mut s = String::new();
-                for ns in &state.pve_node_status {
-                    let mem_g = ns.mem_used as f64 / 1_073_741_824.0;
-                    let max_g = ns.mem_total as f64 / 1_073_741_824.0;
-                    s.push_str(&format!(
-                        "  │  {} {:.0}%cpu {:.0}/{:.0}G",
-                        ns.node, ns.cpu_pct, mem_g, max_g,
-                    ));
-                }
-                for ss in &state.pve_storage_status {
-                    if ss.total > 0 {
-                        let pct = ss.used as f64 / ss.total as f64 * 100.0;
-                        s.push_str(&format!("  │  {} {:.0}%", ss.storage, pct));
-                    }
-                }
-                s
-            };
-
-            let enter_hint = if matches!(state.mode, AppMode::Local) {
-                "[Enter] threads"
-            } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. }) || state.enable_remote {
-                "[Enter] drill down"
-            } else {
-                ""
-            };
-
-            let unprivileged_note = if state.running_unprivileged {
-                "  │  running unprivileged — disk/ctx/fds/swap/rss incomplete for other users' processes; rerun as root for full data"
-            } else {
-                ""
-            };
-
-            let s = format!(
-                " {} groups{hidden_str}  │  {mode_label}  │  {interval_str}s  │  sort:{}{sys_parts}{unprivileged_note}",
-                state.entries.len(),
-                state.sort_metric.name()
-            );
-            let enter_part = if enter_hint.is_empty() {
-                String::new()
-            } else {
-                format!("  {enter_hint}")
-            };
-            let k = if let Some(cursor) = state.history_cursor {
-                let age = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
-                let total = state.history.len();
-                format!(
-                    " PAUSED  ◀ {}s ago ▶  sample {}/{}  [←/→] scrub  [p] resume  [q] quit",
-                    age, cursor + 1, total
-                )
-            } else {
-                format!(" [←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group-by  [↑/↓] cursor{enter_part}  [p] pause  [r] refresh  [m] manual  [q] quit")
-            };
-            (s, k)
-        }
+        AppView::Groups => unreachable!("handled by render_footer_groups"),
     };
-    // Build GPU device selector line (shown below status/keys when gpu is enabled and devices exist)
-    let gpu_device_line: Option<Line<'static>> = if state.gpu_enabled
-        && !state.gpu_devices.is_empty()
-        && matches!(state.view, AppView::Groups | AppView::Remote { .. })
-    {
-        let mut spans = vec![Span::styled(
-            " GPU [/]: ".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )];
-        // "all" entry (selected_gpu == 0)
-        if state.selected_gpu == 0 {
-            spans.push(Span::styled(
-                "[all]".to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::styled(
-                "all".to_string(),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        for (i, dev) in state.gpu_devices.iter().enumerate() {
-            spans.push(Span::styled("  ".to_string(), Style::default()));
-            let label = format!("{}:{}", dev.driver, dev.pci_addr);
-            if state.selected_gpu == i + 1 {
-                spans.push(Span::styled(
-                    format!("[{label}]"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    label,
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        }
-        Some(Line::from(spans))
+    // GPU device selector for Remote view (Groups view handles this in render_footer_groups).
+    let gpu_device_line = if matches!(state.view, AppView::Remote { .. }) {
+        build_gpu_selector_line(state)
     } else {
         None
     };
