@@ -761,6 +761,149 @@ pub fn connect_thin(user: &str, host: &str, policy: SshHostKeyPolicy) -> Result<
     Ok(ThinProbe { child, recv: rx, _thread: thread, host: host.to_string() })
 }
 
+/// Validate a Nomad target (alloc ID, task name, job name) for use as a CLI argument.
+///
+/// Rejects empty names, names starting with '-' (option-injection guard), and names
+/// containing control characters. Nomad alloc IDs are lowercase UUID hex with hyphens;
+/// job and task names may additionally contain underscores and dots.
+pub fn validate_nomad_target(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("nomad {kind}: name is empty");
+    }
+    if name.starts_with('-') {
+        anyhow::bail!(
+            "nomad {kind}: name {:?} starts with '-' (option injection guard)", name
+        );
+    }
+    if name.chars().any(|c| c.is_control()) {
+        anyhow::bail!("nomad {kind}: name {:?} contains control characters", name);
+    }
+    Ok(())
+}
+
+/// Connect to a Nomad allocation via `nomad alloc exec` and run `apptop --daemon`.
+///
+/// The command spawned is:
+/// ```text
+/// nomad alloc exec -address=ADDR -task=TASK ALLOC_ID -- apptop --daemon
+/// ```
+/// All arguments are passed as separate tokens (never shell-expanded). When an ACL
+/// token is provided it is injected as `NOMAD_TOKEN` in the child environment rather
+/// than a CLI flag, so it does not appear in the process list.
+///
+/// The 600 ms fast-fail window detects immediate failures: alloc not found, ACL
+/// denied, or `apptop` not installed in the task image.
+pub fn connect_nomad_daemon(
+    alloc_id: &str,
+    task: &str,
+    addr: &str,
+    token: Option<&str>,
+) -> Result<RemoteClient> {
+    validate_nomad_target("alloc", alloc_id)?;
+    validate_nomad_target("task", task)?;
+
+    let mut cmd = Command::new("nomad");
+    cmd.args([
+        "alloc", "exec",
+        &format!("-address={addr}"),
+        &format!("-task={task}"),
+        alloc_id,
+        "--", "apptop", "--daemon",
+    ]);
+    if let Some(tok) = token {
+        cmd.env("NOMAD_TOKEN", tok);
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow!("could not run nomad: {e} — is nomad in PATH?"))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(snap) = serde_json::from_str::<DaemonSnapshot>(&line) {
+                if tx.send(snap).is_err() { break; }
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(600));
+    match child.try_wait() {
+        Ok(Some(status)) => Err(anyhow!(
+            "nomad alloc exec exited immediately ({status}) — check ACL token, alloc ID, and that apptop is installed in the task"
+        )),
+        Err(e) => Err(anyhow!("process error: {e}")),
+        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: alloc_id.to_string() }),
+    }
+}
+
+/// Establish a thin `/proc` shell probe to a Nomad allocation via `nomad alloc exec`.
+///
+/// Runs the same fixed `/proc` reader shell loop as `connect_kube_thin`, but using
+/// `nomad alloc exec` as the transport. Requires only `sh`, `cat`, `printf`, and
+/// `sleep` inside the task — no `apptop` binary needed.
+pub fn connect_nomad_thin(
+    alloc_id: &str,
+    task: &str,
+    addr: &str,
+    token: Option<&str>,
+) -> Result<ThinProbe> {
+    validate_nomad_target("alloc", alloc_id)?;
+    validate_nomad_target("task", task)?;
+
+    // Fixed shell command — not user-supplied; no injection risk.
+    let shell_cmd = "while true; do cat /proc/stat /proc/meminfo; printf '===\\n'; sleep 1; done";
+
+    let mut cmd = Command::new("nomad");
+    cmd.args([
+        "alloc", "exec",
+        &format!("-address={addr}"),
+        &format!("-task={task}"),
+        alloc_id,
+        "--", "sh", "-c", shell_cmd,
+    ]);
+    if let Some(tok) = token {
+        cmd.env("NOMAD_TOKEN", tok);
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow!("could not run nomad: {e} — is nomad in PATH?"))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
+    let (tx, rx) = mpsc::channel::<DaemonSnapshot>();
+    let thread = std::thread::spawn(move || {
+        let mut block: Vec<String> = Vec::new();
+        let mut prev_total: Option<u64> = None;
+        let mut prev_idle:  Option<u64> = None;
+        let mut snap_count: usize = 0;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line.trim() == "===" {
+                if let Some(snap) = parse_thin_block(&block, &mut prev_total, &mut prev_idle, &mut snap_count) {
+                    if tx.send(snap).is_err() { break; }
+                }
+                block.clear();
+            } else {
+                block.push(line);
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(600));
+    match child.try_wait() {
+        Ok(Some(status)) => Err(anyhow!(
+            "nomad alloc exec exited immediately ({status}) — check ACL token and alloc accessibility"
+        )),
+        Err(e) => Err(anyhow!("process error: {e}")),
+        Ok(None) => Ok(ThinProbe { child, recv: rx, _thread: thread, host: alloc_id.to_string() }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

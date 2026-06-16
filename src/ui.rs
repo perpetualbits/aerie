@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, Metric, PeakVals, Side, AnomalyState};
+use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -1072,10 +1072,11 @@ fn footer_height(state: &AppState, term_w: usize) -> u16 {
 /// constant column offset — the number grows leftward, the unit stays put.
 fn groups_status_parts(state: &AppState) -> Vec<String> {
     let mode_label = match &state.mode {
-        AppMode::Local                  => "local /proc".to_string(),
-        AppMode::Proxmox { url, .. }    => format!("proxmox {url}"),
-        AppMode::Fleet { .. }           => "fleet".to_string(),
-        AppMode::Kube { namespace, .. } => format!("kube/{namespace}"),
+        AppMode::Local                              => "local /proc".to_string(),
+        AppMode::Proxmox { url, .. }               => format!("proxmox {url}"),
+        AppMode::Fleet { .. }                      => "fleet".to_string(),
+        AppMode::Kube { namespace, .. }            => format!("kube/{namespace}"),
+        AppMode::Nomad { addr, namespace, .. }     => format!("nomad/{namespace} {addr}"),
     };
     let interval_s = state.interval.as_secs_f64();
     let interval_str = if interval_s < 1.0 {
@@ -1139,6 +1140,14 @@ fn groups_status_parts(state: &AppState) -> Vec<String> {
             let conn  = state.kube_conns.iter().filter(|c: &&KubeConn| c.client.is_some() && c.snap.is_some()).count();
             let errs  = state.kube_conns.iter().filter(|c: &&KubeConn| c.err.is_some()).count();
             let mut s = format!("pods {conn:>3}/{total}");
+            if errs > 0 { s.push_str(&format!("  {errs} err")); }
+            parts.push(s);
+        }
+        AppMode::Nomad { .. } => {
+            let total = state.nomad_conns.len();
+            let conn  = state.nomad_conns.iter().filter(|c: &&NomadConn| c.client.is_some() && c.snap.is_some()).count();
+            let errs  = state.nomad_conns.iter().filter(|c: &&NomadConn| c.err.is_some()).count();
+            let mut s = format!("allocs {conn:>3}/{total}");
             if errs > 0 { s.push_str(&format!("  {errs} err")); }
             parts.push(s);
         }
@@ -1289,10 +1298,11 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
     let mode_label = match &state.mode {
-        AppMode::Local => "local /proc".to_string(),
-        AppMode::Proxmox { url, .. } => format!("proxmox {url}"),
-        AppMode::Fleet { .. } => "fleet".to_string(),
-        AppMode::Kube { namespace, .. } => format!("kube/{namespace}"),
+        AppMode::Local                          => "local /proc".to_string(),
+        AppMode::Proxmox { url, .. }           => format!("proxmox {url}"),
+        AppMode::Fleet { .. }                  => "fleet".to_string(),
+        AppMode::Kube { namespace, .. }        => format!("kube/{namespace}"),
+        AppMode::Nomad { addr, namespace, .. } => format!("nomad/{namespace} {addr}"),
     };
     let interval_s = state.interval.as_secs_f64();
     // Format the interval: "0.50" for sub-second, "2" for whole seconds, "1.5" for fractions.
@@ -1710,6 +1720,36 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("    • Host-network or /proc visibility inside the container for thin mode"),
         blank(),
         b("  Pod list is discovered once at startup; press [r] to re-query."),
+        blank(),
+        // ── Nomad ─────────────────────────────────────────────────────────────
+        h("NOMAD (EXPERIMENTAL)  (--nomad http://nomad.lan:4646)"),
+        b("  Monitor Nomad allocations via nomad alloc exec.  Each running allocation"),
+        b("  appears as one row, labelled job-name[alloc-short-id].  The bar shows"),
+        b("  system-wide CPU% and memory inside the allocation.  The extra column shows"),
+        b("  the task group name."),
+        blank(),
+        kv("  --nomad ADDR              ", "Nomad HTTP API address (e.g. http://nomad.lan:4646)"),
+        kv("  --nomad-namespace NS      ", "Nomad namespace (env: NOMAD_NAMESPACE, default: default)"),
+        kv("  --nomad-token TOKEN       ", "ACL token (env: NOMAD_TOKEN; omit if ACL is disabled)"),
+        kv("  --nomad-job JOB           ", "filter to allocations of one specific job"),
+        kv("  --nomad-thin              ", "thin /proc probe — no apptop binary required in the task"),
+        blank(),
+        b("  The work-density histogram overlay ([h]) on any allocation row shows the"),
+        b("  process distribution within that allocation — identical to fleet host rows."),
+        blank(),
+        kv("  [Enter]  ", "drill into the selected allocation for per-process detail (daemon mode)"),
+        kv("  [Esc]    ", "exit drill-down back to the allocation list"),
+        blank(),
+        b("  Requirements:"),
+        b("    • nomad CLI in PATH (used as the exec transport for both daemon and thin mode)"),
+        b("    • Daemon mode: apptop binary installed and in PATH inside the task image"),
+        b("    • Thin mode: sh, cat, printf, sleep — standard in any Linux container"),
+        blank(),
+        b("  Multi-task allocations: apptop execs into the first alphabetically-sorted"),
+        b("  running task.  Use --nomad-job to narrow to jobs with predictable task names."),
+        blank(),
+        b("  Allocation list is discovered once at startup via the Nomad HTTP API;"),
+        b("  press [r] to re-discover.  Only allocations with ClientStatus=running are shown."),
         blank(),
         // ── GroupBy ───────────────────────────────────────────────────────────
         h("GROUPING STRATEGY  [g]"),

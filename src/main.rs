@@ -44,7 +44,8 @@ use std::{
     version,
     about = "Thread / VM activity bar-chart monitor.\n\
              Local mode (default): reads /proc and groups processes by name.\n\
-             Proxmox mode: polls the PVE API and shows per-VM CPU + memory."
+             Proxmox mode: polls the PVE API and shows per-VM CPU + memory.\n\
+             Nomad mode (--nomad): monitors allocations via nomad alloc exec."
 )]
 struct Cli {
     /// Proxmox API base URL, e.g. https://pve.lan:8006
@@ -135,6 +136,34 @@ struct Cli {
     /// Used with --kube.
     #[arg(long)]
     kube_thin: bool,
+
+    /// [EXPERIMENTAL] Monitor Nomad allocations via nomad alloc exec.
+    /// Provide the Nomad HTTP API address (e.g. http://nomad.lan:4646).
+    /// Requires the nomad CLI in PATH.
+    #[arg(long)]
+    nomad: Option<String>,
+
+    /// Nomad namespace to monitor.
+    /// Used with --nomad.
+    #[arg(long, env = "NOMAD_NAMESPACE", default_value = "default")]
+    nomad_namespace: String,
+
+    /// Nomad ACL token. Can also be provided via the NOMAD_TOKEN environment variable.
+    /// Omit for clusters with ACL disabled.
+    /// Used with --nomad.
+    #[arg(long, env = "NOMAD_TOKEN")]
+    nomad_token: Option<String>,
+
+    /// Filter --nomad to allocations of one specific job name.
+    /// Used with --nomad.
+    #[arg(long)]
+    nomad_job: Option<String>,
+
+    /// Use a thin /proc shell probe instead of apptop --daemon in the allocation.
+    /// Works without apptop installed in the task image; provides CPU% and memory only.
+    /// Used with --nomad.
+    #[arg(long)]
+    nomad_thin: bool,
 }
 
 /// Metric displayed on one side of the combined meter bar.
@@ -286,6 +315,20 @@ pub enum AppMode {
         selector: Option<String>,
         /// kubectl context name from kubeconfig. None = current context.
         context: Option<String>,
+        /// When true, use thin /proc shell probe; when false, use apptop --daemon.
+        thin: bool,
+    },
+    /// Monitor Nomad allocations via `nomad alloc exec`.
+    /// Experimental — requires nomad CLI in PATH and appropriate ACL policy.
+    Nomad {
+        /// Nomad HTTP API address (e.g. "http://nomad.lan:4646").
+        addr: String,
+        /// Nomad namespace (default: "default").
+        namespace: String,
+        /// Optional ACL token. None = anonymous / ACL disabled.
+        token: Option<String>,
+        /// Optional job name filter. None = all running allocations in the namespace.
+        job_filter: Option<String>,
         /// When true, use thin /proc shell probe; when false, use apptop --daemon.
         thin: bool,
     },
@@ -727,6 +770,33 @@ pub struct KubeConn {
     pub thin: bool,
 }
 
+/// One Nomad allocation connection in --nomad mode.
+///
+/// Analogous to `KubeConn`. The display row label is `"{job_id}[{alloc_short}]"` so
+/// the job name is always visible even when multiple replicas of the same job run.
+/// The histogram overlay shows process distribution within the allocation (daemon mode),
+/// using the entry label as the key — identical to the fleet-host pattern.
+pub struct NomadConn {
+    /// Full allocation UUID — the exec target for `nomad alloc exec`.
+    pub alloc_id: String,
+    /// First 8 hex chars of the UUID — used in the display label.
+    pub alloc_short: String,
+    /// Task name within the allocation to exec into.
+    pub task_name: String,
+    /// Job name — used as the grouping key and in the display label.
+    pub job_id: String,
+    /// Task group name — shown in the `extra` column.
+    pub task_group: String,
+    /// Active `nomad alloc exec` connection, or None if not yet connected / failed.
+    pub client: Option<FleetClient>,
+    /// Most recent snapshot received from this allocation.
+    pub snap: Option<remote::DaemonSnapshot>,
+    /// Error from the most recent connection attempt (shown in the footer).
+    pub err: Option<String>,
+    /// Whether this connection uses the thin /proc shell probe.
+    pub thin: bool,
+}
+
 /// All mutable state owned by the main event loop.
 pub struct AppState {
     pub mode: AppMode,
@@ -853,6 +923,8 @@ pub struct AppState {
     pub fleet_clients: Vec<FleetConn>,
     /// Kubernetes pod connections (AppMode::Kube only). One entry per discovered pod.
     pub kube_conns: Vec<KubeConn>,
+    /// Nomad allocation connections (AppMode::Nomad only). One entry per running allocation.
+    pub nomad_conns: Vec<NomadConn>,
     /// Ring buffer of recent snapshots for replay. Oldest at front, newest at back.
     pub history: std::collections::VecDeque<HistoryEntry>,
     /// Maximum history entries kept (from --history-depth, default 120).
@@ -993,6 +1065,91 @@ fn discover_pods(
     Ok(pods)
 }
 
+/// Discover running Nomad allocations via the Nomad HTTP API.
+///
+/// Calls `GET {addr}/v1/allocations?namespace={ns}` and filters to entries with
+/// `ClientStatus == "running"` and `DesiredStatus == "run"`.  Returns a
+/// `Vec<(alloc_id, task_name, job_id, task_group)>` sorted by job name so the
+/// display order is stable across refreshes.
+///
+/// The task name is resolved from `TaskStates` (first running task, alphabetically).
+/// Falls back to the task group name when `TaskStates` is absent or empty — this
+/// covers the common case of single-task task groups where task name == group name.
+fn discover_nomad_allocs(
+    addr: &str,
+    namespace: &str,
+    token: Option<&str>,
+    job_filter: Option<&str>,
+) -> anyhow::Result<Vec<(String, String, String, String)>> {
+    use reqwest::blocking::Client;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let url = format!("{addr}/v1/allocations?namespace={namespace}");
+    let mut req = client.get(&url);
+    if let Some(tok) = token {
+        req = req.header("X-Nomad-Token", tok);
+    }
+
+    let resp = req.send().context("Nomad API request failed")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Nomad API {url}: HTTP {}", resp.status());
+    }
+
+    let body: serde_json::Value = resp.json().context("Nomad API: invalid JSON response")?;
+    let items = body.as_array()
+        .ok_or_else(|| anyhow::anyhow!("Nomad API: expected a JSON array of allocations"))?;
+
+    let mut result: Vec<(String, String, String, String)> = Vec::new();
+    for item in items {
+        let client_status = item["ClientStatus"].as_str().unwrap_or("");
+        let desired_status = item["DesiredStatus"].as_str().unwrap_or("");
+        if client_status != "running" || desired_status != "run" {
+            continue;
+        }
+
+        let alloc_id = match item["ID"].as_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let job_id = match item["JobID"].as_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let task_group = item["TaskGroup"].as_str().unwrap_or("").to_string();
+
+        if let Some(filter) = job_filter {
+            if job_id != filter {
+                continue;
+            }
+        }
+
+        // Pick the first running task alphabetically from TaskStates.
+        let task_name = item["TaskStates"].as_object()
+            .and_then(|ts| {
+                let mut running: Vec<&str> = ts.iter()
+                    .filter(|(_, v)| v["State"].as_str() == Some("running"))
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+                running.sort_unstable();
+                running.into_iter().next().map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| task_group.clone());
+
+        // Reject names that would cause option injection.
+        if remote::validate_nomad_target("alloc", &alloc_id).is_err() { continue; }
+        if remote::validate_nomad_target("task", &task_name).is_err() { continue; }
+
+        result.push((alloc_id, task_name, job_id, task_group));
+    }
+
+    // Stable sort by job_id so same-job allocations appear together.
+    result.sort_by(|a, b| a.2.cmp(&b.2));
+    Ok(result)
+}
+
 impl AppState {
     /// Construct a new `AppState` from parsed CLI arguments.
     ///
@@ -1002,7 +1159,15 @@ impl AppState {
     ///
     /// Returns an error if Proxmox mode is requested but `--token` is missing.
     fn new(cli: &Cli) -> Result<Self> {
-        let mode = if let Some(kube_arg) = &cli.kube {
+        let mode = if let Some(nomad_addr) = &cli.nomad {
+            AppMode::Nomad {
+                addr: nomad_addr.clone(),
+                namespace: cli.nomad_namespace.clone(),
+                token: cli.nomad_token.clone(),
+                job_filter: cli.nomad_job.clone(),
+                thin: cli.nomad_thin,
+            }
+        } else if let Some(kube_arg) = &cli.kube {
             let (namespace, selector) = parse_kube_arg(kube_arg)?;
             AppMode::Kube {
                 namespace,
@@ -1197,6 +1362,49 @@ impl AppState {
             vec![]
         };
 
+        let nomad_conns: Vec<NomadConn> = if let AppMode::Nomad { ref addr, ref namespace, ref token, ref job_filter, thin } = mode {
+            let allocs = discover_nomad_allocs(addr, namespace, token.as_deref(), job_filter.as_deref())
+                .unwrap_or_else(|e| {
+                    eprintln!("apptop: nomad discover: {e}");
+                    vec![]
+                });
+            let addr_c = addr.clone();
+            let token_c = token.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<(String, String, String, String, Result<FleetClient>)>();
+            for (alloc_id, task_name, job_id, task_group) in allocs {
+                let tx = tx.clone();
+                let addr2 = addr_c.clone();
+                let tok2 = token_c.clone();
+                let aid = alloc_id.clone();
+                let tn = task_name.clone();
+                let is_thin = thin;
+                std::thread::spawn(move || {
+                    let result: Result<FleetClient> = if is_thin {
+                        remote::connect_nomad_thin(&aid, &tn, &addr2, tok2.as_deref()).map(FleetClient::Thin)
+                    } else {
+                        remote::connect_nomad_daemon(&aid, &tn, &addr2, tok2.as_deref()).map(FleetClient::Daemon)
+                    };
+                    let _ = tx.send((alloc_id, task_name, job_id, task_group, result));
+                });
+            }
+            drop(tx);
+            rx.into_iter().map(|(alloc_id, task_name, job_id, task_group, result)| {
+                let alloc_short = alloc_id.chars().take(8).collect::<String>();
+                match result {
+                    Ok(client) => NomadConn {
+                        alloc_id, alloc_short, task_name, job_id, task_group,
+                        client: Some(client), snap: None, err: None, thin,
+                    },
+                    Err(e) => NomadConn {
+                        alloc_id, alloc_short, task_name, job_id, task_group,
+                        client: None, snap: None, err: Some(e.to_string()), thin,
+                    },
+                }
+            }).collect()
+        } else {
+            vec![]
+        };
+
         Ok(Self {
             mode,
             proxmox_rx,
@@ -1253,6 +1461,7 @@ impl AppState {
             sys_psi_io: None,
             fleet_clients,
             kube_conns,
+            nomad_conns,
             history: std::collections::VecDeque::new(),
             history_depth: cli.history_depth.max(10),
             history_cursor: None,
@@ -1675,6 +1884,99 @@ impl AppState {
                 }
             }
 
+            Ok(raw)
+        } else if matches!(self.mode, AppMode::Nomad { .. }) {
+            // Poll each Nomad allocation connection for new snapshots.
+            let hist_metric = match self.active_side {
+                Side::Left => self.left_metric,
+                Side::Right => self.right_metric,
+            };
+            for conn in &mut self.nomad_conns {
+                let new_snap = match &mut conn.client {
+                    Some(FleetClient::Daemon(c)) => c.try_recv(),
+                    Some(FleetClient::Thin(t))   => t.try_recv(),
+                    None => None,
+                };
+                if let Some(snap) = new_snap {
+                    conn.snap = Some(snap);
+                    conn.err = None;
+                }
+                let alive = match &mut conn.client {
+                    Some(FleetClient::Daemon(c)) => c.is_alive(),
+                    Some(FleetClient::Thin(t))   => t.is_alive(),
+                    None => false,
+                };
+                if !alive && conn.client.is_some() {
+                    conn.err = Some("connection lost".into());
+                }
+            }
+            // Build BarEntries: one row per allocation.
+            // Label format: "{job_id}[{alloc_short}]" keeps the job name visible at a glance.
+            let raw: Vec<BarEntry> = self.nomad_conns.iter().map(|conn| {
+                let label = format!("{}[{}]", conn.job_id, conn.alloc_short);
+                let (cpu, mem_pct, mem_used, has_data) = if let Some(ref snap) = conn.snap {
+                    let cpu = snap.sys_cpu_pct.unwrap_or_else(|| {
+                        snap.entries.iter().map(|e| e.value).sum::<f64>().min(100.0)
+                    });
+                    let mem_pct = if snap.total_ram_bytes > 0 {
+                        snap.sys_mem_used_bytes as f64 / snap.total_ram_bytes as f64 * 100.0
+                    } else { 0.0 };
+                    (cpu, mem_pct, snap.sys_mem_used_bytes, true)
+                } else {
+                    (0.0, 0.0, 0u64, false)
+                };
+                let extra = if conn.err.is_some() {
+                    "error".into()
+                } else if conn.thin {
+                    "(thin)".into()
+                } else if !has_data {
+                    "connecting…".into()
+                } else {
+                    conn.task_group.clone()
+                };
+                BarEntry {
+                    label,
+                    value: cpu,
+                    count: None,
+                    extra,
+                    fading: false,
+                    fade_t: 0.0,
+                    rss_bytes: mem_used,
+                    mem_pct,
+                    page_faults_s: 0.0,
+                    disk_read_s: 0.0,
+                    disk_write_s: 0.0,
+                    ctx_switches_s: 0.0,
+                    open_fds: 0,
+                    swap_bytes: 0,
+                    sched_wait_pct: 0.0,
+                    power_w: 0.0,
+                    disk_complete: true,
+                    status_complete: true,
+                    fds_complete: true,
+                    sched_complete: true,
+                    rss_complete: true,
+                    cfs_throttle_pct: 0.0,
+                    psi_cpu_avg10: None,
+                    psi_mem_avg10: None,
+                    psi_io_avg10: None,
+                    cg_v2_complete: false,
+                    gpu_pct: 0.0,
+                    gpu_vram_bytes: 0,
+                }
+            }).collect();
+            // Work-density overlay: process distribution within each allocation.
+            // Key = entry label (same fleet-host pattern), value = per-process CPU from daemon.
+            self.group_member_vals.clear();
+            for conn in &self.nomad_conns {
+                if let Some(ref snap) = conn.snap {
+                    let label = format!("{}[{}]", conn.job_id, conn.alloc_short);
+                    let vals: Vec<f64> = snap.entries.iter().map(|e| e.value).collect();
+                    if !vals.is_empty() {
+                        self.group_member_vals.insert(label, MemberSeries { metric: hist_metric, vals });
+                    }
+                }
+            }
             Ok(raw)
         } else {
             // Non-blocking drain of the Proxmox background thread channel.
@@ -2287,7 +2589,7 @@ fn main() -> Result<()> {
                             state.stable_order.clear();
                             state.entries.clear();
                         }
-                        // Fleet / Kube: no grouping to cycle; ignore silently.
+                        // Fleet / Kube / Nomad: no grouping to cycle; ignore silently.
                     }
                     // Cursor navigation: arrow keys (and vim j/k); also manual scroll
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -2399,10 +2701,44 @@ fn main() -> Result<()> {
                             });
                         }
                     }
-                    // Enter: drill down — threads (local), SSH daemon (proxmox/fleet), kubectl exec (kube)
+                    // Enter: drill down — threads (local), SSH daemon (proxmox/fleet), kubectl exec (kube), nomad alloc exec (nomad)
                     KeyCode::Enter => {
                         if matches!(state.view, AppView::Groups) {
-                            if matches!(state.mode, AppMode::Kube { .. }) {
+                            if matches!(state.mode, AppMode::Nomad { .. }) {
+                                if let Some(conn) = state.nomad_conns.get(state.cursor) {
+                                    if conn.thin {
+                                        state.error = Some(
+                                            "thin probe mode — no per-process drill-down; remove --nomad-thin to enable".into()
+                                        );
+                                    } else if conn.client.is_none() {
+                                        state.error = Some(format!("not connected to alloc {}", conn.alloc_short));
+                                    } else {
+                                        let alloc_id = conn.alloc_id.clone();
+                                        let task = conn.task_name.clone();
+                                        let label = format!("{}[{}]", conn.job_id, conn.alloc_short);
+                                        let (addr, token) = if let AppMode::Nomad { ref addr, ref token, .. } = state.mode {
+                                            (addr.clone(), token.clone())
+                                        } else {
+                                            unreachable!()
+                                        };
+                                        state.view = AppView::Connecting { label: label.clone() };
+                                        terminal.draw(|f| ui::render(f, &state))?;
+                                        match remote::connect_nomad_daemon(&alloc_id, &task, &addr, token.as_deref()) {
+                                            Ok(client) => {
+                                                state.remote_client = Some(client);
+                                                state.view = AppView::Remote { label };
+                                                state.entries = vec![];
+                                                state.snap_count = 0;
+                                                state.error = None;
+                                            }
+                                            Err(e) => {
+                                                state.view = AppView::Groups;
+                                                state.error = Some(format!("drill-down failed: {e}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if matches!(state.mode, AppMode::Kube { .. }) {
                                 // Kube drill-down: connect to the selected pod for per-process detail.
                                 if let Some(conn) = state.kube_conns.get(state.cursor) {
                                     if conn.thin {
