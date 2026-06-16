@@ -139,10 +139,12 @@ fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
     let show_legend = state.show_histogram
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
 
-    // Fixed chars (excluding the variable-width swatch):
-    //   "──┤" (3) + "← balanced" (10) + "├──┤" (4) + " = load concentration" (21) + "├──┤" (4)
-    //   + "hot spots →" (11) + "├──" (3)  = 56
+    // Fixed chars (excluding the variable-width swatch and centering pads):
+    //   "──┤" (3) + "← balanced" (10) + "├──" (3) + "┤" (1)
+    //   + " = load concentration├" (22) + "──┤" (3) + "hot spots →" (11) + "├──" (3)  = 56
     const FIXED: usize = 56;
+    // Cap the swatch so it sits roughly centred; extra space becomes ─ dashes on each side.
+    const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
 
     if !show_legend || w < FIXED + MIN_SWATCH {
@@ -153,18 +155,31 @@ fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let swatch_w = w - FIXED;
+    let available = w - FIXED;
+    let swatch_w  = available.min(MAX_SWATCH);
+    let extra     = available - swatch_w;
+    let left_pad  = extra / 2;
+    let right_pad = extra - left_pad;
+
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled("──┤", dim),
         Span::styled("← balanced", Style::default().fg(Color::Rgb(60, 180, 60))),
-        Span::styled("├──┤", dim),
+        Span::styled("├──", dim),
     ];
+    if left_pad > 0 {
+        spans.push(Span::styled("─".repeat(left_pad), dim));
+    }
+    spans.push(Span::styled("┤", dim));
     for i in 0..swatch_w {
         let frac = i as f64 / (swatch_w - 1).max(1) as f64;
         spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
     }
     spans.push(Span::styled(" = load concentration", dim));
-    spans.push(Span::styled("├──┤", dim));
+    spans.push(Span::styled("├", dim));
+    if right_pad > 0 {
+        spans.push(Span::styled("─".repeat(right_pad), dim));
+    }
+    spans.push(Span::styled("──┤", dim));
     spans.push(Span::styled("hot spots →", Style::default().fg(Color::Rgb(220, 80, 0))));
     spans.push(Span::styled("├──", dim));
 
