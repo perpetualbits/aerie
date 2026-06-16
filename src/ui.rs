@@ -125,7 +125,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 /// When the histogram overlay is active, the divider carries a three-section
 /// legend showing the meaning of the colour scale:
 ///
-///   ──┤← balanced├──┤◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻ = load concentration├──┤hot spots →├──
+///   ──┤← balanced├──┤◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻ = work density├──┤hot spots →├──
 ///
 /// The coloured ◻ strip fills all available width between the fixed labels.
 /// Below a minimum terminal width the divider degrades to a plain ─ line.
@@ -141,8 +141,8 @@ fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Fixed chars (excluding the variable-width swatch and centering pads):
     //   "──┤" (3) + "← balanced" (10) + "├──" (3) + "┤" (1)
-    //   + " = load concentration├" (22) + "──┤" (3) + "hot spots →" (11) + "├──" (3)  = 56
-    const FIXED: usize = 56;
+    //   + " = work density├" (16) + "──┤" (3) + "hot spots →" (11) + "├──" (3)  = 50
+    const FIXED: usize = 50;
     // Cap the swatch so it sits roughly centred; extra space becomes ─ dashes on each side.
     const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
@@ -174,7 +174,7 @@ fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
         let frac = i as f64 / (swatch_w - 1).max(1) as f64;
         spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
     }
-    spans.push(Span::styled(" = load concentration", dim));
+    spans.push(Span::styled(" = work density", dim));
     spans.push(Span::styled("├", dim));
     if right_pad > 0 {
         spans.push(Span::styled("─".repeat(right_pad), dim));
