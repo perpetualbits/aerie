@@ -55,7 +55,7 @@ fn header_height(state: &AppState) -> u16 {
 ///   Manual:     title + scroll/close hints
 ///
 /// Divider row: a `─` line, with the histogram legend carved in when the
-/// overlay is active: `──┤← balanced├──┤◻◻…◻◻ = focus├──┤hot spots →├──`
+/// overlay is active: `──┤← balanced├──┤◻◻…◻◻ = work density├──┤hot spots →├──`
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let h = area.height;
     if h == 0 {
@@ -242,7 +242,7 @@ const HIST_PIVOT_FRAC: f64 = 1.0 / 3.0;
 /// cover [L_min, log₂N] where L_min = −(p/(1−p))·log₂N and p = HIST_PIVOT_FRAC,
 /// so r = 1 (exact fair share) falls at bin W·p ≈ W/3, left of centre.
 ///
-/// y-axis = **work share** per bin: wᵦ = (Σᵢ∈b mᵢ)/F.  This encodes "where
+/// y-axis = **work density** per bin: wᵦ = (Σᵢ∈b mᵢ)/F.  This encodes "where
 /// is the work going?" not "where are the threads?": a single hog carrying
 /// 100% of the load always appears white-hot at the far-right edge, regardless
 /// of N.  A gamma lift (√wᵦ) keeps small-but-non-zero shares visible.
@@ -793,7 +793,7 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
             let l_str = metric_display_str(e, lm, state.total_ram_bytes);
             let r_str = metric_display_str(e, rm, state.total_ram_bytes);
 
-            // Distribution-heat histogram bins for this group.
+            // Work-density histogram bins for this group.
             // None  → draw solid █/░ bars ('h' toggled off).
             // Some  → always draw ◻ cells (consistent character set across all rows).
             //         Active + attributable: real Planck heat. All other cases: dark
@@ -1621,7 +1621,7 @@ fn manual_lines() -> Vec<Line<'static>> {
         b("  The x-axis encodes 'relative work share per thread' on a log₂ scale:"),
         blank(),
         kv("    Left edge    ", "threads contributing zero work"),
-        kv("    Pivot ≈ 1/3   ", "all N threads share work exactly equally — the balanced point"),
+        kv("    Pivot = 1/3   ", "all N threads share work exactly equally — the balanced point"),
         kv("    Right edge   ", "one thread carries the entire load"),
         blank(),
         b("  Reading the histogram:"),
