@@ -34,14 +34,11 @@ pub fn render(frame: &mut Frame, state: &AppState) {
 /// Compute the height of the header area.
 ///
 /// The header is always at least 1 row (the divider line). A second row is added
-/// when there is content to display above the divider: an error, the histogram
-/// focus label, a TLS warning, remote/connecting info, the threads heat swatch,
-/// or the manual title.
+/// when there is content to display above the divider: an error, a TLS warning,
+/// remote/connecting info, the threads heat swatch, or the manual title.
 fn header_height(state: &AppState) -> u16 {
     let has_content = match &state.view {
-        AppView::Groups => {
-            state.error.is_some() || state.show_histogram || state.proxmox_insecure
-        }
+        AppView::Groups => state.error.is_some() || state.proxmox_insecure,
         AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Threads { .. } | AppView::Manual => true,
     };
     if has_content { 2 } else { 1 }
@@ -50,7 +47,7 @@ fn header_height(state: &AppState) -> u16 {
 /// Render the header: an optional content row followed by a divider line.
 ///
 /// Content row (when present):
-///   Groups:     error message  OR  "◻ = focus" swatch label  OR  TLS warning
+///   Groups:     error message  OR  TLS warning
 ///   Remote:     "remote: <label> · [Esc] disconnect"
 ///   Connecting: "Connecting to <label> …"
 ///   Threads:    heat colour swatch (idle → hot)
@@ -82,12 +79,6 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
                         format!(" error: {}", err.lines().next().unwrap_or("")),
                         Style::default().fg(Color::Red),
                     ))
-                } else if state.show_histogram {
-                    Line::from(vec![
-                        Span::styled(" ", Style::default()),
-                        Span::styled("◻", Style::default().fg(planck_color(0.28))),
-                        Span::styled(" = focus", Style::default().fg(Color::DarkGray)),
-                    ])
                 } else if state.proxmox_insecure {
                     Line::from(Span::styled(
                         "  ⚠ TLS OFF",
@@ -133,7 +124,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 /// When the histogram overlay is active, the divider carries a three-section
 /// legend showing the meaning of the colour scale:
 ///
-///   ──┤← balanced├──┤◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻ = focus├──┤hot spots →├──
+///   ──┤← balanced├──┤◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻ = load concentration├──┤hot spots →├──
 ///
 /// The coloured ◻ strip fills all available width between the fixed labels.
 /// Below a minimum terminal width the divider degrades to a plain ─ line.
@@ -148,9 +139,9 @@ fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
 
     // Fixed chars (excluding the variable-width swatch):
-    //   "──┤" (3) + "← balanced" (10) + "├──┤" (4) + " = focus" (8) + "├──┤" (4)
-    //   + "hot spots →" (11) + "├──" (3)  = 43
-    const FIXED: usize = 43;
+    //   "──┤" (3) + "← balanced" (10) + "├──┤" (4) + " = load concentration" (21) + "├──┤" (4)
+    //   + "hot spots →" (11) + "├──" (3)  = 56
+    const FIXED: usize = 56;
     const MIN_SWATCH: usize = 4;
 
     if !show_legend || w < FIXED + MIN_SWATCH {
@@ -171,7 +162,7 @@ fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
         let frac = i as f64 / (swatch_w - 1).max(1) as f64;
         spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
     }
-    spans.push(Span::styled(" = focus", dim));
+    spans.push(Span::styled(" = load concentration", dim));
     spans.push(Span::styled("├──┤", dim));
     spans.push(Span::styled("hot spots →", Style::default().fg(Color::Rgb(220, 80, 0))));
     spans.push(Span::styled("├──", dim));
