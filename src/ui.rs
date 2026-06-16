@@ -19,7 +19,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(2)])
+        .constraints([Constraint::Length(header_height(state)), Constraint::Min(0), Constraint::Length(2)])
         .split(area);
     render_header(frame, chunks[0], state);
     match &state.view {
@@ -31,171 +31,152 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     render_footer(frame, chunks[2], state);
 }
 
-/// Build the metric-selector line shown in the header.
+/// Compute the height of the header area.
 ///
-/// If there is an active error, shows the first line of the error in red instead
-/// of the metric selectors (error takes priority so it is not hidden).
-///
-/// Otherwise shows: `← left_metric  ·  right_metric →` with the active side
-/// highlighted in yellow/bold and the inactive side dimmed. Additional badges
-/// (grouping strategy, TLS warning) are appended as needed.
-fn metric_selector_line(state: &AppState) -> Line<'static> {
-    if let Some(err) = &state.error {
-        Line::from(Span::styled(
-            format!(" error: {}", err.lines().next().unwrap_or("")),
-            Style::default().fg(Color::Red),
-        ))
-    } else {
-        let paused = state.history_cursor.is_some();
-        let left_style = if paused {
-            Style::default().fg(Color::DarkGray)
-        } else if state.active_side == Side::Left {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let right_style = if paused {
-            Style::default().fg(Color::DarkGray)
-        } else if state.active_side == Side::Right {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let dim_style = Style::default().fg(Color::Rgb(60, 60, 60));
-        let arrow_style = if paused {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let mut spans = vec![
-            Span::styled(" ← ", arrow_style),
-            Span::styled(state.left_metric.name().to_string(), left_style),
-            Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(state.right_metric.name().to_string(), right_style),
-            Span::styled(" →", arrow_style),
-        ];
-        if paused {
-            spans.push(Span::styled(
-                "  [scrub]",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
+/// The header is always at least 1 row (the divider line). A second row is added
+/// when there is content to display above the divider: an error, the histogram
+/// focus label, a TLS warning, remote/connecting info, the threads heat swatch,
+/// or the manual title.
+fn header_height(state: &AppState) -> u16 {
+    let has_content = match &state.view {
+        AppView::Groups => {
+            state.error.is_some() || state.show_histogram || state.proxmox_insecure
         }
-        if matches!(state.mode, AppMode::Local) {
-            spans.push(Span::styled(
-                format!("  [{}]", state.group_by.name()),
-                dim_style,
-            ));
-        } else if matches!(state.mode, AppMode::Proxmox { .. }) {
-            spans.push(Span::styled(
-                format!("  [{}]", state.pve_group_by.name()),
-                dim_style,
-            ));
-        } else if matches!(state.mode, AppMode::Fleet { .. }) {
-            let connected = state.fleet_clients.iter().filter(|c| c.snap.is_some()).count();
-            let total = state.fleet_clients.len();
-            spans.push(Span::styled(
-                format!("  [{connected}/{total} hosts]"),
-                dim_style,
-            ));
-        } else if matches!(state.mode, AppMode::Kube { .. }) {
-            let connected = state.kube_conns.iter().filter(|c| c.snap.is_some()).count();
-            let total = state.kube_conns.len();
-            spans.push(Span::styled(
-                format!("  [{connected}/{total} pods]  [EXPERIMENTAL]"),
-                dim_style,
-            ));
-        }
-        if state.proxmox_insecure {
-            spans.push(Span::styled(
-                "  ⚠ TLS OFF",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        }
-        Line::from(spans)
-    }
+        AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Threads { .. } | AppView::Manual => true,
+    };
+    if has_content { 2 } else { 1 }
 }
 
-/// Render the 3-row header block, which varies by view.
+/// Render the header: an optional content row followed by a divider line.
 ///
-/// - Groups view: metric selector line + histogram colour swatch (when overlay is on).
-/// - Remote view: metric selector line + "remote: <label> · [Esc] disconnect".
-/// - Connecting: animated-style "Connecting to <label> …" message.
-/// - Threads: heat colour swatch from idle to hot.
-/// - Manual: title + scroll/close hints.
+/// Content row (when present):
+///   Groups:     error message  OR  "◻ = focus" swatch label  OR  TLS warning
+///   Remote:     "remote: <label> · [Esc] disconnect"
+///   Connecting: "Connecting to <label> …"
+///   Threads:    heat colour swatch (idle → hot)
+///   Manual:     title + scroll/close hints
 ///
-/// The block has a bottom border in DarkGray that visually separates header from body.
+/// Divider row: a `─` line, with the histogram legend carved in when the
+/// overlay is active: `──┤← balanced├──┤◻◻…◻◻ = focus├──┤hot spots →├──`
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
-    let (line1, line2) = match &state.view {
-        AppView::Groups => {
-            let l1 = metric_selector_line(state);
-            let l2 = if state.show_histogram {
-                // Show a colour swatch of the blackbody ramp so users can read the histogram.
-                let mut spans = vec![Span::styled(
-                    " ◻ bright = share of work  ·  left = balanced  ·  right = hot  ",
-                    Style::default().fg(Color::DarkGray),
-                )];
+    let h = area.height;
+    if h == 0 {
+        return;
+    }
+
+    let (content_area, divider_area) = if h == 1 {
+        (None, area)
+    } else {
+        let splits = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(h - 1), Constraint::Length(1)])
+            .split(area);
+        (Some(splits[0]), splits[1])
+    };
+
+    if let Some(ca) = content_area {
+        let line = match &state.view {
+            AppView::Groups => {
+                if let Some(err) = &state.error {
+                    Line::from(Span::styled(
+                        format!(" error: {}", err.lines().next().unwrap_or("")),
+                        Style::default().fg(Color::Red),
+                    ))
+                } else if state.show_histogram {
+                    Line::from(vec![
+                        Span::styled(" ", Style::default()),
+                        Span::styled("◻", Style::default().fg(planck_color(0.28))),
+                        Span::styled(" = focus", Style::default().fg(Color::DarkGray)),
+                    ])
+                } else if state.proxmox_insecure {
+                    Line::from(Span::styled(
+                        "  ⚠ TLS OFF",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::default()
+                }
+            }
+            AppView::Remote { label } => Line::from(vec![
+                Span::styled(" remote: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(label.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("  ·  [Esc] disconnect", Style::default().fg(Color::DarkGray)),
+            ]),
+            AppView::Connecting { label } => Line::from(vec![
+                Span::styled(" Connecting to ", Style::default().fg(Color::DarkGray)),
+                Span::styled(label.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("  …", Style::default().fg(Color::DarkGray)),
+            ]),
+            AppView::Threads { .. } => {
+                let mut spans = vec![Span::styled(" heat: idle ", Style::default().fg(Color::DarkGray))];
                 const SWATCH: usize = 24;
                 for i in 0..SWATCH {
                     let frac = i as f64 / (SWATCH - 1) as f64;
                     spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
                 }
+                spans.push(Span::styled(" hot", Style::default().fg(Color::DarkGray)));
                 Line::from(spans)
-            } else {
-                Line::default()
-            };
-            (l1, l2)
-        }
-        AppView::Remote { label } => {
-            let l1 = metric_selector_line(state);
-            let l2 = Line::from(vec![
-                Span::styled(" remote: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(label.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    "  ·  [Esc] disconnect",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            (l1, l2)
-        }
-        AppView::Connecting { label } => (
-            Line::from(vec![
-                Span::styled(" Connecting to ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    label.clone(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  …", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::default(),
-        ),
-        AppView::Threads { .. } => {
-            // Colour swatch showing the blackbody heat scale for the thread heatmap.
-            let mut spans =
-                vec![Span::styled(" heat: idle ", Style::default().fg(Color::DarkGray))];
-            const SWATCH: usize = 24;
-            for i in 0..SWATCH {
-                let frac = i as f64 / (SWATCH - 1) as f64;
-                spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
             }
-            spans.push(Span::styled(" hot", Style::default().fg(Color::DarkGray)));
-            (Line::from(spans), Line::default())
-        }
-        AppView::Manual => (
-            Line::from(vec![
+            AppView::Manual => Line::from(vec![
                 Span::styled(" manual", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", Style::default().fg(Color::DarkGray)),
             ]),
-            Line::default(),
-        ),
-    };
+        };
+        frame.render_widget(Paragraph::new(line), ca);
+    }
 
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(Paragraph::new(vec![line1, line2]).block(block), area);
+    render_divider(frame, divider_area, state);
+}
+
+/// Render the horizontal divider between header and body.
+///
+/// When the histogram overlay is active, the divider carries a three-section
+/// legend showing the meaning of the colour scale:
+///
+///   ──┤← balanced├──┤◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻ = focus├──┤hot spots →├──
+///
+/// The coloured ◻ strip fills all available width between the fixed labels.
+/// Below a minimum terminal width the divider degrades to a plain ─ line.
+fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
+    let w = area.width as usize;
+    if w == 0 {
+        return;
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let show_legend = state.show_histogram
+        && matches!(state.view, AppView::Groups | AppView::Remote { .. });
+
+    // Fixed chars (excluding the variable-width swatch):
+    //   "──┤" (3) + "← balanced" (10) + "├──┤" (4) + " = focus" (8) + "├──┤" (4)
+    //   + "hot spots →" (11) + "├──" (3)  = 43
+    const FIXED: usize = 43;
+    const MIN_SWATCH: usize = 4;
+
+    if !show_legend || w < FIXED + MIN_SWATCH {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("─".repeat(w), dim))),
+            area,
+        );
+        return;
+    }
+
+    let swatch_w = w - FIXED;
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled("──┤", dim),
+        Span::styled("← balanced", Style::default().fg(Color::Rgb(60, 180, 60))),
+        Span::styled("├──┤", dim),
+    ];
+    for i in 0..swatch_w {
+        let frac = i as f64 / (swatch_w - 1).max(1) as f64;
+        spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
+    }
+    spans.push(Span::styled(" = focus", dim));
+    spans.push(Span::styled("├──┤", dim));
+    spans.push(Span::styled("hot spots →", Style::default().fg(Color::Rgb(220, 80, 0))));
+    spans.push(Span::styled("├──", dim));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 
@@ -697,8 +678,7 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
     let peaks = &state.peak_vals;
 
     // ── column-header line ────────────────────────────────────────────────
-    // Shows left metric name above left bar edge, right metric name above right bar edge.
-    let lead = " ".repeat(label_w + 1 + ARROW_W + VAL_W);
+    // Shows the grouping strategy on the left and metric names above the bar edges.
     let lname = lm.name();
     let rname = rm.name();
     let mid_spaces = bar_w.saturating_sub(lname.len() + rname.len());
@@ -712,8 +692,19 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let group_by_label = if matches!(state.mode, AppMode::Local) {
+        format!("[{}]", state.group_by.name())
+    } else if matches!(state.mode, AppMode::Proxmox { .. }) {
+        format!("[{}]", state.pve_group_by.name())
+    } else {
+        String::new()
+    };
     let header_line = Line::from(vec![
-        Span::raw(lead),
+        Span::styled(
+            truncate_label(&group_by_label, label_w),
+            Style::default().fg(Color::Rgb(60, 60, 60)),
+        ),
+        Span::raw(" ".repeat(1 + ARROW_W + VAL_W)),
         Span::styled(lname, left_hdr_style),
         Span::raw(" ".repeat(mid_spaces)),
         Span::styled(rname, right_hdr_style),
@@ -1149,14 +1140,6 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             (s, k)
         }
         AppView::Groups => {
-            let elapsed = state.last_refresh.map_or(state.interval, |t| t.elapsed());
-            let next_ms = state.interval.saturating_sub(elapsed).as_millis();
-            // Display next refresh countdown: "850ms" for sub-second, "2s" for whole seconds.
-            let next_str = if state.interval.as_millis() < 1000 {
-                format!("{next_ms}ms")
-            } else {
-                format!("{}s", next_ms / 1000)
-            };
             let hidden = state.total_groups.saturating_sub(state.entries.len());
             let hidden_str = if hidden > 0 {
                 format!("  ({hidden} idle hidden)")
@@ -1225,7 +1208,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             };
 
             let s = format!(
-                " {} groups{hidden_str}  │  {mode_label}  │  {interval_str}s  │  next in {next_str}  │  sort:{}{sys_parts}{unprivileged_note}",
+                " {} groups{hidden_str}  │  {mode_label}  │  {interval_str}s  │  sort:{}{sys_parts}{unprivileged_note}",
                 state.entries.len(),
                 state.sort_metric.name()
             );
