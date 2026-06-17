@@ -24,10 +24,11 @@ use clap::Parser;
 use crossterm::event::Event;
 use mullion::{
     backend::CrosstermBackend,
+    capabilities::Capabilities,
     input::{KeyCode, KeyModifiers},
-    layout::{Node, Orientation, TileId},
-    poll_event, Terminal,
-    tree::{reconcile_carousel, Tree},
+    layout::{carousel_visible_range, Node, Orientation, TileId},
+    poll_event, Rect, Terminal, Theme,
+    tree::{id_from_key, reconcile_carousel, Direction, Tree},
 };
 use std::{
     collections::HashMap,
@@ -40,14 +41,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Stable identity for a group label across tree reconciliation.
-/// Uses DefaultHasher which is deterministic within a single process run.
-pub fn stable_hash(s: &str) -> TileId {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -865,10 +858,6 @@ pub struct AppState {
     pub sort_metric: Metric,
     // ── navigation ───────────────────────────────────────────────────────
     pub view: AppView,
-    /// Index into `entries` of the highlighted row.
-    pub cursor: usize,
-    /// First visible entry index (for scrolling).
-    pub scroll_offset: usize,
     /// Scroll position in the manual page (row index).
     pub manual_scroll: usize,
     /// Height of the last-rendered body area in rows; used to bound histogram sampling.
@@ -956,6 +945,8 @@ pub struct AppState {
     /// Carousel node for the group body list; persists scroll position and
     /// is reconciled with entries on every data tick.
     pub body_tree: Option<Tree>,
+    /// Active colour palette; swap to re-theme the whole UI atomically.
+    pub theme: Theme,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1448,8 +1439,6 @@ impl AppState {
             active_side: Side::Left,
             sort_metric: Metric::Cpu,
             view: AppView::Groups,
-            cursor: 0,
-            scroll_offset: 0,
             manual_scroll: 0,
             thread_snap: None,
             thread_samples: vec![],
@@ -1484,6 +1473,7 @@ impl AppState {
             gpu_enabled: cli.enable_gpu,
             gpu_devices: Vec::new(),
             selected_gpu: 0,
+            theme: Theme::default(),
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
                 orientation: Orientation::Vertical,
@@ -1493,51 +1483,25 @@ impl AppState {
         })
     }
 
-    /// Keep `scroll_offset` so that `cursor` is always within the visible window.
-    ///
-    /// Sync the body carousel's focus to the current `cursor` index.
-    ///
-    /// Called after any cursor change so the carousel knows which row is
-    /// selected. `scroll_focus_into_view` in `render_body` then scrolls it
-    /// into the viewport before the next frame is painted.
-    pub fn sync_body_focus(&mut self) {
-        if let Some(tree) = &mut self.body_tree {
-            if let Some(e) = self.entries.get(self.cursor) {
-                tree.focus_set(stable_hash(&e.label));
-            }
-        }
+    /// Index of the carousel's focused entry within `self.entries`, or `None`
+    /// if the tree has no focus or the focused tile is not in `entries`.
+    pub fn focused_entry_idx(&self) -> Option<usize> {
+        let fid = self.body_tree.as_ref()?.focus()?;
+        self.entries.iter().position(|e| id_from_key(&e.label) == fid)
     }
 
-    /// Reconcile the body carousel with the current entry list, then sync focus.
+    /// Reconcile the body carousel with the current entry list.
     ///
     /// Must be called whenever `self.entries` changes — both from `refresh()` and
     /// from the remote-snapshot polling path (which updates entries outside refresh).
     pub fn sync_body_tree(&mut self) {
         let desired: Vec<(TileId, u16)> = self.entries.iter()
-            .map(|e| (stable_hash(&e.label), 1u16))
+            .map(|e| (id_from_key(&e.label), 1u16))
             .collect();
         if let Some(tree) = &mut self.body_tree {
             reconcile_carousel(tree.root_mut(), &desired);
             tree.ensure_focus_valid();
             tree.ensure_zoom_valid();
-        }
-        self.sync_body_focus();
-    }
-
-    /// Keep `scroll_offset` so that `cursor` is always within the visible window.
-    ///
-    /// - If cursor is above the window, scroll up to put it at the top.
-    /// - If cursor is below the window, scroll down to put it at the bottom.
-    /// - No-ops when `body_height` is zero (terminal too small to display anything).
-    pub fn adjust_scroll(&mut self, body_height: usize) {
-        if body_height == 0 {
-            return;
-        }
-        if self.cursor < self.scroll_offset {
-            self.scroll_offset = self.cursor;
-        }
-        if self.cursor >= self.scroll_offset + body_height {
-            self.scroll_offset = self.cursor.saturating_sub(body_height - 1);
         }
     }
 
@@ -1591,16 +1555,20 @@ impl AppState {
             _ => return,
         };
 
-        // Only sample the visible window (scroll_offset .. scroll_offset + entry_rows).
-        let entry_rows = self.last_body_height.saturating_sub(1);
-        let visible_end = self.scroll_offset + entry_rows;
+        // Only sample the visible window according to the carousel's current scroll.
+        let visible_range = if let Some(tree) = &self.body_tree {
+            let h = self.last_body_height.saturating_sub(1) as u16;
+            carousel_visible_range(tree.root(), Rect::new(0, 0, 1, h))
+        } else {
+            0..self.entries.len()
+        };
 
         // Collect (label, pids) pairs for visible, non-fading groups.
         let group_pids: Vec<(String, Vec<u32>)> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(i, e)| !e.fading && *i >= self.scroll_offset && *i < visible_end)
+            .filter(|(i, e)| !e.fading && visible_range.contains(i))
             .filter_map(|(_, e)| {
                 let pids = self
                     .snap
@@ -2206,13 +2174,6 @@ impl AppState {
             Err(e) => self.error = Some(e.to_string()),
         }
 
-        // Clamp cursor so it never points past the last row.
-        if self.entries.is_empty() {
-            self.cursor = 0;
-        } else {
-            self.cursor = self.cursor.min(self.entries.len() - 1);
-        }
-
         // Reconcile the body carousel with the current entry list.
         self.sync_body_tree();
 
@@ -2482,10 +2443,12 @@ fn main() -> Result<()> {
     // Do an initial refresh before entering the TUI so the first frame shows data.
     state.refresh();
 
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut backend = CrosstermBackend::new(io::stdout());
+    backend.apply_capabilities(&Capabilities::detect());
+    let mut terminal = Terminal::new(backend)?;
     terminal.enter()?;
 
-    // Track last rendered body height so `adjust_scroll` has the correct window size.
+    // Track last rendered body height for histogram visible-range computation.
     let mut last_body_height: usize = 30;
 
     'main: loop {
@@ -2537,8 +2500,6 @@ fn main() -> Result<()> {
             state.last_hist_sample = Some(Instant::now());
             state.sample_histograms();
         }
-
-        state.adjust_scroll(last_body_height);
 
         terminal.draw(|buf| {
             // The body area is the full terminal height minus 3 rows (header) minus 2 rows (footer).
@@ -2647,23 +2608,21 @@ fn main() -> Result<()> {
                         }
                         // Fleet / Kube / Nomad: no grouping to cycle; ignore silently.
                     }
-                    // Cursor navigation: arrow keys (and vim j/k); also manual scroll
+                    // Navigation: arrow keys (and vim j/k) route through the carousel focus.
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
-                            && state.cursor > 0
-                        {
-                            state.cursor -= 1;
-                            state.sync_body_focus();
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
+                            if let Some(tree) = &mut state.body_tree {
+                                tree.focus_dir(Direction::Up);
+                            }
                         } else if matches!(state.view, AppView::Manual) {
                             state.manual_scroll = state.manual_scroll.saturating_sub(1);
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
-                            && state.cursor + 1 < state.entries.len()
-                        {
-                            state.cursor += 1;
-                            state.sync_body_focus();
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
+                            if let Some(tree) = &mut state.body_tree {
+                                tree.focus_dir(Direction::Down);
+                            }
                         } else if matches!(state.view, AppView::Manual) {
                             let max_scroll = ui::manual_line_count()
                                 .saturating_sub(state.last_body_height);
@@ -2763,7 +2722,7 @@ fn main() -> Result<()> {
                     KeyCode::Enter => {
                         if matches!(state.view, AppView::Groups) {
                             if matches!(state.mode, AppMode::Nomad { .. }) {
-                                if let Some(conn) = state.nomad_conns.get(state.cursor) {
+                                if let Some(conn) = state.focused_entry_idx().and_then(|i| state.nomad_conns.get(i)) {
                                     if conn.thin {
                                         state.error = Some(
                                             "thin probe mode — no per-process drill-down; remove --nomad-thin to enable".into()
@@ -2780,7 +2739,7 @@ fn main() -> Result<()> {
                                             unreachable!()
                                         };
                                         if let Some(tree) = &mut state.body_tree {
-                                            tree.zoom_to(stable_hash(&label));
+                                            tree.zoom_to(id_from_key(&label));
                                         }
                                         state.view = AppView::Connecting { label: label.clone() };
                                         terminal.draw(|buf| ui::render(buf, &mut state))?;
@@ -2803,7 +2762,7 @@ fn main() -> Result<()> {
                                 }
                             } else if matches!(state.mode, AppMode::Kube { .. }) {
                                 // Kube drill-down: connect to the selected pod for per-process detail.
-                                if let Some(conn) = state.kube_conns.get(state.cursor) {
+                                if let Some(conn) = state.focused_entry_idx().and_then(|i| state.kube_conns.get(i)) {
                                     if conn.thin {
                                         state.error = Some(
                                             "thin probe mode — no per-process drill-down; remove --kube-thin to enable".into()
@@ -2819,7 +2778,7 @@ fn main() -> Result<()> {
                                             unreachable!()
                                         };
                                         if let Some(tree) = &mut state.body_tree {
-                                            tree.zoom_to(stable_hash(&pod));
+                                            tree.zoom_to(id_from_key(&pod));
                                         }
                                         state.view = AppView::Connecting { label: pod.clone() };
                                         terminal.draw(|buf| ui::render(buf, &mut state))?;
@@ -2842,7 +2801,7 @@ fn main() -> Result<()> {
                                 }
                             } else if matches!(state.mode, AppMode::Fleet { .. }) {
                                 // Fleet: drill into the selected host's per-process view.
-                                if let Some(conn) = state.fleet_clients.get(state.cursor) {
+                                if let Some(conn) = state.focused_entry_idx().and_then(|i| state.fleet_clients.get(i)) {
                                     if conn.thin {
                                         state.error = Some(
                                             "thin probe mode — no per-process drill-down; remove --thin to enable".into()
@@ -2860,7 +2819,7 @@ fn main() -> Result<()> {
                                             remote::SshHostKeyPolicy::Strict
                                         };
                                         if let Some(tree) = &mut state.body_tree {
-                                            tree.zoom_to(stable_hash(&host));
+                                            tree.zoom_to(id_from_key(&host));
                                         }
                                         state.view = AppView::Connecting { label: host.clone() };
                                         terminal.draw(|buf| ui::render(buf, &mut state))?;
@@ -2881,12 +2840,12 @@ fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                            } else if let Some(e) = state.entries.get(state.cursor) {
+                            } else if let Some(e) = state.focused_entry_idx().and_then(|i| state.entries.get(i)) {
                                 let label = e.label.clone();
                                 if matches!(state.mode, AppMode::Local) {
                                     // Local: open per-thread heat-map view.
                                     if let Some(tree) = &mut state.body_tree {
-                                        tree.zoom_to(stable_hash(&label));
+                                        tree.zoom_to(id_from_key(&label));
                                     }
                                     state.view = AppView::Threads { label };
                                     state.thread_snap = None;
@@ -2913,7 +2872,7 @@ fn main() -> Result<()> {
                                         remote::SshHostKeyPolicy::Strict
                                     };
                                     if let Some(tree) = &mut state.body_tree {
-                                        tree.zoom_to(stable_hash(&label));
+                                        tree.zoom_to(id_from_key(&label));
                                     }
                                     state.view = AppView::Connecting { label: label.clone() };
                                     // Force-render the connecting screen before blocking on SSH.

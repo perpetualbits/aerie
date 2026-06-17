@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, stable_hash};
-use mullion::{Buffer, Rect, render_carousel};
+use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
+use mullion::{Buffer, Rect, render_carousel, tree::id_from_key};
 use mullion::layout::{Constraint, Node, Orientation, Size, TileId};
 use mullion::style::{Color, Modifier, Style};
 use std::collections::HashMap;
@@ -698,6 +698,9 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     let carousel_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
     if carousel_area.height == 0 { return; }
 
+    // Capture focus before taking the tree out.
+    let focused_id = state.body_tree.as_ref().and_then(|t| t.focus());
+
     // Take the tree out so we can borrow the rest of state in the draw closure.
     let mut tree = match state.body_tree.take() {
         Some(t) => t,
@@ -705,14 +708,13 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     };
     tree.scroll_focus_into_view(carousel_area);
 
-    // Build index before the closure captures state fields.
+    // Build id→index map before the closure captures state fields.
     let entries_by_id: HashMap<TileId, usize> = state.entries.iter()
         .enumerate()
-        .map(|(i, e)| (stable_hash(&e.label), i))
+        .map(|(i, e)| (id_from_key(&e.label), i))
         .collect();
 
     // Snapshot scalar fields and shared-ref fields before the closure.
-    let cursor          = state.cursor;
     let total_ram_bytes = state.total_ram_bytes;
     let show_histogram  = state.show_histogram;
     let entries         = &state.entries;
@@ -725,7 +727,7 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         let e = &entries[entry_idx];
         let ey = rect.y;
         let fading     = e.fading;
-        let is_selected = entry_idx == cursor;
+        let is_selected = Some(id) == focused_id;
 
         let lf = if fading { 0.0 } else { metric_frac(e, lm, total_ram_bytes, peaks) };
         let rf = if fading { 0.0 } else { metric_frac(e, rm, total_ram_bytes, peaks) };
