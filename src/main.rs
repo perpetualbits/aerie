@@ -21,12 +21,12 @@ mod ui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+use crossterm::event::Event;
+use mullion::{
+    backend::CrosstermBackend,
+    input::{KeyCode, KeyModifiers},
+    poll_event, Terminal,
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     collections::HashMap,
     io,
@@ -2428,13 +2428,8 @@ fn main() -> Result<()> {
     // Do an initial refresh before entering the TUI so the first frame shows data.
     state.refresh();
 
-    // Set up the crossterm alternate screen. Alternate screen keeps the user's
-    // terminal history intact when apptop exits.
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.enter()?;
 
     // Track last rendered body height so `adjust_scroll` has the correct window size.
     let mut last_body_height: usize = 30;
@@ -2486,11 +2481,11 @@ fn main() -> Result<()> {
 
         state.adjust_scroll(last_body_height);
 
-        terminal.draw(|f| {
+        terminal.draw(|buf| {
             // The body area is the full terminal height minus 3 rows (header) minus 2 rows (footer).
-            last_body_height = f.area().height.saturating_sub(5) as usize;
+            last_body_height = buf.area.height.saturating_sub(5) as usize;
             state.last_body_height = last_body_height;
-            ui::render(f, &state);
+            ui::render(buf, &state);
         })?;
 
         // Compute the shortest possible poll timeout so we wake exactly when the next
@@ -2514,8 +2509,8 @@ fn main() -> Result<()> {
             next_refresh.min(next_hist).saturating_duration_since(now)
         };
 
-        if event::poll(wait)? {
-            if let Event::Key(key) = event::read()? {
+        if let Some(event) = poll_event(wait)? {
+            if let Event::Key(key) = event {
                 // In Remote view, treat the data source as local for metric cycling
                 // because the daemon sends local /proc data.
                 let is_local = matches!(state.mode, AppMode::Local)
@@ -2722,7 +2717,7 @@ fn main() -> Result<()> {
                                             unreachable!()
                                         };
                                         state.view = AppView::Connecting { label: label.clone() };
-                                        terminal.draw(|f| ui::render(f, &state))?;
+                                        terminal.draw(|buf| ui::render(buf, &state))?;
                                         match remote::connect_nomad_daemon(&alloc_id, &task, &addr, token.as_deref()) {
                                             Ok(client) => {
                                                 state.remote_client = Some(client);
@@ -2756,7 +2751,7 @@ fn main() -> Result<()> {
                                             unreachable!()
                                         };
                                         state.view = AppView::Connecting { label: pod.clone() };
-                                        terminal.draw(|f| ui::render(f, &state))?;
+                                        terminal.draw(|buf| ui::render(buf, &state))?;
                                         match remote::connect_kube_daemon(&pod, &ns, ctx.as_deref()) {
                                             Ok(client) => {
                                                 state.remote_client = Some(client);
@@ -2792,7 +2787,7 @@ fn main() -> Result<()> {
                                             remote::SshHostKeyPolicy::Strict
                                         };
                                         state.view = AppView::Connecting { label: host.clone() };
-                                        terminal.draw(|f| ui::render(f, &state))?;
+                                        terminal.draw(|buf| ui::render(buf, &state))?;
                                         match remote::connect_direct(&host, &ssh_user, policy) {
                                             Ok(client) => {
                                                 state.remote_client = Some(client);
@@ -2838,7 +2833,7 @@ fn main() -> Result<()> {
                                     };
                                     state.view = AppView::Connecting { label: label.clone() };
                                     // Force-render the connecting screen before blocking on SSH.
-                                    terminal.draw(|f| ui::render(f, &state))?;
+                                    terminal.draw(|buf| ui::render(buf, &state))?;
                                     // Create a temporary client for get_vm_ips (SSH host discovery).
                                     let temp_pve = if let (Some(url), Some(token)) =
                                         (&state.proxmox_url, &state.proxmox_token)
@@ -2901,10 +2896,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Restore the terminal: leave alternate screen, disable raw mode, show cursor.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    terminal.leave()?;
     Ok(())
 }
 

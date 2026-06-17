@@ -37,7 +37,7 @@ assets = [
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
-ratatui = "0.29"
+mullion = { path = "../mullion" }
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

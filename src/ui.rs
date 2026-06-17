@@ -1,35 +1,53 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
-    Frame,
-};
+use mullion::{Buffer, Rect};
+use mullion::layout::{Constraint, Node, Orientation, Size, TileId};
+use mullion::style::{Color, Modifier, Style};
 
-/// Top-level render entry point: splits the terminal into header / body / footer and
-/// dispatches to the appropriate view renderer based on `state.view`.
-///
-/// Layout (from top to bottom):
-///   - 3 rows: header (metric selectors, hint bar, or colour swatch).
-///   - remaining rows: body (group list, thread view, manual, or connecting screen).
-///   - 2 rows: footer (status line + key hints).
-pub fn render(frame: &mut Frame, state: &AppState) {
-    let area = frame.area();
+const HEADER_ID: TileId = 1;
+const BODY_ID:   TileId = 2;
+const FOOTER_ID: TileId = 3;
+
+/// Top-level render entry point: splits the terminal into header / body / footer
+/// using a mullion `Node::Split` and dispatches to per-section renderers.
+pub fn render(buf: &mut Buffer, state: &AppState) {
+    let area = buf.area;
+    if area.height == 0 { return; }
     let term_w = area.width as usize;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(header_height(state)), Constraint::Min(0), Constraint::Length(footer_height(state, term_w))])
-        .split(area);
-    render_header(frame, chunks[0], state);
-    match &state.view {
-        AppView::Groups | AppView::Remote { .. } => render_body(frame, chunks[1], state),
-        AppView::Threads { .. } => render_threads(frame, chunks[1], state),
-        AppView::Manual => render_manual(frame, chunks[1], state),
-        AppView::Connecting { label } => render_connecting(frame, chunks[1], label),
+    let hh = header_height(state);
+    let fw = footer_height(state, term_w);
+    let bh = area.height.saturating_sub(hh + fw);
+
+    let mut root = Node::Split {
+        orientation: Orientation::Vertical,
+        children: vec![
+            (Constraint::new(Size::Fixed(hh)), Node::Tile(HEADER_ID)),
+            (Constraint::new(Size::Fill(1)),   Node::Tile(BODY_ID)),
+            (Constraint::new(Size::Fixed(fw)), Node::Tile(FOOTER_ID)),
+        ],
+    };
+    let tiles = mullion::layout::solve(&mut root, area);
+
+    let mut header_rect = Rect::new(area.x, area.y, area.width, hh);
+    let mut body_rect   = Rect::new(area.x, area.y + hh, area.width, bh);
+    let mut footer_rect = Rect::new(area.x, area.y + hh + bh, area.width, fw);
+    for (id, r) in &tiles {
+        match *id {
+            HEADER_ID => header_rect = *r,
+            BODY_ID   => body_rect   = *r,
+            FOOTER_ID => footer_rect = *r,
+            _ => {}
+        }
     }
-    render_footer(frame, chunks[2], state);
+
+    render_header(buf, header_rect, state);
+    match &state.view {
+        AppView::Groups | AppView::Remote { .. } => render_body(buf, body_rect, state),
+        AppView::Threads { .. } => render_threads(buf, body_rect, state),
+        AppView::Manual => render_manual(buf, body_rect, state),
+        AppView::Connecting { label } => render_connecting(buf, body_rect, label),
+    }
+    render_footer(buf, footer_rect, state);
 }
 
 /// Compute the height of the header area.
@@ -56,68 +74,63 @@ fn header_height(state: &AppState) -> u16 {
 ///
 /// Divider row: a `─` line, with the histogram legend carved in when the
 /// overlay is active: `──┤← balanced├──┤◻◻…◻◻ = work density├──┤hot spots →├──`
-fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_header(buf: &mut Buffer, area: Rect, state: &AppState) {
     let h = area.height;
-    if h == 0 {
-        return;
-    }
+    if h == 0 { return; }
 
-    let (content_area, divider_area) = if h == 1 {
-        (None, area)
+    let (content_y, divider_y) = if h == 1 {
+        (None, area.y)
     } else {
-        let splits = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(h - 1), Constraint::Length(1)])
-            .split(area);
-        (Some(splits[0]), splits[1])
+        (Some(area.y), area.y + h - 1)
     };
 
-    if let Some(ca) = content_area {
-        let line = match &state.view {
+    let dim = Style::default().fg(Color::DarkGray);
+
+    if let Some(cy) = content_y {
+        let mut x = area.x;
+        match &state.view {
             AppView::Groups => {
                 if let Some(err) = &state.error {
-                    Line::from(Span::styled(
-                        format!(" error: {}", err.lines().next().unwrap_or("")),
-                        Style::default().fg(Color::Red),
-                    ))
+                    x = buf.set_string(x, cy,
+                        &format!(" error: {}", err.lines().next().unwrap_or("")),
+                        Style::default().fg(Color::Red));
                 } else if state.proxmox_insecure {
-                    Line::from(Span::styled(
-                        "  ⚠ TLS OFF",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::default()
+                    x = buf.set_string(x, cy, "  ⚠ TLS OFF",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
                 }
             }
-            AppView::Remote { label } => Line::from(vec![
-                Span::styled(" remote: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(label.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("  ·  [Esc] disconnect", Style::default().fg(Color::DarkGray)),
-            ]),
-            AppView::Connecting { label } => Line::from(vec![
-                Span::styled(" Connecting to ", Style::default().fg(Color::DarkGray)),
-                Span::styled(label.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled("  …", Style::default().fg(Color::DarkGray)),
-            ]),
+            AppView::Remote { label } => {
+                x = buf.set_string(x, cy, " remote: ", dim);
+                x = buf.set_string(x, cy, label,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                x = buf.set_string(x, cy, "  ·  [Esc] disconnect", dim);
+            }
+            AppView::Connecting { label } => {
+                x = buf.set_string(x, cy, " Connecting to ", dim);
+                x = buf.set_string(x, cy, label,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                x = buf.set_string(x, cy, "  …", dim);
+            }
             AppView::Threads { .. } => {
-                let mut spans = vec![Span::styled(" heat: idle ", Style::default().fg(Color::DarkGray))];
+                x = buf.set_string(x, cy, " heat: idle ", dim);
                 const SWATCH: usize = 24;
                 for i in 0..SWATCH {
                     let frac = i as f64 / (SWATCH - 1) as f64;
-                    spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
+                    x = buf.set_string(x, cy, "◻", Style::default().fg(planck_color(frac)));
                 }
-                spans.push(Span::styled(" hot", Style::default().fg(Color::DarkGray)));
-                Line::from(spans)
+                x = buf.set_string(x, cy, " hot", dim);
             }
-            AppView::Manual => Line::from(vec![
-                Span::styled(" manual", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", Style::default().fg(Color::DarkGray)),
-            ]),
-        };
-        frame.render_widget(Paragraph::new(line), ca);
+            AppView::Manual => {
+                x = buf.set_string(x, cy, " manual",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                x = buf.set_string(x, cy,
+                    "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", dim);
+            }
+        }
+        let _ = x;
     }
 
-    render_divider(frame, divider_area, state);
+    render_divider(buf, Rect::new(area.x, divider_y, area.width, 1), state);
 }
 
 /// Render the horizontal divider between header and body.
@@ -129,29 +142,21 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 ///
 /// The coloured ◻ strip fills all available width between the fixed labels.
 /// Below a minimum terminal width the divider degrades to a plain ─ line.
-fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_divider(buf: &mut Buffer, area: Rect, state: &AppState) {
     let w = area.width as usize;
-    if w == 0 {
-        return;
-    }
+    if w == 0 { return; }
+    let y = area.y;
     let dim = Style::default().fg(Color::DarkGray);
 
     let show_legend = state.show_histogram
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
 
-    // Fixed chars (excluding the variable-width swatch and centering pads):
-    //   "──┤" (3) + "← balanced" (10) + "├──" (3) + "┤" (1)
-    //   + " = work density├" (16) + "──┤" (3) + "hot spots →" (11) + "├──" (3)  = 50
     const FIXED: usize = 50;
-    // Cap the swatch so it sits roughly centred; extra space becomes ─ dashes on each side.
     const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
 
     if !show_legend || w < FIXED + MIN_SWATCH {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("─".repeat(w), dim))),
-            area,
-        );
+        buf.set_string(area.x, y, &"─".repeat(w), dim);
         return;
     }
 
@@ -161,29 +166,27 @@ fn render_divider(frame: &mut Frame, area: Rect, state: &AppState) {
     let left_pad  = extra / 2;
     let right_pad = extra - left_pad;
 
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled("──┤", dim),
-        Span::styled("← balanced", Style::default().fg(Color::Rgb(60, 180, 60))),
-        Span::styled("├──", dim),
-    ];
+    let mut x = area.x;
+    x = buf.set_string(x, y, "──┤", dim);
+    x = buf.set_string(x, y, "← balanced", Style::default().fg(Color::Rgb(60, 180, 60)));
+    x = buf.set_string(x, y, "├──", dim);
     if left_pad > 0 {
-        spans.push(Span::styled("─".repeat(left_pad), dim));
+        x = buf.set_string(x, y, &"─".repeat(left_pad), dim);
     }
-    spans.push(Span::styled("┤", dim));
+    x = buf.set_string(x, y, "┤", dim);
     for i in 0..swatch_w {
         let frac = i as f64 / (swatch_w - 1).max(1) as f64;
-        spans.push(Span::styled("◻", Style::default().fg(planck_color(frac))));
+        x = buf.set_string(x, y, "◻", Style::default().fg(planck_color(frac)));
     }
-    spans.push(Span::styled(" = work density", dim));
-    spans.push(Span::styled("├", dim));
+    x = buf.set_string(x, y, " = work density", dim);
+    x = buf.set_string(x, y, "├", dim);
     if right_pad > 0 {
-        spans.push(Span::styled("─".repeat(right_pad), dim));
+        x = buf.set_string(x, y, &"─".repeat(right_pad), dim);
     }
-    spans.push(Span::styled("──┤", dim));
-    spans.push(Span::styled("hot spots →", Style::default().fg(Color::Rgb(220, 80, 0))));
-    spans.push(Span::styled("├──", dim));
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    x = buf.set_string(x, y, "──┤", dim);
+    x = buf.set_string(x, y, "hot spots →", Style::default().fg(Color::Rgb(220, 80, 0)));
+    x = buf.set_string(x, y, "├──", dim);
+    let _ = x;
 }
 
 
@@ -630,62 +633,38 @@ fn metric_frac(e: &BarEntry, m: Metric, total_ram: u64, peaks: &PeakVals) -> f64
 ///   When off, classic solid `█` / dim `░` characters are used.
 /// - Fading rows (group gone from /proc, within retention window) have zeroed
 ///   rate metrics and a label that smoothly transitions from cyan to dark grey.
-fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
-    let inner = Block::default().borders(Borders::NONE).inner(area);
-    frame.render_widget(Block::default().borders(Borders::NONE), area);
+fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
+    if area.height == 0 { return; }
 
     if state.entries.is_empty() {
         let msg = if state.snap_count < 2 {
-            // First sample is just a baseline; second sample is the first with delta data.
             "Collecting first sample — waiting for next refresh tick…"
         } else {
             "Nothing active to display."
         };
-        frame.render_widget(
-            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
-            inner,
-        );
+        buf.set_string(area.x, area.y, msg, Style::default().fg(Color::DarkGray));
         return;
     }
 
     let lm = state.left_metric;
     let rm = state.right_metric;
 
-    // The histogram tracks the focused side's metric.
-    // Memory (per-process, not per-thread) and Threads count are not per-member
-    // attributable in local mode, so the overlay is blanked for those metrics.
-    let hist_metric = match state.active_side {
-        Side::Left => lm,
-        Side::Right => rm,
-    };
-    // Overlay is enabled for any metric that can have per-member data.
-    // Local mode: threads supply CPU/fault/disk/ctx/sched data.
-    // Proxmox mode: VMs supply CPU/memory/disk data for the group overlay.
-    // Memory is included here; local mode simply won't have Memory member vals,
-    // so it shows a dark floor (all-zero bins) for that metric.
+    let hist_metric = match state.active_side { Side::Left => lm, Side::Right => rm };
     let overlay_enabled = state.show_histogram
-        && matches!(
-            hist_metric,
+        && matches!(hist_metric,
             Metric::Cpu | Metric::Memory | Metric::PageFaults | Metric::DiskRead
                 | Metric::DiskWrite | Metric::CtxSwitches | Metric::SchedWait
-                | Metric::CfsThrottle | Metric::PsiCpu | Metric::PsiMem | Metric::PsiIo
-        );
+                | Metric::CfsThrottle | Metric::PsiCpu | Metric::PsiMem | Metric::PsiIo);
 
-    // Label column width: widest label, clamped to [8, 28] chars.
     let label_w = state.entries.iter().map(|e| e.label.len()).max().unwrap_or(8).clamp(8, 28);
-    // Fixed value columns on each side of the bar
-    const VAL_W: usize = 9;   // one extra for possible trailing '?'
-    const ARROW_W: usize = 3; // ▶▶▶ / ◀◀◀ cursor arrows bracketing the bar
-
-    let total_w = inner.width as usize;
+    const VAL_W: usize = 9;
+    const ARROW_W: usize = 3;
+    let total_w = area.width as usize;
     let fixed = label_w + 1 + ARROW_W + VAL_W + VAL_W + ARROW_W;
-    // Ensure at least 16 cells for the bar even on very narrow terminals.
     let bar_w = total_w.saturating_sub(fixed).max(16);
-
     let peaks = &state.peak_vals;
 
-    // ── column-header line ────────────────────────────────────────────────
-    // Shows the grouping strategy on the left and metric names above the bar edges.
+    // ── column-header row ─────────────────────────────────────────────────────
     let lname = lm.name();
     let rname = rm.name();
     let mid_spaces = bar_w.saturating_sub(lname.len() + rname.len());
@@ -706,178 +685,116 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         String::new()
     };
-    let header_line = Line::from(vec![
-        Span::styled(
-            truncate_label(&group_by_label, label_w),
-            Style::default().fg(Color::Rgb(60, 60, 60)),
-        ),
-        Span::raw(" ".repeat(1 + ARROW_W + VAL_W)),
-        Span::styled(lname, left_hdr_style),
-        Span::raw(" ".repeat(mid_spaces)),
-        Span::styled(rname, right_hdr_style),
-    ]);
+    let hy = area.y;
+    let mut x = area.x;
+    x = buf.set_string(x, hy, &truncate_label(&group_by_label, label_w),
+        Style::default().fg(Color::Rgb(60, 60, 60)));
+    x = buf.set_string(x, hy, &" ".repeat(1 + ARROW_W + VAL_W), Style::default());
+    x = buf.set_string(x, hy, lname, left_hdr_style);
+    x = buf.set_string(x, hy, &" ".repeat(mid_spaces), Style::default());
+    x = buf.set_string(x, hy, rname, right_hdr_style);
+    let _ = x;
 
-    let max_rows = inner.height as usize;
+    let max_rows = area.height as usize;
     let scroll = state.scroll_offset.min(state.entries.len().saturating_sub(1));
-
-    // Reserve 1 row for the column header; show max_rows-1 entries below it.
     let entry_rows = max_rows.saturating_sub(1);
 
-    let entry_lines: Vec<Line> = state
-        .entries
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(entry_rows)
-        .map(|(i, e)| {
-            let fading = e.fading;
-            let is_selected = i == state.cursor;
+    for (row_i, (i, e)) in state.entries.iter().enumerate()
+        .skip(scroll).take(entry_rows).enumerate()
+    {
+        let ey = area.y + 1 + row_i as u16;
+        if ey >= area.bottom() { break; }
+        let fading = e.fading;
+        let is_selected = i == state.cursor;
 
-            // Fading rows show no bar fill (all rates have been zeroed).
-            let lf = if fading { 0.0 } else { metric_frac(e, lm, state.total_ram_bytes, peaks) };
-            let rf = if fading { 0.0 } else { metric_frac(e, rm, state.total_ram_bytes, peaks) };
+        let lf = if fading { 0.0 } else { metric_frac(e, lm, state.total_ram_bytes, peaks) };
+        let rf = if fading { 0.0 } else { metric_frac(e, rm, state.total_ram_bytes, peaks) };
+        let l_incomplete = !fading && !entry_complete(e, lm);
+        let r_incomplete = !fading && !entry_complete(e, rm);
+        let lc = if fading { Color::DarkGray } else {
+            let c = bar_color(lm, lf); if l_incomplete { dimmed(c) } else { c }
+        };
+        let rc = if fading { Color::DarkGray } else {
+            let c = bar_color(rm, rf); if r_incomplete { dimmed(c) } else { c }
+        };
 
-            let l_incomplete = !fading && !entry_complete(e, lm);
-            let r_incomplete = !fading && !entry_complete(e, rm);
+        let usable = (bar_w / 2).saturating_sub(1);
+        let l_filled = (lf * usable as f64).round() as usize;
+        let r_filled = (rf * usable as f64).round() as usize;
+        let right_start = bar_w - r_filled;
 
-            let lc = if fading {
-                Color::DarkGray
-            } else {
-                let c = bar_color(lm, lf);
-                if l_incomplete { dimmed(c) } else { c }
-            };
-            let rc = if fading {
-                Color::DarkGray
-            } else {
-                let c = bar_color(rm, rf);
-                if r_incomplete { dimmed(c) } else { c }
-            };
+        let anomaly = state.anomaly_states.get(&e.label);
+        let is_anomaly = anomaly.is_some_and(|s: &AnomalyState| s.alerting);
 
-            // Each bar fills at most (bar_w/2 - 1) cells, guaranteeing a visible
-            // 2-cell dim gap at the centre even when both metrics are at 100%.
-            let usable = (bar_w / 2).saturating_sub(1);
-            let l_filled = (lf * usable as f64).round() as usize;
-            let r_filled = (rf * usable as f64).round() as usize;
-            // Right bar starts at `right_start` and extends to the right edge.
-            let right_start = bar_w - r_filled;
+        let label_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if e.fading {
+            let r = lerp_u8(0, 80, e.fade_t);
+            let g = lerp_u8(200, 80, e.fade_t);
+            let b = lerp_u8(200, 80, e.fade_t);
+            Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD)
+        } else if is_anomaly {
+            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        };
 
-            // Check anomaly state for this entry.
-            let anomaly = state.anomaly_states.get(&e.label);
-            let is_anomaly = anomaly.is_some_and(|s: &AnomalyState| s.alerting);
+        let display_label = if is_anomaly && !e.fading && !is_selected {
+            truncate_label(&format!("! {}", e.label), label_w)
+        } else {
+            truncate_label(&e.label, label_w)
+        };
 
-            let label_style = if is_selected {
-                // Selected row: black text on cyan background for high contrast.
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else if e.fading {
-                // Smoothly fade Cyan (0,200,200) → DarkGray (80,80,80) over the retention window.
-                // fade_t: 0.0 = just disappeared, 1.0 = about to be removed.
-                let r = lerp_u8(0, 80, e.fade_t);
-                let g = lerp_u8(200, 80, e.fade_t);
-                let b = lerp_u8(200, 80, e.fade_t);
-                Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD)
-            } else if is_anomaly {
-                // Anomaly: highlight label in LightRed to signal concentration/dropout.
-                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            };
+        let l_str = metric_display_str(e, lm, state.total_ram_bytes);
+        let r_str = metric_display_str(e, rm, state.total_ram_bytes);
 
-            // Anomaly prefix: "! " prepended to the label when alerting.
-            let display_label = if is_anomaly && !e.fading && !is_selected {
-                let prefixed = format!("! {}", e.label);
-                truncate_label(&prefixed, label_w)
-            } else {
-                truncate_label(&e.label, label_w)
-            };
-
-            let l_str = metric_display_str(e, lm, state.total_ram_bytes);
-            let r_str = metric_display_str(e, rm, state.total_ram_bytes);
-
-            // Work-density histogram bins for this group.
-            // None  → draw solid █/░ bars ('h' toggled off).
-            // Some  → always draw ◻ cells (consistent character set across all rows).
-            //         Active + attributable: real Planck heat. All other cases: dark
-            //         floor outlines (fading, non-attributable metric, Proxmox mode).
-            let hist: Option<Vec<f64>> = if state.show_histogram {
-                if overlay_enabled && !fading {
-                    Some(
-                        state
-                            .group_member_vals
-                            .get(&e.label)
-                            .map(|v| {
-                                // One dark frame if the user just switched metric.
-                                // If the stored metric doesn't match the current one,
-                                // show all-dark until the next histogram sample arrives.
-                                if v.metric == hist_metric {
-                                    fair_share_bins(&v.vals, bar_w)
-                                } else {
-                                    vec![0.0; bar_w]
-                                }
-                            })
-                            .unwrap_or_else(|| vec![0.0; bar_w]),
-                    )
-                } else {
-                    // Overlay is on but this row is fading or metric is non-attributable:
-                    // still use ◻ characters (consistent character set) but all dark.
-                    Some(vec![0.0; bar_w])
-                }
-            } else {
-                None // classic solid █/░ mode
-            };
-
-            // ▶▶▶ / ◀◀◀ arrows: cyan fg on the selected row, invisible otherwise.
-            // We use the default style (which has no fg set) so the arrows blend into
-            // the terminal background on non-selected rows without using spaces.
-            let arrow_style = Style::default().fg(Color::Cyan);
-            let blank_arrow = Style::default(); // invisible (default terminal fg = bg)
-            let (l_arrow, r_arrow, a_style) = if is_selected {
-                ("▶▶▶", "◀◀◀", arrow_style)
-            } else {
-                ("   ", "   ", blank_arrow)
-            };
-
-            let mut spans = vec![
-                Span::styled(display_label, label_style),
-                Span::raw(" "),
-                Span::styled(l_arrow, a_style),
-                // Right-align the value in VAL_W columns so bar edges stay lined up.
-                Span::styled(format!("{:>VAL_W$}", l_str), Style::default().fg(lc)),
-            ];
-
-            for x in 0..bar_w {
-                let in_left = x < l_filled;
-                let in_right = x >= right_start;
-                if let Some(ref h) = hist {
-                    // Overlay mode: hollow ◻, bg = bar fill, fg = Planck heat.
-                    // bg shows bar membership; fg shows work-share heat.
-                    let bg = if in_left { lc } else if in_right { rc } else { Color::Reset };
-                    spans.push(Span::styled(
-                        "◻",
-                        Style::default().fg(planck_color(h[x])).bg(bg),
-                    ));
-                } else {
-                    // Classic solid bar: filled cells = █, gap = ░.
-                    if in_left {
-                        spans.push(Span::styled("█", Style::default().fg(lc)));
-                    } else if in_right {
-                        spans.push(Span::styled("█", Style::default().fg(rc)));
+        let hist: Option<Vec<f64>> = if state.show_histogram {
+            if overlay_enabled && !fading {
+                Some(state.group_member_vals.get(&e.label).map(|v| {
+                    if v.metric == hist_metric {
+                        fair_share_bins(&v.vals, bar_w)
                     } else {
-                        spans.push(Span::styled("░", Style::default().fg(Color::DarkGray)));
+                        vec![0.0; bar_w]
                     }
-                }
+                }).unwrap_or_else(|| vec![0.0; bar_w]))
+            } else {
+                Some(vec![0.0; bar_w])
             }
+        } else {
+            None
+        };
 
-            // Left-align the right value so spaces pad between it and the arrow.
-            spans.push(Span::styled(format!("{:<VAL_W$}", r_str), Style::default().fg(rc)));
-            spans.push(Span::styled(r_arrow, a_style));
+        let arrow_style = Style::default().fg(Color::Cyan);
+        let blank_arrow = Style::default();
+        let (l_arrow, r_arrow, a_style) = if is_selected {
+            ("▶▶▶", "◀◀◀", arrow_style)
+        } else {
+            ("   ", "   ", blank_arrow)
+        };
 
-            Line::from(spans)
-        })
-        .collect();
-
-    let mut all_lines = vec![header_line];
-    all_lines.extend(entry_lines);
-    frame.render_widget(Paragraph::new(all_lines), inner);
+        let mut x = area.x;
+        x = buf.set_string(x, ey, &display_label, label_style);
+        x = buf.set_string(x, ey, " ", Style::default());
+        x = buf.set_string(x, ey, l_arrow, a_style);
+        x = buf.set_string(x, ey, &format!("{:>VAL_W$}", l_str), Style::default().fg(lc));
+        for bi in 0..bar_w {
+            let in_left  = bi < l_filled;
+            let in_right = bi >= right_start;
+            if let Some(ref h) = hist {
+                let bg = if in_left { lc } else if in_right { rc } else { Color::Reset };
+                x = buf.set_string(x, ey, "◻", Style::default().fg(planck_color(h[bi])).bg(bg));
+            } else if in_left {
+                x = buf.set_string(x, ey, "█", Style::default().fg(lc));
+            } else if in_right {
+                x = buf.set_string(x, ey, "█", Style::default().fg(rc));
+            } else {
+                x = buf.set_string(x, ey, "░", Style::default().fg(Color::DarkGray));
+            }
+        }
+        x = buf.set_string(x, ey, &format!("{:<VAL_W$}", r_str), Style::default().fg(rc));
+        x = buf.set_string(x, ey, r_arrow, a_style);
+        let _ = x;
+    }
 }
 
 /// Thread heat-map view. Each ◻ cell encodes CPU heat relative to the
@@ -890,165 +807,119 @@ fn render_body(frame: &mut Frame, area: Rect, state: &AppState) {
 ///   - 1..4 rows: heat-map grid
 ///   - 1 row: horizontal divider
 ///   - remaining rows: thread list with name, CPU%, pid:tid
-fn render_threads(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
     let label = match &state.view {
         AppView::Threads { label } => label.clone(),
         _ => return,
     };
+    if area.height == 0 { return; }
 
     let n = state.thread_samples.len();
     let total_cpu: f64 = state.thread_samples.iter().map(|t| t.cpu_pct).sum();
-    // Relative scale: hottest thread = planck_color(1.0) = white.
     let max_cpu = state.thread_samples.iter()
-        .map(|t| t.cpu_pct)
-        .fold(0.0f64, f64::max)
-        .max(1e-6); // guard against dividing by zero for an all-idle group
+        .map(|t| t.cpu_pct).fold(0.0f64, f64::max).max(1e-6);
     let w = area.width as usize;
-
-    // Each cell is "◻ " (2 chars wide) so the number of cells per row is w/2.
     let cells_per_row = (w / 2).max(1);
     const MAX_HEAT_ROWS: usize = 4;
     let max_cells = MAX_HEAT_ROWS * cells_per_row;
-
-    // Find the smallest power-of-2 grouping so all threads fit in max_cells.
-    // group_size = 1: one cell per thread. group_size = 2: pairs, etc.
     let mut group_size = 1usize;
-    while n > 0 && n.div_ceil(group_size) > max_cells {
-        group_size *= 2;
-    }
-
-    // Each super-cell = max cpu% of its group (threads already sorted hottest first).
+    while n > 0 && n.div_ceil(group_size) > max_cells { group_size *= 2; }
     let num_cells = if n == 0 { 0 } else { n.div_ceil(group_size) };
-    let cell_cpus: Vec<f64> = (0..num_cells)
-        .map(|i| {
-            let start = i * group_size;
-            let end = (start + group_size).min(n);
-            state.thread_samples[start..end].iter()
-                .map(|t| t.cpu_pct)
-                .fold(0.0f64, f64::max)
-        })
-        .collect();
-
+    let cell_cpus: Vec<f64> = (0..num_cells).map(|i| {
+        let start = i * group_size;
+        let end = (start + group_size).min(n);
+        state.thread_samples[start..end].iter().map(|t| t.cpu_pct).fold(0.0f64, f64::max)
+    }).collect();
     let heat_rows = if num_cells == 0 { 1 } else {
         num_cells.div_ceil(cells_per_row).clamp(1, MAX_HEAT_ROWS)
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),             // info line
-            Constraint::Length(heat_rows as u16), // heat grid
-            Constraint::Length(1),             // divider
-            Constraint::Min(0),                // thread list
-        ])
-        .split(area);
+    // Manual rect split: info / heat / divider / list
+    let mut y = area.y;
+    let info_y    = y; y += 1;
+    let heat_y    = y; y += heat_rows as u16;
+    let div_y     = y; y += 1;
+    let list_y    = y;
+    let list_h    = area.bottom().saturating_sub(list_y);
 
-    // Info line: group name + thread count + total CPU% + grouping note if applicable.
-    let group_info = if group_size > 1 {
-        format!("  │  {} threads/cell", group_size)
-    } else {
-        String::new()
-    };
-    frame.render_widget(
-        Paragraph::new(format!(
-            " {label}  │  {n} threads  │  total {total_cpu:.2}%{group_info}"
-        ))
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        chunks[0],
-    );
+    let dim = Style::default().fg(Color::DarkGray);
 
-    // Heat-map grid: row-major, hottest threads in the top-left.
+    // Info line
+    if info_y < area.bottom() {
+        let group_info = if group_size > 1 { format!("  │  {} threads/cell", group_size) } else { String::new() };
+        buf.set_string(area.x, info_y,
+            &format!(" {label}  │  {n} threads  │  total {total_cpu:.2}%{group_info}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    }
+
+    // Heat-map grid
     if state.thread_samples.is_empty() {
-        frame.render_widget(
-            Paragraph::new("  waiting for second sample…")
-                .style(Style::default().fg(Color::DarkGray)),
-            chunks[1],
-        );
+        if heat_y < area.bottom() {
+            buf.set_string(area.x, heat_y, "  waiting for second sample…", dim);
+        }
     } else {
-        let mut hm_lines: Vec<Line> = Vec::new();
-        let mut row_spans: Vec<Span<'static>> = Vec::new();
-        for (idx, &cpu) in cell_cpus.iter().enumerate() {
-            row_spans.push(Span::styled(
-                "◻ ",
-                Style::default().fg(planck_color(cpu / max_cpu)),
-            ));
-            // Wrap to a new row every `cells_per_row` cells.
-            if (idx + 1) % cells_per_row == 0 {
-                hm_lines.push(Line::from(std::mem::take(&mut row_spans)));
+        let mut idx = 0;
+        'outer: for row in 0..heat_rows {
+            let ry = heat_y + row as u16;
+            if ry >= area.bottom() { break; }
+            let mut x = area.x;
+            for _ in 0..cells_per_row {
+                if idx >= cell_cpus.len() { break 'outer; }
+                x = buf.set_string(x, ry, "◻ ",
+                    Style::default().fg(planck_color(cell_cpus[idx] / max_cpu)));
+                idx += 1;
             }
         }
-        // Flush any partial row.
-        if !row_spans.is_empty() {
-            hm_lines.push(Line::from(row_spans));
+    }
+
+    // Horizontal divider
+    if div_y < area.bottom() {
+        buf.set_string(area.x, div_y, &"─".repeat(w), dim);
+    }
+
+    // Thread list
+    if list_y < area.bottom() && list_h > 0 {
+        let name_w = state.thread_samples.iter().map(|t| t.name.len())
+            .max().unwrap_or(10).clamp(8, 24);
+        buf.set_string(area.x, list_y,
+            &format!("  {:<name_w$}  {:>6}  pid:tid", "thread", "cpu%"), dim);
+        for (row, t) in state.thread_samples.iter()
+            .take(list_h.saturating_sub(1) as usize).enumerate()
+        {
+            let ty = list_y + 1 + row as u16;
+            if ty >= area.bottom() { break; }
+            let mut x = area.x;
+            x = buf.set_string(x, ty, "◻ ",
+                Style::default().fg(planck_color(t.cpu_pct / max_cpu)));
+            x = buf.set_string(x, ty,
+                &format!("{:<name_w$}  {:>5.2}%  {}:{}", t.name, t.cpu_pct, t.pid, t.tid),
+                Style::default().fg(Color::Gray));
+            let _ = x;
         }
-        frame.render_widget(Paragraph::new(hm_lines), chunks[1]);
     }
-
-    // Horizontal divider between heat grid and thread list.
-    frame.render_widget(
-        Paragraph::new("─".repeat(w)).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
-    );
-
-    // Thread list: one row per thread, sorted hottest first (same order as heatmap).
-    let legend_h = chunks[3].height as usize;
-    let name_w = state
-        .thread_samples
-        .iter()
-        .map(|t| t.name.len())
-        .max()
-        .unwrap_or(10)
-        .clamp(8, 24);
-
-    let mut legend_lines: Vec<Line> = vec![Line::from(Span::styled(
-        format!("  {:<name_w$}  {:>6}  pid:tid", "thread", "cpu%"),
-        Style::default().fg(Color::DarkGray),
-    ))];
-
-    for t in state.thread_samples.iter().take(legend_h.saturating_sub(1)) {
-        legend_lines.push(Line::from(vec![
-            // Colour swatch matching the heat-map cell for this thread.
-            Span::styled(
-                "◻ ",
-                Style::default().fg(planck_color(t.cpu_pct / max_cpu)),
-            ),
-            Span::styled(
-                format!(
-                    "{:<name_w$}  {:>5.2}%  {}:{}",
-                    t.name, t.cpu_pct, t.pid, t.tid
-                ),
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
-    }
-
-    frame.render_widget(Paragraph::new(legend_lines), chunks[3]);
 }
 
 /// Render the "Connecting to <label>…" splash shown while `connect_vm` is blocking.
 ///
 /// This is drawn synchronously with `terminal.draw()` before the SSH call starts,
 /// so the user sees feedback immediately rather than a frozen screen.
-fn render_connecting(frame: &mut Frame, area: Rect, label: &str) {
-    let lines = vec![
-        Line::default(),
-        Line::from(vec![
-            Span::styled("  Connecting to ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                label.to_string(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " — trying guest-agent, DNS, hostname…",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(Span::styled(
+fn render_connecting(buf: &mut Buffer, area: Rect, label: &str) {
+    let dim = Style::default().fg(Color::DarkGray);
+    // Row 1: blank (same as ratatui Line::default())
+    // Row 2: "  Connecting to LABEL — trying guest-agent, DNS, hostname…"
+    if area.height >= 2 {
+        let mut x = area.x;
+        x = buf.set_string(x, area.y + 1, "  Connecting to ", dim);
+        x = buf.set_string(x, area.y + 1, label,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        x = buf.set_string(x, area.y + 1, " — trying guest-agent, DNS, hostname…", dim);
+        let _ = x;
+    }
+    if area.height >= 3 {
+        buf.set_string(area.x, area.y + 2,
             "  This may take a few seconds. [Esc] to cancel.",
-            Style::default().fg(Color::Rgb(80, 80, 80)),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines), area);
+            Style::default().fg(Color::Rgb(80, 80, 80)));
+    }
 }
 
 /// Compute the footer height for the current view and terminal width.
@@ -1196,105 +1067,115 @@ fn packed_row_count(parts: &[String], width: usize) -> usize {
     rows
 }
 
-/// Render `parts` into styled `Line`s, greedy-wrapping at `width`.
-fn render_packed_parts(parts: &[String], width: usize) -> Vec<Line<'static>> {
+/// Greedy-pack `parts` into rows: each part is separated by "  │  ".
+/// Returns (row_index, col_x) offsets for each part in `area`, for direct buffer writes.
+fn write_packed_parts(buf: &mut Buffer, parts: &[String], area: Rect) {
     const SEP: &str = "  │  ";
     let dim    = Style::default().fg(Color::DarkGray);
     let sep_st = Style::default().fg(Color::Rgb(50, 50, 50));
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut spans: Vec<Span<'static>>  = Vec::new();
+    let w = area.width as usize;
+    let mut y = area.y;
     let mut col = 0usize;
+    let mut x = area.x;
 
     for (i, p) in parts.iter().enumerate() {
+        if y >= area.bottom() { break; }
         if i == 0 {
-            spans.push(Span::styled(" ".to_string(), dim));
-            spans.push(Span::styled(p.clone(), dim));
+            x = buf.set_string(area.x, y, " ", dim);
+            x = buf.set_string(x, y, p, dim);
             col = 1 + p.len();
-        } else if col + SEP.len() + p.len() > width {
-            lines.push(Line::from(std::mem::take(&mut spans)));
-            spans.push(Span::styled(" ".to_string(), dim));
-            spans.push(Span::styled(p.clone(), dim));
+        } else if col + SEP.len() + p.len() > w {
+            y += 1;
+            if y >= area.bottom() { break; }
+            x = buf.set_string(area.x, y, " ", dim);
+            x = buf.set_string(x, y, p, dim);
             col = 1 + p.len();
         } else {
-            spans.push(Span::styled(SEP.to_string(), sep_st));
-            spans.push(Span::styled(p.clone(), dim));
+            x = buf.set_string(x, y, SEP, sep_st);
+            x = buf.set_string(x, y, p, dim);
             col += SEP.len() + p.len();
         }
     }
-    if !spans.is_empty() {
-        lines.push(Line::from(spans));
-    }
-    lines
+    let _ = x;
 }
 
-/// Build the GPU device selector line, shown instead of key hints when devices are present.
-fn build_gpu_selector_line(state: &AppState) -> Option<Line<'static>> {
+/// Write the GPU device selector row at `(area.x, y)`. Returns `true` if written.
+fn write_gpu_selector_line(buf: &mut Buffer, state: &AppState, x0: u16, y: u16) -> bool {
     if !state.gpu_enabled || state.gpu_devices.is_empty() {
-        return None;
+        return false;
     }
-    let mut spans = vec![Span::styled(" GPU [/]: ".to_string(), Style::default().fg(Color::DarkGray))];
+    let dim  = Style::default().fg(Color::DarkGray);
+    let hi   = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let mut x = buf.set_string(x0, y, " GPU [/]: ", dim);
     if state.selected_gpu == 0 {
-        spans.push(Span::styled("[all]".to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        x = buf.set_string(x, y, "[all]", hi);
     } else {
-        spans.push(Span::styled("all".to_string(), Style::default().fg(Color::DarkGray)));
+        x = buf.set_string(x, y, "all", dim);
     }
     for (i, dev) in state.gpu_devices.iter().enumerate() {
-        spans.push(Span::styled("  ".to_string(), Style::default()));
+        x = buf.set_string(x, y, "  ", Style::default());
         let label = format!("{}:{}", dev.driver, dev.pci_addr);
         if state.selected_gpu == i + 1 {
-            spans.push(Span::styled(format!("[{label}]"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            x = buf.set_string(x, y, &format!("[{label}]"), hi);
         } else {
-            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            x = buf.set_string(x, y, &label, dim);
         }
     }
-    Some(Line::from(spans))
+    let _ = x;
+    true
 }
 
 /// Render the Groups-view footer: parts-based status rows + key hints (or GPU selector).
-fn render_footer_groups(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_footer_groups(buf: &mut Buffer, area: Rect, state: &AppState) {
+    if area.height == 0 { return; }
     let w = area.width as usize;
-    let mut lines = render_packed_parts(&groups_status_parts(state), w);
+    let parts = groups_status_parts(state);
+    let status_rows = packed_row_count(&parts, w);
+    // Write status rows (may occupy 1 or 2 lines depending on width).
+    let status_area = Rect::new(area.x, area.y, area.width,
+        (status_rows as u16).min(area.height));
+    write_packed_parts(buf, &parts, status_area);
 
-    let keys_style = if state.history_cursor.is_some() {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(60, 60, 60))
-    };
-
-    if let Some(gl) = build_gpu_selector_line(state) {
-        lines.push(gl);
-    } else if let Some(cursor) = state.history_cursor {
-        let age   = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
-        let total = state.history.len();
-        lines.push(Line::styled(
-            format!(" PAUSED  ◀ {age}s ago ▶  sample {}/{total}  [←/→] scrub  [p] resume  [q] quit",
-                cursor + 1),
-            keys_style,
-        ));
-    } else {
-        let enter_part = if matches!(state.mode, AppMode::Local) {
-            "  [Enter] threads"
-        } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. }) || state.enable_remote {
-            "  [Enter] drill down"
+    // Last row: key hints, GPU selector, or replay indicator.
+    let last_y = area.y + area.height.saturating_sub(1);
+    if last_y < area.bottom() {
+        let keys_style = if state.history_cursor.is_some() {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
-            ""
+            Style::default().fg(Color::Rgb(60, 60, 60))
         };
-        lines.push(Line::styled(
-            format!(" [←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group-by  [↑/↓] cursor{enter_part}  [p] pause  [r] refresh  [m] manual  [q] quit"),
-            keys_style,
-        ));
-    }
 
-    frame.render_widget(Paragraph::new(lines), area);
+        if write_gpu_selector_line(buf, state, area.x, last_y) {
+            // GPU selector replaces key hints.
+        } else if let Some(cursor) = state.history_cursor {
+            let age   = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
+            let total = state.history.len();
+            buf.set_string(area.x, last_y,
+                &format!(" PAUSED  ◀ {age}s ago ▶  sample {}/{total}  [←/→] scrub  [p] resume  [q] quit",
+                    cursor + 1),
+                keys_style);
+        } else {
+            let enter_part = if matches!(state.mode, AppMode::Local) {
+                "  [Enter] threads"
+            } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. }) || state.enable_remote {
+                "  [Enter] drill down"
+            } else {
+                ""
+            };
+            buf.set_string(area.x, last_y,
+                &format!(" [←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group-by  [↑/↓] cursor{enter_part}  [p] pause  [r] refresh  [m] manual  [q] quit"),
+                keys_style);
+        }
+    }
 }
 
 /// Render the footer: status line(s) + key hints.
 ///
 /// The Groups view uses a parts-based variable-height layout (see
 /// `render_footer_groups`). All other views use a fixed 2-row layout.
-fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_footer(buf: &mut Buffer, area: Rect, state: &AppState) {
     if matches!(state.view, AppView::Groups) {
-        render_footer_groups(frame, area, state);
+        render_footer_groups(buf, area, state);
         return;
     }
     let mode_label = match &state.mode {
@@ -1305,7 +1186,6 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         AppMode::Nomad { addr, namespace, .. } => format!("nomad/{namespace} {addr}"),
     };
     let interval_s = state.interval.as_secs_f64();
-    // Format the interval: "0.50" for sub-second, "2" for whole seconds, "1.5" for fractions.
     let interval_str = if interval_s < 1.0 {
         format!("{interval_s:.2}")
     } else if interval_s.fract() == 0.0 {
@@ -1314,21 +1194,18 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         format!("{interval_s:.1}")
     };
 
-    // Build the system metrics string (net, GPU, RAPL total, PSI) for the footer.
     let sys_metrics = |state: &AppState| -> String {
-        let mut s = String::new();
-        s.push_str(&format!(
+        let mut s = format!(
             "  │  net ↓{}  ↑{}",
             fmt_bytes_rate(state.sys_net_rx_s),
             fmt_bytes_rate(state.sys_net_tx_s),
-        ));
+        );
         if let Some(gpu) = state.sys_gpu_pct {
             s.push_str(&format!("  │  gpu {:.0}%", gpu));
         }
         if state.sys_rapl_w > 0.0 {
             s.push_str(&format!("  │  {} total", fmt_watts(state.sys_rapl_w)));
         }
-        // Show system PSI only when at least one value is available.
         let any_psi = state.sys_psi_cpu.is_some()
             || state.sys_psi_mem.is_some()
             || state.sys_psi_io.is_some();
@@ -1361,35 +1238,20 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             (s, k)
         }
         AppView::Remote { label } => {
-            let host = state
-                .remote_client
-                .as_ref()
-                .map(|c| c.host.as_str())
-                .unwrap_or("?");
+            let host = state.remote_client.as_ref().map(|c| c.host.as_str()).unwrap_or("?");
             let sys = sys_metrics(state);
-            let s = format!(
-                " remote: {label} ({host})  │  {} processes{sys}",
-                state.entries.len()
-            );
+            let s = format!(" remote: {label} ({host})  │  {} processes{sys}", state.entries.len());
             let k = if let Some(cursor) = state.history_cursor {
                 let age = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
                 let total = state.history.len();
-                format!(
-                    " PAUSED  ◀ {}s ago ▶  sample {}/{}  [←/→] scrub  [p] resume  [Esc] disconnect  [q] quit",
-                    age, cursor + 1, total
-                )
+                format!(" PAUSED  ◀ {}s ago ▶  sample {}/{}  [←/→] scrub  [p] resume  [Esc] disconnect  [q] quit",
+                    age, cursor + 1, total)
             } else {
                 " [←/→] metric  [Tab] side  [s] sort  [↑/↓] cursor  [p] pause  [Esc] disconnect  [q] quit".to_string()
             };
             (s, k)
         }
         AppView::Groups => unreachable!("handled by render_footer_groups"),
-    };
-    // GPU device selector for Remote view (Groups view handles this in render_footer_groups).
-    let gpu_device_line = if matches!(state.view, AppView::Remote { .. }) {
-        build_gpu_selector_line(state)
-    } else {
-        None
     };
 
     let keys_style = if state.history_cursor.is_some() {
@@ -1398,19 +1260,18 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         Style::default().fg(Color::Rgb(60, 60, 60))
     };
 
-    let mut lines = vec![
-        Line::styled(status, Style::default().fg(Color::DarkGray)),
-        Line::styled(keys, keys_style),
-    ];
-    if let Some(gpu_line) = gpu_device_line {
-        // Replace the last line with the GPU selector (footer is only 2 rows in layout,
-        // so we insert it as the second line and drop keys to the combined line)
-        // Actually, we only have 2 rows — show GPU line instead of keys when devices present,
-        // or append it to the status line.
-        // Since footer is 2 rows, put gpu line as line 2 (replacing key hints) when devices present.
-        lines[1] = gpu_line;
+    if area.height >= 1 {
+        buf.set_string(area.x, area.y, &status, Style::default().fg(Color::DarkGray));
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    if area.height >= 2 {
+        let last_y = area.y + 1;
+        // For Remote view, GPU selector replaces key hints when devices are present.
+        let wrote_gpu = matches!(state.view, AppView::Remote { .. })
+            && write_gpu_selector_line(buf, state, area.x, last_y);
+        if !wrote_gpu {
+            buf.set_string(area.x, last_y, &keys, keys_style);
+        }
+    }
 }
 
 // ── Manual ────────────────────────────────────────────────────────────────────
@@ -1420,11 +1281,15 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 /// Clamps `manual_scroll` to the range [0, max_scroll] so the page never
 /// scrolls past the last line. Ratatui's `Paragraph::scroll` takes a (row, col)
 /// offset, so we pass `(scroll as u16, 0)`.
-fn render_manual(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_manual(buf: &mut Buffer, area: Rect, state: &AppState) {
+    if area.height == 0 { return; }
     let lines = manual_lines();
     let max_scroll = lines.len().saturating_sub(area.height as usize);
-    let scroll = state.manual_scroll.min(max_scroll) as u16;
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+    let scroll = state.manual_scroll.min(max_scroll);
+    let dim = Style::default().fg(Color::DarkGray);
+    for (row, line) in lines.iter().skip(scroll).take(area.height as usize).enumerate() {
+        buf.set_string(area.x, area.y + row as u16, line, dim);
+    }
 }
 
 /// Build the static manual page content as a `Vec<Line>`.
@@ -1435,433 +1300,101 @@ fn render_manual(frame: &mut Frame, area: Rect, state: &AppState) {
 /// - `d(s)` → dark gray (dimmed) annotation/example
 /// - `kv(k, v)` → yellow key + gray description
 /// - `blank()` → empty line
-fn manual_lines() -> Vec<Line<'static>> {
-    fn h(s: &'static str) -> Line<'static> {
-        Line::from(Span::styled(
-            s,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))
-    }
-    fn b(s: &'static str) -> Line<'static> {
-        Line::from(Span::styled(s, Style::default().fg(Color::Gray)))
-    }
-    fn d(s: &'static str) -> Line<'static> {
-        Line::from(Span::styled(s, Style::default().fg(Color::DarkGray)))
-    }
-    fn kv(k: &'static str, v: &'static str) -> Line<'static> {
-        Line::from(vec![
-            Span::styled(k, Style::default().fg(Color::Yellow)),
-            Span::styled(v, Style::default().fg(Color::Gray)),
-        ])
-    }
-    fn blank() -> Line<'static> {
-        Line::from("")
-    }
-
+fn manual_lines() -> Vec<String> {
     vec![
-        h("  apptop  ·  real-time process-group activity monitor"),
-        blank(),
-        // ── Overview ──────────────────────────────────────────────────────────
-        h("OVERVIEW"),
-        b("  Reads /proc and groups all processes by name (default), cgroup, or exe."),
-        b("  Two metrics are shown simultaneously as a split meter bar.  The left"),
-        b("  bar grows toward the centre; the right bar grows inward from the far"),
-        b("  edge.  Both are capped at the midpoint so they never cross."),
-        blank(),
-        b("  Eleven per-process metrics are available.  System-wide network, GPU,"),
-        b("  and power totals appear in the footer."),
-        blank(),
-        b("  Local mode (default)  reads /proc on this machine."),
-        b("  Proxmox mode (--proxmox URL --token T)  polls the PVE REST API and"),
-        b("  shows per-VM CPU and memory."),
-        blank(),
-        b("  When running without root privileges, metrics that require reading other"),
-        b("  users' /proc files (disk I/O, context switches, FDs, swap, RSS) will be"),
-        b("  marked with a trailing '?' and bars will be dimmed.  Rerun as root for"),
-        b("  complete data."),
-        blank(),
-        // ── Navigation ────────────────────────────────────────────────────────
-        h("NAVIGATION"),
-        kv("  [↑] [↓]  or  [j] [k]    ", "move cursor up / down through the group list"),
-        kv("  [Enter]                  ", "open thread heatmap for the selected group"),
-        kv("  [Esc]                    ", "return from thread view or manual to group list"),
-        kv("  [q]  [Ctrl-C]            ", "quit"),
-        blank(),
-        // ── Display controls ──────────────────────────────────────────────────
-        h("DISPLAY CONTROLS"),
-        kv("  [Tab]                    ", "switch active side  (left ↔ right)"),
-        d("                             active side is highlighted in yellow in the header"),
-        kv("  [← / →]                 ", "cycle the metric shown on the active side"),
-        kv("  [s]                      ", "re-sort list by the current active-side metric"),
-        kv("  [h]                      ", "toggle distribution histogram overlay"),
-        kv("  [g]                      ", "cycle grouping: comm→cgroup→exe (local) or flat→pool→tag→node (Proxmox)"),
-        d("                             current grouping shown in brackets in the header"),
-        kv("  [r]                      ", "force an immediate data refresh"),
-        kv("  [m]                      ", "toggle this manual  (↑/↓ line, PgUp/PgDn page)"),
-        blank(),
-        // ── Meter bar ─────────────────────────────────────────────────────────
-        h("THE METER BAR"),
-        b("  label  ▶▶▶  left-value  [══left bar══  gap  ══right bar══]  right-value  ◀◀◀"),
-        blank(),
-        kv("  ▶▶▶ / ◀◀◀  ", "cyan cursor brackets on the selected row.  They bracket the"),
-        d("               whole line so you can track one row across the full width."),
-        kv("  Left bar    ", "grows L→R from the label side, capped at the bar midpoint."),
-        kv("  Right bar   ", "grows R→L from the far edge, capped at the bar midpoint."),
-        kv("  Gap         ", "at least 2 dim cells always separate the two bars at centre."),
-        blank(),
-        // ── Metrics ───────────────────────────────────────────────────────────
-        h("METRICS  (per process group)"),
-        blank(),
-        b("  cpu% mach CPU time consumed by this group, normalised to the whole machine."),
-        b("             100% = every CPU core fully saturated (all threads combined)."),
-        b("             Note: this differs from top(1), which shows per-core percent"),
-        b("             (a process pinned to one core reads 100% in apptop, but 25% in"),
-        b("             top(1) on a 4-core machine).  apptop's convention makes groups"),
-        b("             comparable regardless of thread count."),
-        d("             Linear scale  0–100% of whole-machine CPU."),
-        blank(),
-        b("  mem       Resident set size — RAM pages physically in use (not virtual memory)."),
-        b("             Bar length = group RSS / total physical RAM (linear scale)."),
-        d("             Linear scale, fraction of physical RAM."),
-        blank(),
-        b("  disk-r    Bytes read from storage devices / second  (/proc/<pid>/io)."),
-        b("  disk-w    Bytes written to storage devices / second."),
-        d("             Log scale, relative to the current busiest group."),
-        blank(),
-        b("  faults/s  Page faults / second.  A fault happens when the process touches a"),
-        b("             virtual memory page not currently in RAM — typical during large"),
-        b("             allocations, first access of memory-mapped files, or copy-on-write."),
-        d("             Log scale, relative to the current busiest group."),
-        blank(),
-        b("  ctx-sw    Context switches / second (voluntary + involuntary combined)."),
-        b("             Voluntary:   the thread blocked on I/O, sleep, a mutex, or channel."),
-        b("             Involuntary: the scheduler preempted the thread (CPU contention)."),
-        d("             Log scale, relative to the current busiest group."),
-        blank(),
-        b("  runq      Scheduler wait % — fraction of time threads are ready to run but"),
-        b("             waiting for a free CPU core.  High values indicate CPU saturation:"),
-        b("             the threads want to run but cannot."),
-        d("             Linear scale  0–100%."),
-        blank(),
-        b("  fds       Open file descriptor count (sockets + pipes + files).  High or"),
-        b("             steadily growing counts can reveal connection or handle leaks."),
-        d("             Log scale, relative to the current busiest group."),
-        blank(),
-        b("  swap      Bytes of swap space in use  (VmSwap from /proc/<pid>/status)."),
-        d("             Log scale, relative to the current busiest group."),
-        blank(),
-        b("  threads   Total thread count for the process group."),
-        d("             Log scale, relative to the current busiest group."),
-        blank(),
-        b("  power     Estimated watts consumed by this group (shown with ≈ prefix):"),
-        b("               (group CPU%) / (total CPU%)  ×  RAPL package watts"),
-        b("             This is a CPU-proportional split of measured package power — not a"),
-        b("             per-process measurement.  Requires Intel or AMD RAPL support in the"),
-        b("             kernel.  Shows 0 if RAPL is unavailable.  Bar is anchored to the"),
-        b("             measured package watts."),
-        d("             Log scale, relative to the current busiest group."),
-        blank(),
-        // ── cgroup v2 metrics ─────────────────────────────────────────────────
-        h("CGROUP v2 METRICS  (group-by cgroup mode only, requires cgroup v2)"),
-        b("  These metrics are only available when:"),
-        b("    • the kernel uses cgroup v2 (/sys/fs/cgroup/cgroup.controllers exists)"),
-        b("    • group-by is set to 'cgroup' ([g] in local mode)"),
-        b("  When unavailable, the value shows '?' and the bar is dimmed."),
-        blank(),
-        b("  throttle  CFS CPU bandwidth throttle %.  When a cgroup has a CPU quota set"),
-        b("             (cpu.max), the scheduler throttles it once the quota is exhausted."),
-        b("             Calculated as: nr_throttled / nr_periods × 100 from cgroup cpu.stat."),
-        b("             A non-zero value means the cgroup is consistently hitting its limit."),
-        b("             Linear scale 0–100%."),
-        blank(),
-        b("  psi-cpu   CPU Pressure Stall Information — 'some avg10' from cpu.pressure."),
-        b("  psi-mem   Memory PSI — 'some avg10' from memory.pressure."),
-        b("  psi-io    I/O PSI — 'some avg10' from io.pressure."),
-        b("             'some avg10' = % of time at least one task in the cgroup was"),
-        b("             stalled waiting for that resource, averaged over the last 10 s."),
-        b("             Linear scale 0–100%.  System-wide PSI appears in the footer."),
-        d("             Per-cgroup PSI also requires that the kernel compiled with CONFIG_PSI."),
-        blank(),
-        b("  cgroup v2 also provides more accurate disk I/O accounting (io.stat) and"),
-        b("  RSS memory (memory.current) when group-by=cgroup.  These replace the"),
-        b("  /proc/PID/io and /proc/PID/statm values which are per-process and"),
-        b("  can miss I/O done by short-lived subprocesses."),
-        blank(),
-        // ── System metrics ────────────────────────────────────────────────────
-        h("SYSTEM METRICS  (footer only — not per-process)"),
-        kv("  net ↓/↑  ", "system-wide network receive / transmit  bytes / second"),
-        kv("  gpu      ", "total GPU utilisation %  (DRM sysfs; shown when GPU detected)"),
-        d("             reads /sys/class/drm/card*/device/gpu_busy_percent"),
-        kv("  total    ", "system-wide RAPL power draw in watts  (Intel / AMD only)"),
-        kv("  psi      ", "system-wide CPU/memory/I/O pressure from /proc/pressure/{cpu,memory,io}"),
-        d("             shown as 'psi cpu:N.N% mem:N.N% io:N.N%' when PSI is available"),
-        blank(),
-        // ── Incomplete data ───────────────────────────────────────────────────
-        h("INCOMPLETE DATA  (running without root)"),
-        b("  Metrics that require reading /proc/<pid>/io, /status, or /fd for processes"),
-        b("  owned by other users will be denied with EACCES unless you run as root."),
-        b("  When denied, the displayed value shows only the processes you own (a lower"),
-        b("  bound), and the value is marked with a trailing '?' and the bar is dimmed."),
-        blank(),
-        b("  Affected metrics: disk-r, disk-w, ctx-sw, swap, fds, runq, mem"),
-        b("  Unaffected: cpu% mach (reads /proc/<pid>/stat, world-readable)"),
-        blank(),
-        // ── Log scale ─────────────────────────────────────────────────────────
-        h("LOG SCALE"),
-        b("  Most metrics span many orders of magnitude: a quiet process may generate"),
-        b("  1 fault/s; a loaded one may generate 100 000.  On a linear scale everything"),
-        b("  except the current maximum would appear as zero."),
-        blank(),
-        b("    bar length  =  log₂(value + 1)  /  log₂(peak + 1)"),
-        blank(),
-        b("  Adding 1 before the log makes zero map to zero (avoids log(0) = −∞)."),
-        b("  The peak is the busiest non-fading group for that metric, smoothed with a"),
-        b("  0.95 decay so the scale shrinks gradually as activity drops."),
-        b("  The busiest group always fills ~100% of its half-bar."),
-        blank(),
-        // ── Distribution histogram ────────────────────────────────────────────
-        h("DISTRIBUTION HISTOGRAM  [h]"),
-        b("  Pressing [h] overlays a work-density histogram on the bar cells."),
-        b("  Cells switch from solid █ to hollow ◻.  Each ◻ carries two layers:"),
-        blank(),
-        kv("    Background  ", "bar fill colour (left metric, right metric, or transparent)"),
-        kv("    Foreground  ", "work density: blackbody heat from dark (none) to white (all)"),
-        d("                  how much of the group's total work falls in this load bucket"),
-        blank(),
-        b("  The x-axis encodes 'relative work share per thread' on a log₂ scale:"),
-        blank(),
-        kv("    Left edge    ", "threads contributing zero work"),
-        kv("    Pivot = 1/3   ", "all N threads share work exactly equally — the balanced point"),
-        kv("    Right edge   ", "one thread carries the entire load"),
-        blank(),
-        b("  Reading the histogram:"),
-        kv("    Heat near the pivot      ", "work is evenly distributed  (good parallelism)"),
-        kv("    Heat right of the pivot  ", "one or a few threads dominate — serial bottleneck,"),
-        d("                               hot lock, or single-threaded workload"),
-        kv("    Dark / all heat left     ", "threads mostly idle; total activity is very low"),
-        blank(),
-        b("  Why the pivot sits at exactly 1/3:"),
-        b("  The axis runs from l_min = −(p/(1−p))·log₂N to l_max = log₂N.  At the pivot"),
-        b("  r = 1  →  log₂(r) = 0, so its fractional position is:"),
-        b("    t = (0 − l_min) / (l_max − l_min) = (p/(1−p)) / (1/(1−p)) = p = 1/3"),
-        b("  The constant HIST_PIVOT_FRAC is literally the pivot position — not an input"),
-        b("  that produces it by coincidence.  Unequal loads push heat rightward."),
-        blank(),
-        d("  For N = 1 the histogram is suppressed (all dark ◻) — a distribution"),
-        d("  of one thread carries no useful information."),
-        d("  The histogram is sampled at most once per second to limit /proc overhead."),
-        blank(),
-        // ── Thread heatmap ────────────────────────────────────────────────────
-        h("THREAD HEATMAP  [Enter]"),
-        b("  Pressing Enter drills into the selected group and shows a per-thread grid."),
-        blank(),
-        b("  Each ◻ cell represents one thread.  Colour = that thread's CPU% relative"),
-        b("  to the hottest thread in the group (blackbody scale, same as histogram)."),
-        b("  Threads are sorted hottest-first; the top-left cell is always the busiest."),
-        blank(),
-        b("  When there are too many threads to fit in 4 rows, they are combined in"),
-        b("  power-of-2 batches (2, 4, 8, …) — the smallest factor that still fits in"),
-        b("  4 rows.  Each cell then shows the maximum CPU% in its group.  The info"),
-        b("  line at the top shows 'N threads/cell' when grouping is active."),
-        blank(),
-        b("  Below the heat grid, threads are listed individually with name, TID,"),
-        b("  and CPU%.  Press [Esc] to return to the group list."),
-        blank(),
-        // ── Fading rows ───────────────────────────────────────────────────────
-        h("FADING ROWS"),
-        b("  When a process group stops being active, its row stays visible for 5"),
-        b("  seconds, fading gradually from cyan to dark grey.  Rate-based metrics"),
-        b("  (CPU, disk I/O, page faults, context switches, power) are zeroed during"),
-        b("  the fade.  Static metrics (fds, swap, threads) retain their last value."),
-        b("  The row is removed once the 5-second retention window expires."),
-        blank(),
-        // ── Fleet mode ────────────────────────────────────────────────────────
-        h("FLEET MODE  (--enable-remote --hosts h1,h2,h3)"),
-        b("  Monitor multiple SSH hosts simultaneously. Each host appears as one row;"),
-        b("  the bar shows the host's system-wide CPU% and memory."),
-        blank(),
-        b("  The distribution-heat overlay ([h]) on any host row shows the process"),
-        b("  distribution within that host — which processes are driving load."),
-        blank(),
-        b("  [Enter] drills into the selected host's per-process view (daemon mode only)."),
-        blank(),
-        kv("  --hosts h1,h2,h3  ", "comma-separated list of hostnames or IPs"),
-        kv("  --hosts @/file    ", "read one host per line from a file (# = comment)"),
-        kv("  --thin            ", "use a minimal /proc shell probe instead of apptop --daemon;"),
-        d("                       provides CPU% and memory only; no drill-down"),
-        blank(),
-        b("  The disk-r / disk-w metrics show system-wide network rx/tx bytes/s in fleet mode."),
-        blank(),
-        b("  Hosts must be accessible via SSH. Key auth required (BatchMode=yes)."),
-        b("  Use --ssh-accept-new for first-time TOFU connection; always validates host keys."),
-        b("  For daemon mode, apptop must be installed and in PATH on each host."),
-        blank(),
-        // ── Kubernetes ────────────────────────────────────────────────────────
-        h("KUBERNETES (EXPERIMENTAL)  (--kube NAMESPACE[/SELECTOR])"),
-        b("  Monitor all pods in a Kubernetes namespace via kubectl exec."),
-        b("  Each pod appears as one row; the bar shows system-wide CPU% and memory."),
-        blank(),
-        kv("  --kube NAMESPACE           ", "monitor all pods in a namespace"),
-        kv("  --kube NAMESPACE/SELECTOR  ", "filter by label selector (e.g. app=nginx)"),
-        kv("  --kube-context CTX         ", "kubectl context from kubeconfig"),
-        kv("  --kube-thin                ", "thin /proc probe (no apptop binary required in image)"),
-        blank(),
-        b("  One row per pod, ordered by the active sort metric. The histogram overlay"),
-        b("  groups pods by their 'app' / 'app.kubernetes.io/name' label and shows"),
-        b("  load distribution across replicas of the same Deployment — the original"),
-        b("  consul-pool fairness question, answered for Kubernetes."),
-        blank(),
-        kv("  [Enter]  ", "drill into the selected pod (daemon mode only, not --kube-thin)"),
-        kv("  [Esc]    ", "exit drill-down back to the pod list"),
-        blank(),
-        b("  Requirements:"),
-        b("    • kubectl in PATH with RBAC permission to exec into pods"),
-        b("    • For daemon mode: apptop binary in the container image (same arch)"),
-        b("    • Host-network or /proc visibility inside the container for thin mode"),
-        blank(),
-        b("  Pod list is discovered once at startup; press [r] to re-query."),
-        blank(),
-        // ── Nomad ─────────────────────────────────────────────────────────────
-        h("NOMAD (EXPERIMENTAL)  (--nomad http://nomad.lan:4646)"),
-        b("  Monitor Nomad allocations via nomad alloc exec.  Each running allocation"),
-        b("  appears as one row, labelled job-name[alloc-short-id].  The bar shows"),
-        b("  system-wide CPU% and memory inside the allocation.  The extra column shows"),
-        b("  the task group name."),
-        blank(),
-        kv("  --nomad ADDR              ", "Nomad HTTP API address (e.g. http://nomad.lan:4646)"),
-        kv("  --nomad-namespace NS      ", "Nomad namespace (env: NOMAD_NAMESPACE, default: default)"),
-        kv("  --nomad-token TOKEN       ", "ACL token (env: NOMAD_TOKEN; omit if ACL is disabled)"),
-        kv("  --nomad-job JOB           ", "filter to allocations of one specific job"),
-        kv("  --nomad-thin              ", "thin /proc probe — no apptop binary required in the task"),
-        blank(),
-        b("  The work-density histogram overlay ([h]) on any allocation row shows the"),
-        b("  process distribution within that allocation — identical to fleet host rows."),
-        blank(),
-        kv("  [Enter]  ", "drill into the selected allocation for per-process detail (daemon mode)"),
-        kv("  [Esc]    ", "exit drill-down back to the allocation list"),
-        blank(),
-        b("  Requirements:"),
-        b("    • nomad CLI in PATH (used as the exec transport for both daemon and thin mode)"),
-        b("    • Daemon mode: apptop binary installed and in PATH inside the task image"),
-        b("    • Thin mode: sh, cat, printf, sleep — standard in any Linux container"),
-        blank(),
-        b("  Multi-task allocations: apptop execs into the first alphabetically-sorted"),
-        b("  running task.  Use --nomad-job to narrow to jobs with predictable task names."),
-        blank(),
-        b("  Allocation list is discovered once at startup via the Nomad HTTP API;"),
-        b("  press [r] to re-discover.  Only allocations with ClientStatus=running are shown."),
-        blank(),
-        // ── GroupBy ───────────────────────────────────────────────────────────
-        h("GROUPING STRATEGY  [g]"),
-        b("  Press [g] to cycle grouping.  The active strategy is shown in [brackets] in the header."),
-        blank(),
-        b("  LOCAL MODE:"),
-        kv("  comm    ", "Process name from /proc/<pid>/stat (default).  Best for"),
-        d("            identifying individual applications and daemons."),
-        kv("  cgroup  ", "Last meaningful component of /proc/<pid>/cgroup path, with"),
-        d("            .service/.scope suffixes stripped.  Groups systemd units together."),
-        kv("  exe     ", "Basename of /proc/<pid>/exe symlink.  Groups by the actual"),
-        d("            binary, useful when the same binary runs under different names."),
-        blank(),
-        b("  PROXMOX MODE:"),
-        kv("  flat    ", "One row per VM/CT — the default, same as before."),
-        kv("  pool    ", "Group VMs/CTs by their Proxmox pool.  VMs without a pool"),
-        d("            appear as '(no pool)'.  Useful for workload-oriented views."),
-        kv("  tag     ", "Group by each VM's first tag (semicolon-delimited).  VMs"),
-        d("            with no tags appear as '(untagged)'."),
-        kv("  node    ", "Group all VMs/CTs running on the same Proxmox node."),
-        d("            Gives a host-rollup: how much of each hypervisor is consumed."),
-        blank(),
-        b("  In grouped Proxmox mode, the bar shows aggregated CPU/mem/disk for the group."),
-        b("  The fair-share overlay shows how load is distributed among VMs in each group."),
-        b("  Node/storage status is always shown in the footer in Proxmox mode."),
-        blank(),
-        b("  Switching strategy clears the current snapshot and resets the stable order."),
-        blank(),
-        // ── Replay / Scrub ────────────────────────────────────────────────────
-        h("REPLAY / SCRUB"),
-        blank(),
-        kv("  [p]       ", "toggle pause — freezes the display on the current snapshot"),
-        kv("  [← →]     ", "while paused: scrub backward/forward through buffered history"),
-        kv("  [p]        ", "again to resume live mode"),
-        blank(),
-        b("  apptop keeps the last N snapshots in memory (--history-depth N, default 120)."),
-        b("  At the default 2 s interval this is ~4 minutes of history."),
-        b("  While paused the footer shows how far back in time the current view is."),
-        b("  Metric cycling (← →) is suspended while paused; resume first, then cycle."),
-        blank(),
-        // ── Anomaly alerts ────────────────────────────────────────────────────
-        h("ANOMALY ALERTS"),
-        blank(),
-        b("  apptop watches the load-distribution shape within each group using the"),
-        b("  Herfindahl N_eff concentration measure:"),
-        blank(),
-        b("    N_eff = (Σv)² / Σ(v²)   — effective-participant count"),
-        blank(),
-        b("  N_eff = N  →  all members share the load equally  (balanced)"),
-        b("  N_eff = 1  →  one member carries everything        (concentrated)"),
-        blank(),
-        b("  Two anomaly conditions are flagged (row label turns red, \"! \" prefix):"),
-        blank(),
-        kv("    concentrated   ", "N_eff/N < 0.35 with ≥ 5 members — most load on one member"),
-        kv("    dropout        ", "a member that was active (>15% share) dropped to near-zero (<3%)"),
-        d("                    The same member (by position) must drop — not any active + any idle."),
-        blank(),
-        b("  Optional alert hook (--alert-cmd CMD):"),
-        b("    CMD is called as:  CMD GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION"),
-        d("    e.g.  alert.sh \"nginx\" \"concentrated\" \"0.18\""),
-        b("    Rate-limited to once per 60 s per group. CMD is split on whitespace;"),
-        b("    no shell expansion. All stdio is suppressed (fire-and-forget)."),
-        b("    Gate explicitly: the hook fires only when --alert-cmd is provided."),
-        blank(),
-        blank(),
-        // ── GPU metrics ───────────────────────────────────────────────────────
-        h("GPU METRICS  (--enable-gpu, AMD/Intel DRM + NVIDIA via nvidia-smi)"),
-        b("  GPU metrics are disabled by default to avoid reading /proc/PID/fdinfo for every"),
-        b("  process.  Pass --enable-gpu to enable them.  Without this flag, gpu% and vram"),
-        b("  always show 0.0; the bar is not dimmed and no '?' is appended — the value is"),
-        b("  accurate (opt-in, not a permission failure)."),
-        blank(),
-        b("  gpu%      GPU engine time % for this process group.  Computed as:"),
-        b("              Δ(drm-engine-* nanoseconds) / elapsed_wall_clock_ns × 100"),
-        b("            Summed across all GPU engines (gfx, compute, enc, dec) and all"),
-        b("            DRM file descriptors held by PIDs in the group."),
-        b("            Can exceed 100% when multiple GPU engines run simultaneously."),
-        b("            For NVIDIA: SM% from nvidia-smi pmon (per-PID)."),
-        d("            Linear scale, capped at 1.0 in the bar display."),
-        blank(),
-        b("  vram      GPU VRAM in use by this group (instantaneous, bytes)."),
-        b("            Summed from drm-memory-vram lines across all DRM fds (AMD/Intel)."),
-        b("            For NVIDIA: used_gpu_memory from nvidia-smi --query-compute-apps."),
-        b("            May slightly over-count when multiple DRM contexts share allocations."),
-        d("            Log scale, relative to the current busiest group."),
-        blank(),
-        b("  Supported drivers:"),
-        b("    • AMD amdgpu — DRM fdinfo (kernel ≥ 5.14)"),
-        b("    • Intel i915 / xe — DRM fdinfo (kernel ≥ 5.14)"),
-        b("    • NVIDIA proprietary — nvidia-smi pmon (nvidia-smi must be in PATH)"),
-        b("    • nouveau (NVIDIA open) — DRM fdinfo where supported"),
-        blank(),
-        b("  Multi-GPU: apptop discovers all GPUs at startup via sysfs.  When multiple"),
-        b("  GPUs are present, a device selector appears at the bottom of the screen."),
-        blank(),
-        kv("  [         ", "cycle GPU selector backward (all → last device → … → first device)"),
-        kv("  ]         ", "cycle GPU selector forward  (all → first device → … → last device)"),
-        blank(),
-        b("  'all' aggregates data from all discovered GPUs (DRM + NVIDIA combined)."),
-        b("  Selecting a specific device shows only that device's gpu% and vram."),
-        blank(),
-        b("  How DRM metrics work: each open DRM file descriptor exposes lines in"),
-        b("  /proc/PID/fdinfo/N.  A fd is a DRM fd if 'drm-driver:' appears in the file."),
-        b("  The 'drm-pdev:' field identifies the PCI device."),
-        b("  drm-engine-* values are cumulative nanoseconds (like CPU jiffies) — the"),
-        b("  delta divided by elapsed time gives GPU%.  drm-memory-vram is instantaneous."),
-        blank(),
-        b("  How NVIDIA metrics work: nvidia-smi pmon -c 1 -s u is called each tick."),
-        b("  This requires the nvidia-smi binary in PATH.  If absent, NVIDIA data is"),
-        b("  silently omitted (no error shown)."),
-        blank(),
-        d("  apptop — GPLv3-or-later — Copyright (C) 2026 Epsilon Null Operation — see LICENSE"),
+        "  apptop  ·  real-time process-group activity monitor".into(),
+        "".into(),
+        "OVERVIEW".into(),
+        "  Reads /proc and groups all processes by name (default), cgroup, or exe.".into(),
+        "  Two metrics are shown simultaneously as a split meter bar.  The left".into(),
+        "  bar grows toward the centre; the right bar grows inward from the far".into(),
+        "  edge.  Both are capped at the midpoint so they never cross.".into(),
+        "".into(),
+        "  Eleven per-process metrics are available.  System-wide network, GPU,".into(),
+        "  and power totals appear in the footer.".into(),
+        "".into(),
+        "  Local mode (default)  reads /proc on this machine.".into(),
+        "  Proxmox mode (--proxmox URL --token T)  polls the PVE REST API and".into(),
+        "  shows per-VM CPU and memory.".into(),
+        "".into(),
+        "  When running without root privileges, metrics that require reading other".into(),
+        "  users' /proc files (disk I/O, context switches, FDs, swap, RSS) will be".into(),
+        "  marked with a trailing '?' and bars will be dimmed.  Rerun as root for".into(),
+        "  complete data.".into(),
+        "".into(),
+        "NAVIGATION".into(),
+        "  [↑] [↓]  or  [j] [k]    move cursor up / down through the group list".into(),
+        "  [Enter]                  open thread heatmap for the selected group".into(),
+        "  [Esc]                    return from thread view or manual to group list".into(),
+        "  [q]  [Ctrl-C]            quit".into(),
+        "".into(),
+        "DISPLAY CONTROLS".into(),
+        "  [Tab]                    switch active side  (left <-> right)".into(),
+        "  [<- / ->]                cycle the metric shown on the active side".into(),
+        "  [s]                      re-sort list by the current active-side metric".into(),
+        "  [h]                      toggle distribution histogram overlay".into(),
+        "  [g]                      cycle grouping: comm->cgroup->exe (local) or flat->pool->tag->node (Proxmox)".into(),
+        "  [n]                      toggle sort direction (descending / ascending)".into(),
+        "  [r]                      toggle replay / live mode".into(),
+        "  [,] [.]                  step backward / forward in replay history".into(),
+        "  [/]                      cycle GPU device selector (when --enable-gpu)".into(),
+        "".into(),
+        "METRICS".into(),
+        "  cpu%    CPU usage as percent of one core".into(),
+        "  mem     Resident set size (fraction of physical RAM)".into(),
+        "  faults/s  Minor+major page faults per second".into(),
+        "  threads Thread count".into(),
+        "  disk-r  Disk bytes read per second".into(),
+        "  disk-w  Disk bytes written per second".into(),
+        "  ctx-sw  Context switches per second (voluntary + involuntary)".into(),
+        "  fds     Open file descriptor count".into(),
+        "  swap    Swap in use, bytes".into(),
+        "  runq    Scheduler wait %".into(),
+        "  power   Estimated RAPL power (watts)".into(),
+        "  throttle  CFS bandwidth throttle % (cgroup v2 + Cgroup mode)".into(),
+        "  psi-cpu   CPU pressure stall avg10 (cgroup v2)".into(),
+        "  psi-mem   Memory pressure stall avg10 (cgroup v2)".into(),
+        "  psi-io    I/O pressure stall avg10 (cgroup v2)".into(),
+        "  gpu%    GPU engine time % (--enable-gpu, AMD/Intel DRM)".into(),
+        "  vram    GPU VRAM in use, bytes (--enable-gpu)".into(),
+        "".into(),
+        "PROXMOX MODE".into(),
+        "  Start with: apptop --proxmox https://pve.lan:8006 --token USER@REALM!ID=SECRET".into(),
+        "  Press Enter on a VM to SSH into it and monitor its processes.".into(),
+        "  Requires --enable-remote. Uses your ~/.ssh/known_hosts by default.".into(),
+        "".into(),
+        "FLEET MODE".into(),
+        "  apptop --hosts host1,host2,host3 --enable-remote".into(),
+        "  apptop --hosts @/path/to/hosts.txt --enable-remote".into(),
+        "  Monitor multiple SSH hosts simultaneously.".into(),
+        "  Press Enter on a host to drill into its process list.".into(),
+        "".into(),
+        "KUBERNETES".into(),
+        "  apptop --kube NAMESPACE".into(),
+        "  apptop --kube NAMESPACE/SELECTOR".into(),
+        "  Monitors pods via kubectl exec. Requires kubectl in PATH and RBAC.".into(),
+        "  --kube-context CTX    use a specific kubeconfig context".into(),
+        "  --kube-thin           thin /proc probe (no apptop in image needed)".into(),
+        "".into(),
+        "NOMAD".into(),
+        "  apptop --nomad http://nomad.lan:4646".into(),
+        "  apptop --nomad http://nomad.lan:4646 --nomad-job myjob".into(),
+        "  Monitors Nomad allocations via nomad alloc exec.".into(),
+        "  Requires the nomad CLI in PATH.".into(),
+        "  --nomad-namespace NS  target namespace (default: default)".into(),
+        "  --nomad-job JOB       filter to one job's allocations".into(),
+        "  --nomad-thin          thin /proc probe (no apptop in allocation needed)".into(),
+        "  ACL token: set NOMAD_TOKEN env var (not --token, which is Proxmox-only).".into(),
+        "".into(),
+        "DAEMON MODE".into(),
+        "  apptop --daemon       stream JSON snapshots to stdout".into(),
+        "  Used internally by remote drill-down and fleet mode.".into(),
+        "".into(),
+        "ANOMALY ALERTS".into(),
+        "  apptop --alert-cmd /path/to/script".into(),
+        "  Fired when a group's load concentration drops below the alert threshold.".into(),
+        "  Args: GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION".into(),
+        "  Rate-limited to once per 60 seconds per group.".into(),
     ]
 }
 
@@ -1873,9 +1406,7 @@ pub fn manual_text() -> String {
     let lines = manual_lines();
     let mut out = String::with_capacity(lines.len() * 72);
     for line in lines {
-        for span in line.spans {
-            out.push_str(&span.content);
-        }
+        out.push_str(&line);
         out.push('\n');
     }
     out
