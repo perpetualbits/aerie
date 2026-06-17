@@ -1,12 +1,12 @@
 [package]
-name = "apptop"
+name = "aerie"
 version = "1.0.3"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
 description = "Process-group performance monitor with Proxmox VM support and SSH drill-down"
-repository = "https://github.com/perpetualbits/apptop"
-homepage = "https://github.com/perpetualbits/apptop"
+repository = "https://github.com/perpetualbits/aerie"
+homepage = "https://github.com/perpetualbits/aerie"
 categories = ["command-line-utilities"]
 keywords = ["monitoring", "performance", "top", "proxmox", "processes"]
 
@@ -24,13 +24,13 @@ depends = "$auto"
 section = "utils"
 priority = "optional"
 assets = [
-    ["target/release/apptop", "usr/bin/apptop", "755"],
+    ["target/release/aerie", "usr/bin/aerie", "755"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/apptop", dest = "/usr/bin/apptop", mode = "755" },
-    { source = "LICENSE", dest = "/usr/share/licenses/apptop/LICENSE", mode = "644" },
+    { source = "target/release/aerie", dest = "/usr/bin/aerie", mode = "755" },
+    { source = "LICENSE", dest = "/usr/share/licenses/aerie/LICENSE", mode = "644" },
 ]
 
 [dependencies]

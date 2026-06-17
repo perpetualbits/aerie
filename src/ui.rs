@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
-use mullion::{Buffer, Rect};
+use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, stable_hash};
+use mullion::{Buffer, Rect, render_carousel};
 use mullion::layout::{Constraint, Node, Orientation, Size, TileId};
 use mullion::style::{Color, Modifier, Style};
+use std::collections::HashMap;
 
 const HEADER_ID: TileId = 1;
-const BODY_ID:   TileId = 2;
+pub const BODY_ID: TileId = 2;
 const FOOTER_ID: TileId = 3;
 
 /// Top-level render entry point: splits the terminal into header / body / footer
 /// using a mullion `Node::Split` and dispatches to per-section renderers.
-pub fn render(buf: &mut Buffer, state: &AppState) {
+pub fn render(buf: &mut Buffer, state: &mut AppState) {
     let area = buf.area;
     if area.height == 0 { return; }
     let term_w = area.width as usize;
@@ -41,11 +42,11 @@ pub fn render(buf: &mut Buffer, state: &AppState) {
     }
 
     render_header(buf, header_rect, state);
-    match &state.view {
+    match state.view.clone() {
         AppView::Groups | AppView::Remote { .. } => render_body(buf, body_rect, state),
         AppView::Threads { .. } => render_threads(buf, body_rect, state),
         AppView::Manual => render_manual(buf, body_rect, state),
-        AppView::Connecting { label } => render_connecting(buf, body_rect, label),
+        AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
     }
     render_footer(buf, footer_rect, state);
 }
@@ -633,7 +634,7 @@ fn metric_frac(e: &BarEntry, m: Metric, total_ram: u64, peaks: &PeakVals) -> f64
 ///   When off, classic solid `█` / dim `░` characters are used.
 /// - Fading rows (group gone from /proc, within retention window) have zeroed
 ///   rate metrics and a label that smoothly transitions from cyan to dark grey.
-fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
+fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     if area.height == 0 { return; }
 
     if state.entries.is_empty() {
@@ -648,7 +649,6 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
 
     let lm = state.left_metric;
     let rm = state.right_metric;
-
     let hist_metric = match state.active_side { Side::Left => lm, Side::Right => rm };
     let overlay_enabled = state.show_histogram
         && matches!(hist_metric,
@@ -662,7 +662,6 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
     let total_w = area.width as usize;
     let fixed = label_w + 1 + ARROW_W + VAL_W + VAL_W + ARROW_W;
     let bar_w = total_w.saturating_sub(fixed).max(16);
-    let peaks = &state.peak_vals;
 
     // ── column-header row ─────────────────────────────────────────────────────
     let lname = lm.name();
@@ -695,20 +694,41 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
     x = buf.set_string(x, hy, rname, right_hdr_style);
     let _ = x;
 
-    let max_rows = area.height as usize;
-    let scroll = state.scroll_offset.min(state.entries.len().saturating_sub(1));
-    let entry_rows = max_rows.saturating_sub(1);
+    // ── carousel body ─────────────────────────────────────────────────────────
+    let carousel_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+    if carousel_area.height == 0 { return; }
 
-    for (row_i, (i, e)) in state.entries.iter().enumerate()
-        .skip(scroll).take(entry_rows).enumerate()
-    {
-        let ey = area.y + 1 + row_i as u16;
-        if ey >= area.bottom() { break; }
-        let fading = e.fading;
-        let is_selected = i == state.cursor;
+    // Take the tree out so we can borrow the rest of state in the draw closure.
+    let mut tree = match state.body_tree.take() {
+        Some(t) => t,
+        None => return,
+    };
+    tree.scroll_focus_into_view(carousel_area);
 
-        let lf = if fading { 0.0 } else { metric_frac(e, lm, state.total_ram_bytes, peaks) };
-        let rf = if fading { 0.0 } else { metric_frac(e, rm, state.total_ram_bytes, peaks) };
+    // Build index before the closure captures state fields.
+    let entries_by_id: HashMap<TileId, usize> = state.entries.iter()
+        .enumerate()
+        .map(|(i, e)| (stable_hash(&e.label), i))
+        .collect();
+
+    // Snapshot scalar fields and shared-ref fields before the closure.
+    let cursor          = state.cursor;
+    let total_ram_bytes = state.total_ram_bytes;
+    let show_histogram  = state.show_histogram;
+    let entries         = &state.entries;
+    let peaks           = &state.peak_vals;
+    let anomaly_states  = &state.anomaly_states;
+    let group_member_vals = &state.group_member_vals;
+
+    render_carousel(buf, tree.root_mut(), carousel_area, &mut |buf: &mut Buffer, id: TileId, rect: Rect| {
+        let entry_idx = match entries_by_id.get(&id) { Some(&i) => i, None => return };
+        let e = &entries[entry_idx];
+        let ey = rect.y;
+        let fading     = e.fading;
+        let is_selected = entry_idx == cursor;
+
+        let lf = if fading { 0.0 } else { metric_frac(e, lm, total_ram_bytes, peaks) };
+        let rf = if fading { 0.0 } else { metric_frac(e, rm, total_ram_bytes, peaks) };
         let l_incomplete = !fading && !entry_complete(e, lm);
         let r_incomplete = !fading && !entry_complete(e, rm);
         let lc = if fading { Color::DarkGray } else {
@@ -718,12 +738,12 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
             let c = bar_color(rm, rf); if r_incomplete { dimmed(c) } else { c }
         };
 
-        let usable = (bar_w / 2).saturating_sub(1);
-        let l_filled = (lf * usable as f64).round() as usize;
-        let r_filled = (rf * usable as f64).round() as usize;
+        let usable      = (bar_w / 2).saturating_sub(1);
+        let l_filled    = (lf * usable as f64).round() as usize;
+        let r_filled    = (rf * usable as f64).round() as usize;
         let right_start = bar_w - r_filled;
 
-        let anomaly = state.anomaly_states.get(&e.label);
+        let anomaly    = anomaly_states.get(&e.label);
         let is_anomaly = anomaly.is_some_and(|s: &AnomalyState| s.alerting);
 
         let label_style = if is_selected {
@@ -745,12 +765,12 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
             truncate_label(&e.label, label_w)
         };
 
-        let l_str = metric_display_str(e, lm, state.total_ram_bytes);
-        let r_str = metric_display_str(e, rm, state.total_ram_bytes);
+        let l_str = metric_display_str(e, lm, total_ram_bytes);
+        let r_str = metric_display_str(e, rm, total_ram_bytes);
 
-        let hist: Option<Vec<f64>> = if state.show_histogram {
+        let hist: Option<Vec<f64>> = if show_histogram {
             if overlay_enabled && !fading {
-                Some(state.group_member_vals.get(&e.label).map(|v| {
+                Some(group_member_vals.get(&e.label).map(|v| {
                     if v.metric == hist_metric {
                         fair_share_bins(&v.vals, bar_w)
                     } else {
@@ -772,7 +792,7 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
             ("   ", "   ", blank_arrow)
         };
 
-        let mut x = area.x;
+        let mut x = rect.x;
         x = buf.set_string(x, ey, &display_label, label_style);
         x = buf.set_string(x, ey, " ", Style::default());
         x = buf.set_string(x, ey, l_arrow, a_style);
@@ -794,7 +814,11 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &AppState) {
         x = buf.set_string(x, ey, &format!("{:<VAL_W$}", r_str), Style::default().fg(rc));
         x = buf.set_string(x, ey, r_arrow, a_style);
         let _ = x;
-    }
+    });
+
+    // Restore the tree and record visible height for histogram sampling.
+    state.body_tree = Some(tree);
+    state.last_body_height = area.height as usize;
 }
 
 /// Thread heat-map view. Each ◻ cell encodes CPU heat relative to the
@@ -1302,7 +1326,7 @@ fn render_manual(buf: &mut Buffer, area: Rect, state: &AppState) {
 /// - `blank()` → empty line
 fn manual_lines() -> Vec<String> {
     vec![
-        "  apptop  ·  real-time process-group activity monitor".into(),
+        "  aerie  ·  real-time process-group activity monitor".into(),
         "".into(),
         "OVERVIEW".into(),
         "  Reads /proc and groups all processes by name (default), cgroup, or exe.".into(),
@@ -1359,39 +1383,39 @@ fn manual_lines() -> Vec<String> {
         "  vram    GPU VRAM in use, bytes (--enable-gpu)".into(),
         "".into(),
         "PROXMOX MODE".into(),
-        "  Start with: apptop --proxmox https://pve.lan:8006 --token USER@REALM!ID=SECRET".into(),
+        "  Start with: aerie --proxmox https://pve.lan:8006 --token USER@REALM!ID=SECRET".into(),
         "  Press Enter on a VM to SSH into it and monitor its processes.".into(),
         "  Requires --enable-remote. Uses your ~/.ssh/known_hosts by default.".into(),
         "".into(),
         "FLEET MODE".into(),
-        "  apptop --hosts host1,host2,host3 --enable-remote".into(),
-        "  apptop --hosts @/path/to/hosts.txt --enable-remote".into(),
+        "  aerie --hosts host1,host2,host3 --enable-remote".into(),
+        "  aerie --hosts @/path/to/hosts.txt --enable-remote".into(),
         "  Monitor multiple SSH hosts simultaneously.".into(),
         "  Press Enter on a host to drill into its process list.".into(),
         "".into(),
         "KUBERNETES".into(),
-        "  apptop --kube NAMESPACE".into(),
-        "  apptop --kube NAMESPACE/SELECTOR".into(),
+        "  aerie --kube NAMESPACE".into(),
+        "  aerie --kube NAMESPACE/SELECTOR".into(),
         "  Monitors pods via kubectl exec. Requires kubectl in PATH and RBAC.".into(),
         "  --kube-context CTX    use a specific kubeconfig context".into(),
-        "  --kube-thin           thin /proc probe (no apptop in image needed)".into(),
+        "  --kube-thin           thin /proc probe (no aerie in image needed)".into(),
         "".into(),
         "NOMAD".into(),
-        "  apptop --nomad http://nomad.lan:4646".into(),
-        "  apptop --nomad http://nomad.lan:4646 --nomad-job myjob".into(),
+        "  aerie --nomad http://nomad.lan:4646".into(),
+        "  aerie --nomad http://nomad.lan:4646 --nomad-job myjob".into(),
         "  Monitors Nomad allocations via nomad alloc exec.".into(),
         "  Requires the nomad CLI in PATH.".into(),
         "  --nomad-namespace NS  target namespace (default: default)".into(),
         "  --nomad-job JOB       filter to one job's allocations".into(),
-        "  --nomad-thin          thin /proc probe (no apptop in allocation needed)".into(),
+        "  --nomad-thin          thin /proc probe (no aerie in allocation needed)".into(),
         "  ACL token: set NOMAD_TOKEN env var (not --token, which is Proxmox-only).".into(),
         "".into(),
         "DAEMON MODE".into(),
-        "  apptop --daemon       stream JSON snapshots to stdout".into(),
+        "  aerie --daemon       stream JSON snapshots to stdout".into(),
         "  Used internally by remote drill-down and fleet mode.".into(),
         "".into(),
         "ANOMALY ALERTS".into(),
-        "  apptop --alert-cmd /path/to/script".into(),
+        "  aerie --alert-cmd /path/to/script".into(),
         "  Fired when a group's load concentration drops below the alert threshold.".into(),
         "  Args: GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION".into(),
         "  Rate-limited to once per 60 seconds per group.".into(),

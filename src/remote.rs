@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SSH-based remote daemon client.
-// The remote machine runs `apptop --daemon` which streams newline-delimited
+// The remote machine runs `aerie --daemon` which streams newline-delimited
 // JSON snapshots to stdout. This module handles host discovery, SSH spawn,
 // and the reader thread that feeds a channel consumed by the main event loop.
 
@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-/// One snapshot emitted by `apptop --daemon` each refresh cycle.
+/// One snapshot emitted by `aerie --daemon` each refresh cycle.
 ///
 /// Serialised as a single JSON object and written to stdout as one line.
 /// The remote UI's reader thread deserialises each line into this struct and
@@ -74,7 +74,7 @@ pub enum SshHostKeyPolicy {
     AcceptNew,
 }
 
-/// Live SSH connection to a remote `apptop --daemon` instance.
+/// Live SSH connection to a remote `aerie --daemon` instance.
 ///
 /// The connection consists of:
 /// - `child`: the `ssh` subprocess with its stdout piped.
@@ -207,8 +207,8 @@ pub fn remote_enabled_for_vm(enable_remote: bool) -> bool {
 /// For each candidate:
 /// 1. Validates the user/host strings (no leading `-`).
 /// 2. TCP-probes port 22 with a 2-second timeout.
-/// 3. Attempts to spawn `ssh … apptop --daemon` with `BatchMode=yes`.
-/// 4. Waits 600 ms for an immediate SSH failure (bad key, `apptop` not in PATH).
+/// 3. Attempts to spawn `ssh … aerie --daemon` with `BatchMode=yes`.
+/// 4. Waits 600 ms for an immediate SSH failure (bad key, `aerie` not in PATH).
 ///
 /// Returns:
 /// - `Ok(RemoteClient)` on the first successful connection.
@@ -287,7 +287,7 @@ pub fn connect_vm(
     diag.push("To fix:".into());
     diag.push(format!("  • SSH key auth:   ssh-copy-id {ssh_user}@{label}"));
     diag.push(format!(
-        "  • Install apptop: scp apptop {ssh_user}@{label}:/usr/local/bin/"
+        "  • Install aerie: scp aerie {ssh_user}@{label}:/usr/local/bin/"
     ));
     diag.push("  • Confirm the VM is running and reachable on the network".into());
     Err(diag)
@@ -311,7 +311,7 @@ pub fn probe_port_22(host: &str) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
 }
 
-/// Connect directly to a remote host and run `apptop --daemon` over SSH.
+/// Connect directly to a remote host and run `aerie --daemon` over SSH.
 ///
 /// This is the public, direct-connect variant of the SSH daemon launcher.
 /// It is used both internally by `connect_vm` (which calls it after host discovery)
@@ -326,7 +326,7 @@ pub fn probe_port_22(host: &str) -> bool {
 /// - `--`: argument terminator to prevent `user@host` from being parsed as an option.
 ///
 /// After spawning, we sleep 600 ms and call `try_wait` to detect fast failures:
-/// SSH exits immediately when key auth fails or `apptop` is not in PATH.
+/// SSH exits immediately when key auth fails or `aerie` is not in PATH.
 /// If the process has already exited, we return an error with the exit status.
 ///
 /// On success, a reader thread is spawned that parses JSON lines from the SSH
@@ -356,7 +356,7 @@ pub fn connect_direct(host: &str, user: &str, policy: SshHostKeyPolicy) -> Resul
             "ServerAliveCountMax=2",
             "--",           // prevents user@host from being parsed as an option
             &target,
-            "apptop",
+            "aerie",
             "--daemon",
         ])
         .stdin(Stdio::null())   // no input needed from the remote daemon
@@ -380,15 +380,15 @@ pub fn connect_direct(host: &str, user: &str, policy: SshHostKeyPolicy) -> Resul
         }
     });
 
-    // Brief pause so SSH can fail fast on obvious errors (bad key, refused, apptop absent…).
+    // Brief pause so SSH can fail fast on obvious errors (bad key, refused, aerie absent…).
     // 600 ms is enough for `ssh` to complete the TCP handshake, authenticate, and fail
-    // if the remote `apptop` binary is missing, without being long enough to feel sluggish
+    // if the remote `aerie` binary is missing, without being long enough to feel sluggish
     // on a fast LAN connection.
     std::thread::sleep(Duration::from_millis(600));
     match child.try_wait() {
         Ok(Some(status)) => {
             return Err(anyhow!(
-                "SSH exited immediately ({status}) — check key auth and that apptop is in PATH on the remote"
+                "SSH exited immediately ({status}) — check key auth and that aerie is in PATH on the remote"
             ));
         }
         Err(e) => return Err(anyhow!("process error: {e}")),
@@ -490,7 +490,7 @@ fn parse_thin_block(
 
 /// Thin SSH probe: runs a fixed `/proc` reader shell command on the remote host.
 ///
-/// Unlike `connect_direct` (which requires `apptop` to be installed), `ThinProbe`
+/// Unlike `connect_direct` (which requires `aerie` to be installed), `ThinProbe`
 /// only requires `sh`, `cat`, and `sleep` — universally available on Linux.
 ///
 /// The fixed command run over SSH is:
@@ -564,18 +564,18 @@ pub fn validate_kube_target(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Connect to a Kubernetes pod via `kubectl exec` and run `apptop --daemon`.
+/// Connect to a Kubernetes pod via `kubectl exec` and run `aerie --daemon`.
 ///
 /// The command spawned is:
 /// ```text
-/// kubectl exec POD -n NAMESPACE [--context CTX] -- apptop --daemon
+/// kubectl exec POD -n NAMESPACE [--context CTX] -- aerie --daemon
 /// ```
 /// Pod and namespace are passed as separate positional arguments (never concatenated
 /// into a shell string) to prevent option injection even for unusual pod names.
 /// The `--` separator ensures the subsequent tokens are never parsed as kubectl flags.
 ///
 /// The 600 ms fast-fail check detects immediate failures: pod not found, RBAC denied,
-/// or `apptop` not installed in the container image. Returns a `RemoteClient` that
+/// or `aerie` not installed in the container image. Returns a `RemoteClient` that
 /// reads JSON `DaemonSnapshot` lines from the kubectl stdout, identical to the SSH-based
 /// `connect_direct`.
 pub fn connect_kube_daemon(pod: &str, namespace: &str, context: Option<&str>) -> Result<RemoteClient> {
@@ -585,7 +585,7 @@ pub fn connect_kube_daemon(pod: &str, namespace: &str, context: Option<&str>) ->
 
     let mut args: Vec<&str> = vec!["exec", pod, "-n", namespace];
     if let Some(ctx) = context { args.push("--context"); args.push(ctx); }
-    args.extend_from_slice(&["--", "apptop", "--daemon"]);
+    args.extend_from_slice(&["--", "aerie", "--daemon"]);
 
     let mut child = Command::new("kubectl")
         .args(&args)
@@ -605,11 +605,11 @@ pub fn connect_kube_daemon(pod: &str, namespace: &str, context: Option<&str>) ->
         }
     });
 
-    // Allow 600 ms for kubectl to fail fast (pod not found, RBAC error, apptop absent).
+    // Allow 600 ms for kubectl to fail fast (pod not found, RBAC error, aerie absent).
     std::thread::sleep(Duration::from_millis(600));
     match child.try_wait() {
         Ok(Some(status)) => Err(anyhow!(
-            "kubectl exec exited immediately ({status}) — check RBAC and that apptop is in the container image"
+            "kubectl exec exited immediately ({status}) — check RBAC and that aerie is in the container image"
         )),
         Err(e) => Err(anyhow!("process error: {e}")),
         Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: pod.to_string() }),
@@ -620,7 +620,7 @@ pub fn connect_kube_daemon(pod: &str, namespace: &str, context: Option<&str>) ->
 ///
 /// Runs the same fixed `/proc` reader command as the SSH `connect_thin`, but using
 /// `kubectl exec` as the transport. Only `sh`, `cat`, `printf`, and `sleep` are
-/// required inside the container image; no `apptop` binary is needed.
+/// required inside the container image; no `aerie` binary is needed.
 ///
 /// Command run inside the pod:
 /// ```text
@@ -681,7 +681,7 @@ pub fn connect_kube_thin(pod: &str, namespace: &str, context: Option<&str>) -> R
 /// ```text
 /// sh -c "while true; do cat /proc/stat /proc/meminfo; echo '==='; sleep 1; done"
 /// ```
-/// via SSH with `BatchMode=yes` (key auth only).  No `apptop` binary is required
+/// via SSH with `BatchMode=yes` (key auth only).  No `aerie` binary is required
 /// on the remote machine — only a POSIX shell.
 ///
 /// SSH options are identical to `connect_direct`: `BatchMode`, `ConnectTimeout=5`,
@@ -781,18 +781,18 @@ pub fn validate_nomad_target(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Connect to a Nomad allocation via `nomad alloc exec` and run `apptop --daemon`.
+/// Connect to a Nomad allocation via `nomad alloc exec` and run `aerie --daemon`.
 ///
 /// The command spawned is:
 /// ```text
-/// nomad alloc exec -address=ADDR -task=TASK ALLOC_ID -- apptop --daemon
+/// nomad alloc exec -address=ADDR -task=TASK ALLOC_ID -- aerie --daemon
 /// ```
 /// All arguments are passed as separate tokens (never shell-expanded). When an ACL
 /// token is provided it is injected as `NOMAD_TOKEN` in the child environment rather
 /// than a CLI flag, so it does not appear in the process list.
 ///
 /// The 600 ms fast-fail window detects immediate failures: alloc not found, ACL
-/// denied, or `apptop` not installed in the task image.
+/// denied, or `aerie` not installed in the task image.
 pub fn connect_nomad_daemon(
     alloc_id: &str,
     task: &str,
@@ -808,7 +808,7 @@ pub fn connect_nomad_daemon(
         &format!("-address={addr}"),
         &format!("-task={task}"),
         alloc_id,
-        "--", "apptop", "--daemon",
+        "--", "aerie", "--daemon",
     ]);
     if let Some(tok) = token {
         cmd.env("NOMAD_TOKEN", tok);
@@ -833,7 +833,7 @@ pub fn connect_nomad_daemon(
     std::thread::sleep(Duration::from_millis(600));
     match child.try_wait() {
         Ok(Some(status)) => Err(anyhow!(
-            "nomad alloc exec exited immediately ({status}) — check ACL token, alloc ID, and that apptop is installed in the task"
+            "nomad alloc exec exited immediately ({status}) — check ACL token, alloc ID, and that aerie is installed in the task"
         )),
         Err(e) => Err(anyhow!("process error: {e}")),
         Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: alloc_id.to_string() }),
@@ -844,7 +844,7 @@ pub fn connect_nomad_daemon(
 ///
 /// Runs the same fixed `/proc` reader shell loop as `connect_kube_thin`, but using
 /// `nomad alloc exec` as the transport. Requires only `sh`, `cat`, `printf`, and
-/// `sleep` inside the task — no `apptop` binary needed.
+/// `sleep` inside the task — no `aerie` binary needed.
 pub fn connect_nomad_thin(
     alloc_id: &str,
     task: &str,

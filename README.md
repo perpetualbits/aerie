@@ -1,13 +1,13 @@
-# apptop
+# aerie
 
 Real-time process-group performance monitor for Linux.
 
-`apptop` reads `/proc` and groups processes by name, cgroup, or executable,
+`aerie` reads `/proc` and groups processes by name, cgroup, or executable,
 displaying a dual-metric bar chart updated every 2 seconds. It supports local
 monitoring, SSH fleet fan-out, Proxmox VE API polling, and Kubernetes pod
 drill-down.
 
-Press `m` for the full built-in manual, or `apptop -m | less` from the shell.
+Press `m` for the full built-in manual, or `aerie -m | less` from the shell.
 
 ## Features
 
@@ -21,7 +21,7 @@ Press `m` for the full built-in manual, or `apptop -m | less` from the shell.
   `nvidia-smi` pmon; multi-GPU with per-device selection using `[`/`]`
 - **Fleet mode** (`--hosts`, `--enable-remote`) — monitor many SSH hosts in one view;
   press Enter to drill into any host
-- **Thin probe** (`--thin`) — CPU% + memory without apptop installed on the remote;
+- **Thin probe** (`--thin`) — CPU% + memory without aerie installed on the remote;
   works over any SSH connection via a `/proc` shell one-liner
 - **Proxmox VE** (`--proxmox`) — poll the PVE REST API; group VMs by pool, tag, or
   node; press Enter to SSH into any VM and monitor its processes live
@@ -31,29 +31,29 @@ Press `m` for the full built-in manual, or `apptop -m | less` from the shell.
   (default 4 minutes at 2 s interval)
 - **Anomaly detection** — load-concentration alerts with optional shell hook
   (`--alert-cmd`)
-- **Built-in manual** — `m` in the TUI or `apptop -m` at the shell
+- **Built-in manual** — `m` in the TUI or `aerie -m` at the shell
 
 ## Installation
 
 ### Pre-built packages
 
-Download from [GitHub Releases](https://github.com/perpetualbits/apptop/releases/latest):
+Download from [GitHub Releases](https://github.com/perpetualbits/aerie/releases/latest):
 
 | Architecture | Binary | Debian/Ubuntu | Fedora/RHEL | Snap |
 |---|---|---|---|---|
-| x86-64 | `apptop-vX.Y.Z-x86_64-linux` | `apptop_X.Y.Z_amd64.deb` | `apptop-X.Y.Z.x86_64.rpm` | `apptop_X.Y.Z_amd64.snap` |
-| aarch64 | `apptop-vX.Y.Z-aarch64-linux` | `apptop_X.Y.Z_arm64.deb` | `apptop-X.Y.Z.aarch64.rpm` | — |
-| riscv64 | `apptop-vX.Y.Z-riscv64-linux` | `apptop_X.Y.Z_riscv64.deb` | `apptop-X.Y.Z.riscv64gc.rpm` | — |
+| x86-64 | `aerie-vX.Y.Z-x86_64-linux` | `aerie_X.Y.Z_amd64.deb` | `aerie-X.Y.Z.x86_64.rpm` | `aerie_X.Y.Z_amd64.snap` |
+| aarch64 | `aerie-vX.Y.Z-aarch64-linux` | `aerie_X.Y.Z_arm64.deb` | `aerie-X.Y.Z.aarch64.rpm` | — |
+| riscv64 | `aerie-vX.Y.Z-riscv64-linux` | `aerie_X.Y.Z_riscv64.deb` | `aerie-X.Y.Z.riscv64gc.rpm` | — |
 
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i apptop_*.deb
+sudo dpkg -i aerie_*.deb
 
 # Fedora/RHEL
-sudo rpm -i apptop-*.rpm
+sudo rpm -i aerie-*.rpm
 
 # Raw binary
-chmod +x apptop-*-linux && sudo mv apptop-*-linux /usr/local/bin/apptop
+chmod +x aerie-*-linux && sudo mv aerie-*-linux /usr/local/bin/aerie
 ```
 
 ### Build from source
@@ -61,38 +61,38 @@ chmod +x apptop-*-linux && sudo mv apptop-*-linux /usr/local/bin/apptop
 Requires Rust 1.85+:
 
 ```bash
-git clone https://github.com/perpetualbits/apptop
-cd apptop
+git clone https://github.com/perpetualbits/aerie
+cd aerie
 cargo build --release
-sudo cp target/release/apptop /usr/local/bin/
+sudo cp target/release/aerie /usr/local/bin/
 ```
 
 ## Quick start
 
 ```bash
 # Local process monitor
-apptop
+aerie
 
 # Show only the 20 busiest groups, refresh every second
-apptop -n 20 -i 1
+aerie -n 20 -i 1
 
 # Enable GPU metrics (Intel/AMD via fdinfo, NVIDIA via nvidia-smi)
-apptop --enable-gpu
+aerie --enable-gpu
 
 # Monitor a Proxmox cluster
-apptop --proxmox https://pve.lan:8006 --token user@pam!mytoken=SECRET
+aerie --proxmox https://pve.lan:8006 --token user@pam!mytoken=SECRET
 
 # Monitor a fleet of SSH hosts
-apptop --enable-remote --hosts web1,web2,web3
+aerie --enable-remote --hosts web1,web2,web3
 
-# Monitor fleet from a file, use thin probe (no apptop needed on remotes)
-apptop --enable-remote --hosts @/etc/apptop/hosts --thin
+# Monitor fleet from a file, use thin probe (no aerie needed on remotes)
+aerie --enable-remote --hosts @/etc/aerie/hosts --thin
 
 # Monitor Kubernetes pods in a namespace
-apptop --kube monitoring
+aerie --kube monitoring
 
 # Print the built-in manual
-apptop -m | less
+aerie -m | less
 ```
 
 ## Key bindings
@@ -116,7 +116,7 @@ apptop -m | less
 ## CLI reference
 
 ```
-apptop [OPTIONS]
+aerie [OPTIONS]
 
 Options:
   -i, --interval <SECS>       Refresh interval (default: 2)
@@ -130,16 +130,16 @@ Proxmox:
       --insecure              Accept self-signed TLS certificates
 
 Remote / Fleet:
-      --enable-remote         Enable SSH drill-down [$APPTOP_ENABLE_REMOTE]
+      --enable-remote         Enable SSH drill-down [$AERIE_ENABLE_REMOTE]
       --hosts <LIST|@FILE>    Comma-separated hostnames or @/path/to/file
       --ssh-user <USER>       SSH username (default: current user)
       --ssh-accept-new        Accept unknown host keys on first use (TOFU)
-      --thin                  Use shell /proc probe instead of apptop --daemon
+      --thin                  Use shell /proc probe instead of aerie --daemon
 
 Kubernetes (experimental):
       --kube <NS[/SELECTOR]>  Namespace or namespace/label-selector
       --kube-context <CTX>    kubeconfig context (default: current)
-      --kube-thin             Use shell probe instead of apptop --daemon in pod
+      --kube-thin             Use shell probe instead of aerie --daemon in pod
 
 GPU:
       --enable-gpu            Enable GPU metrics (fdinfo + nvidia-smi pmon)
@@ -167,7 +167,7 @@ zero values without an error.
 ## Proxmox mode
 
 ```bash
-apptop --proxmox https://pve.lan:8006 --token user@pam!token=SECRET
+aerie --proxmox https://pve.lan:8006 --token user@pam!token=SECRET
 ```
 
 Groups VMs/CTs by pool, tag, or node (press `g` to cycle). The fair-share
@@ -177,16 +177,16 @@ row to SSH in and monitor its processes live (requires `--enable-remote`).
 ## Fleet mode
 
 ```bash
-apptop --enable-remote --hosts web1,web2,db1
+aerie --enable-remote --hosts web1,web2,db1
 ```
 
 Each host appears as a row; metrics are the busiest process group on that host.
-Press Enter to drill in. Use `--thin` for hosts without apptop installed.
+Press Enter to drill in. Use `--thin` for hosts without aerie installed.
 
 ## Anomaly alerts
 
 ```bash
-apptop --alert-cmd /usr/local/bin/alert.sh
+aerie --alert-cmd /usr/local/bin/alert.sh
 ```
 
 The hook is called as `CMD GROUP KIND BALANCE_FRACTION` (e.g.

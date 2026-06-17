@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// apptop — process-group performance monitor
+// aerie — process-group performance monitor
 // Copyright (C) 2026 Epsilon Null Operation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -25,7 +25,9 @@ use crossterm::event::Event;
 use mullion::{
     backend::CrosstermBackend,
     input::{KeyCode, KeyModifiers},
+    layout::{Node, Orientation, TileId},
     poll_event, Terminal,
+    tree::{reconcile_carousel, Tree},
 };
 use std::{
     collections::HashMap,
@@ -38,9 +40,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Stable identity for a group label across tree reconciliation.
+/// Uses DefaultHasher which is deterministic within a single process run.
+pub fn stable_hash(s: &str) -> TileId {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "apptop",
+    name = "aerie",
     version,
     about = "Thread / VM activity bar-chart monitor.\n\
              Local mode (default): reads /proc and groups processes by name.\n\
@@ -78,11 +89,11 @@ struct Cli {
 
     /// Enable SSH remote drill-down into Proxmox VMs.
     /// Without this flag, pressing Enter on a VM does nothing.
-    #[arg(long, env = "APPTOP_ENABLE_REMOTE", default_value_t = false)]
+    #[arg(long, env = "AERIE_ENABLE_REMOTE", default_value_t = false)]
     enable_remote: bool,
 
     /// Accept unknown SSH host keys on first use (TOFU).
-    /// By default apptop requires the host key to already be in known_hosts.
+    /// By default aerie requires the host key to already be in known_hosts.
     /// Never passes StrictHostKeyChecking=no.
     #[arg(long, default_value_t = false)]
     ssh_accept_new: bool,
@@ -92,8 +103,8 @@ struct Cli {
     #[arg(long)]
     hosts: Option<String>,
 
-    /// Use a thin /proc shell probe instead of apptop --daemon on fleet hosts.
-    /// Provides CPU% and memory only; works without apptop installed remotely.
+    /// Use a thin /proc shell probe instead of aerie --daemon on fleet hosts.
+    /// Provides CPU% and memory only; works without aerie installed remotely.
     /// No per-process breakdown or drill-down available in thin mode.
     #[arg(long)]
     thin: bool,
@@ -130,8 +141,8 @@ struct Cli {
     #[arg(long)]
     kube_context: Option<String>,
 
-    /// Use a thin /proc shell probe instead of apptop --daemon in the pod.
-    /// Works without apptop installed in the container image; provides CPU%
+    /// Use a thin /proc shell probe instead of aerie --daemon in the pod.
+    /// Works without aerie installed in the container image; provides CPU%
     /// and memory only — no per-process breakdown or drill-down.
     /// Used with --kube.
     #[arg(long)]
@@ -159,8 +170,8 @@ struct Cli {
     #[arg(long)]
     nomad_job: Option<String>,
 
-    /// Use a thin /proc shell probe instead of apptop --daemon in the allocation.
-    /// Works without apptop installed in the task image; provides CPU% and memory only.
+    /// Use a thin /proc shell probe instead of aerie --daemon in the allocation.
+    /// Works without aerie installed in the task image; provides CPU% and memory only.
     /// Used with --nomad.
     #[arg(long)]
     nomad_thin: bool,
@@ -303,7 +314,7 @@ pub enum AppMode {
         hosts: Vec<String>,
         /// SSH login user.
         ssh_user: String,
-        /// When true, use thin /proc probe; when false, use apptop --daemon.
+        /// When true, use thin /proc probe; when false, use aerie --daemon.
         thin: bool,
     },
     /// Monitor Kubernetes pods via `kubectl exec`.
@@ -315,7 +326,7 @@ pub enum AppMode {
         selector: Option<String>,
         /// kubectl context name from kubeconfig. None = current context.
         context: Option<String>,
-        /// When true, use thin /proc shell probe; when false, use apptop --daemon.
+        /// When true, use thin /proc shell probe; when false, use aerie --daemon.
         thin: bool,
     },
     /// Monitor Nomad allocations via `nomad alloc exec`.
@@ -329,7 +340,7 @@ pub enum AppMode {
         token: Option<String>,
         /// Optional job name filter. None = all running allocations in the namespace.
         job_filter: Option<String>,
-        /// When true, use thin /proc shell probe; when false, use apptop --daemon.
+        /// When true, use thin /proc shell probe; when false, use aerie --daemon.
         thin: bool,
     },
 }
@@ -532,7 +543,7 @@ pub struct MemberSeries {
 /// `BarEntry` completeness flags use `#[serde(default = "default_true")]` so that
 /// JSON produced by older daemon versions (which lacked these fields) deserialises
 /// as "fully complete" rather than "all denied". This avoids spurious `?` markers
-/// when drilling into an older remote apptop.
+/// when drilling into an older remote aerie.
 pub fn default_true() -> bool { true }
 
 /// One row in the display: all metrics for a single process group or VM.
@@ -942,6 +953,9 @@ pub struct AppState {
     /// Index into gpu_devices for the selected device. 0 = aggregate all.
     /// 1..=N selects gpu_devices[selected_gpu-1].
     pub selected_gpu: usize,
+    /// Carousel node for the group body list; persists scroll position and
+    /// is reconciled with entries on every data tick.
+    pub body_tree: Option<Tree>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1323,7 +1337,7 @@ impl AppState {
             // log to stderr and start with an empty pod list so the UI can show the error.
             let pods = discover_pods(namespace, selector.as_deref(), context.as_deref())
                 .unwrap_or_else(|e| {
-                    eprintln!("apptop: kubectl discover: {e}");
+                    eprintln!("aerie: kubectl discover: {e}");
                     vec![]
                 });
             let ns = namespace.clone();
@@ -1365,7 +1379,7 @@ impl AppState {
         let nomad_conns: Vec<NomadConn> = if let AppMode::Nomad { ref addr, ref namespace, ref token, ref job_filter, thin } = mode {
             let allocs = discover_nomad_allocs(addr, namespace, token.as_deref(), job_filter.as_deref())
                 .unwrap_or_else(|e| {
-                    eprintln!("apptop: nomad discover: {e}");
+                    eprintln!("aerie: nomad discover: {e}");
                     vec![]
                 });
             let addr_c = addr.clone();
@@ -1470,7 +1484,44 @@ impl AppState {
             gpu_enabled: cli.enable_gpu,
             gpu_devices: Vec::new(),
             selected_gpu: 0,
+            body_tree: Some(Tree::new(Node::Carousel {
+                id: ui::BODY_ID,
+                orientation: Orientation::Vertical,
+                scroll: 0,
+                children: vec![],
+            })),
         })
+    }
+
+    /// Keep `scroll_offset` so that `cursor` is always within the visible window.
+    ///
+    /// Sync the body carousel's focus to the current `cursor` index.
+    ///
+    /// Called after any cursor change so the carousel knows which row is
+    /// selected. `scroll_focus_into_view` in `render_body` then scrolls it
+    /// into the viewport before the next frame is painted.
+    pub fn sync_body_focus(&mut self) {
+        if let Some(tree) = &mut self.body_tree {
+            if let Some(e) = self.entries.get(self.cursor) {
+                tree.focus_set(stable_hash(&e.label));
+            }
+        }
+    }
+
+    /// Reconcile the body carousel with the current entry list, then sync focus.
+    ///
+    /// Must be called whenever `self.entries` changes — both from `refresh()` and
+    /// from the remote-snapshot polling path (which updates entries outside refresh).
+    pub fn sync_body_tree(&mut self) {
+        let desired: Vec<(TileId, u16)> = self.entries.iter()
+            .map(|e| (stable_hash(&e.label), 1u16))
+            .collect();
+        if let Some(tree) = &mut self.body_tree {
+            reconcile_carousel(tree.root_mut(), &desired);
+            tree.ensure_focus_valid();
+            tree.ensure_zoom_valid();
+        }
+        self.sync_body_focus();
     }
 
     /// Keep `scroll_offset` so that `cursor` is always within the visible window.
@@ -2162,6 +2213,9 @@ impl AppState {
             self.cursor = self.cursor.min(self.entries.len() - 1);
         }
 
+        // Reconcile the body carousel with the current entry list.
+        self.sync_body_tree();
+
         // Thread sampling when the thread-detail view is open (local only).
         // We re-sample on every refresh so thread CPU% stays current.
         let thread_label: Option<String> = match &self.view {
@@ -2309,8 +2363,8 @@ impl AppState {
 
 /// Headless daemon mode: stream newline-delimited JSON snapshots to stdout.
 ///
-/// This is the server side of the remote drill-down feature. The remote apptop
-/// (in Proxmox mode) SSHes into a VM, runs `apptop --daemon`, and reads its
+/// This is the server side of the remote drill-down feature. The remote aerie
+/// (in Proxmox mode) SSHes into a VM, runs `aerie --daemon`, and reads its
 /// stdout. Each line is a complete `DaemonSnapshot` JSON object.
 ///
 /// The daemon uses `CollectOpts::default()` (all metrics enabled) because the
@@ -2446,6 +2500,7 @@ fn main() -> Result<()> {
                     if let Some(c) = state.remote_client.take() {
                         c.close();
                     }
+                    if let Some(tree) = &mut state.body_tree { tree.zoom_reset(); }
                     state.view = AppView::Groups;
                     state.last_refresh = None;
                 } else if let Some(snap) = client.try_recv() {
@@ -2460,6 +2515,10 @@ fn main() -> Result<()> {
                     state.sys_psi_mem = snap.sys_psi_mem;
                     state.sys_psi_io  = snap.sys_psi_io;
                     state.snap_count = snap.snap_count;
+                    // Reconcile the carousel with the remote entries so render_body
+                    // can display them (reconcile normally runs in refresh(), which
+                    // is skipped while in_remote).
+                    state.sync_body_tree();
                 }
             }
         }
@@ -2485,7 +2544,7 @@ fn main() -> Result<()> {
             // The body area is the full terminal height minus 3 rows (header) minus 2 rows (footer).
             last_body_height = buf.area.height.saturating_sub(5) as usize;
             state.last_body_height = last_body_height;
-            ui::render(buf, &state);
+            ui::render(buf, &mut state);
         })?;
 
         // Compute the shortest possible poll timeout so we wake exactly when the next
@@ -2527,6 +2586,7 @@ fn main() -> Result<()> {
                             AppView::Threads { .. } => {
                                 // Clear thread state so the next Enter into a different group
                                 // doesn't momentarily show stale data.
+                                if let Some(tree) = &mut state.body_tree { tree.zoom_out(); }
                                 state.view = AppView::Groups;
                                 state.thread_snap = None;
                                 state.thread_samples = vec![];
@@ -2536,6 +2596,7 @@ fn main() -> Result<()> {
                                 if let Some(c) = state.remote_client.take() {
                                     c.close();
                                 }
+                                if let Some(tree) = &mut state.body_tree { tree.zoom_reset(); }
                                 state.view = AppView::Groups;
                                 // Force an immediate Proxmox refresh so the group list
                                 // is up-to-date after disconnecting.
@@ -2592,6 +2653,7 @@ fn main() -> Result<()> {
                             && state.cursor > 0
                         {
                             state.cursor -= 1;
+                            state.sync_body_focus();
                         } else if matches!(state.view, AppView::Manual) {
                             state.manual_scroll = state.manual_scroll.saturating_sub(1);
                         }
@@ -2601,6 +2663,7 @@ fn main() -> Result<()> {
                             && state.cursor + 1 < state.entries.len()
                         {
                             state.cursor += 1;
+                            state.sync_body_focus();
                         } else if matches!(state.view, AppView::Manual) {
                             let max_scroll = ui::manual_line_count()
                                 .saturating_sub(state.last_body_height);
@@ -2716,8 +2779,11 @@ fn main() -> Result<()> {
                                         } else {
                                             unreachable!()
                                         };
+                                        if let Some(tree) = &mut state.body_tree {
+                                            tree.zoom_to(stable_hash(&label));
+                                        }
                                         state.view = AppView::Connecting { label: label.clone() };
-                                        terminal.draw(|buf| ui::render(buf, &state))?;
+                                        terminal.draw(|buf| ui::render(buf, &mut state))?;
                                         match remote::connect_nomad_daemon(&alloc_id, &task, &addr, token.as_deref()) {
                                             Ok(client) => {
                                                 state.remote_client = Some(client);
@@ -2725,8 +2791,10 @@ fn main() -> Result<()> {
                                                 state.entries = vec![];
                                                 state.snap_count = 0;
                                                 state.error = None;
+                                                state.sync_body_tree();
                                             }
                                             Err(e) => {
+                                                if let Some(tree) = &mut state.body_tree { tree.zoom_reset(); }
                                                 state.view = AppView::Groups;
                                                 state.error = Some(format!("drill-down failed: {e}"));
                                             }
@@ -2750,8 +2818,11 @@ fn main() -> Result<()> {
                                         } else {
                                             unreachable!()
                                         };
+                                        if let Some(tree) = &mut state.body_tree {
+                                            tree.zoom_to(stable_hash(&pod));
+                                        }
                                         state.view = AppView::Connecting { label: pod.clone() };
-                                        terminal.draw(|buf| ui::render(buf, &state))?;
+                                        terminal.draw(|buf| ui::render(buf, &mut state))?;
                                         match remote::connect_kube_daemon(&pod, &ns, ctx.as_deref()) {
                                             Ok(client) => {
                                                 state.remote_client = Some(client);
@@ -2759,8 +2830,10 @@ fn main() -> Result<()> {
                                                 state.entries = vec![];
                                                 state.snap_count = 0;
                                                 state.error = None;
+                                                state.sync_body_tree();
                                             }
                                             Err(e) => {
+                                                if let Some(tree) = &mut state.body_tree { tree.zoom_reset(); }
                                                 state.view = AppView::Groups;
                                                 state.error = Some(format!("drill-down failed: {e}"));
                                             }
@@ -2786,8 +2859,11 @@ fn main() -> Result<()> {
                                         } else {
                                             remote::SshHostKeyPolicy::Strict
                                         };
+                                        if let Some(tree) = &mut state.body_tree {
+                                            tree.zoom_to(stable_hash(&host));
+                                        }
                                         state.view = AppView::Connecting { label: host.clone() };
-                                        terminal.draw(|buf| ui::render(buf, &state))?;
+                                        terminal.draw(|buf| ui::render(buf, &mut state))?;
                                         match remote::connect_direct(&host, &ssh_user, policy) {
                                             Ok(client) => {
                                                 state.remote_client = Some(client);
@@ -2795,8 +2871,10 @@ fn main() -> Result<()> {
                                                 state.entries = vec![];
                                                 state.snap_count = 0;
                                                 state.error = None;
+                                                state.sync_body_tree();
                                             }
                                             Err(e) => {
+                                                if let Some(tree) = &mut state.body_tree { tree.zoom_reset(); }
                                                 state.view = AppView::Groups;
                                                 state.error = Some(format!("drill-down failed: {e}"));
                                             }
@@ -2807,6 +2885,9 @@ fn main() -> Result<()> {
                                 let label = e.label.clone();
                                 if matches!(state.mode, AppMode::Local) {
                                     // Local: open per-thread heat-map view.
+                                    if let Some(tree) = &mut state.body_tree {
+                                        tree.zoom_to(stable_hash(&label));
+                                    }
                                     state.view = AppView::Threads { label };
                                     state.thread_snap = None;
                                     state.thread_samples = vec![];
@@ -2817,7 +2898,7 @@ fn main() -> Result<()> {
                                         "remote drill-down disabled — re-run with --enable-remote".into()
                                     );
                                 } else {
-                                    // Proxmox mode: connect over SSH to remote apptop --daemon.
+                                    // Proxmox mode: connect over SSH to remote aerie --daemon.
                                     // We show a "Connecting…" screen immediately (blocking draw)
                                     // because connect_vm can take up to ~8 s.
                                     let meta = state.vm_meta.get(&label).map(|m| proxmox::VmMeta {
@@ -2831,9 +2912,12 @@ fn main() -> Result<()> {
                                     } else {
                                         remote::SshHostKeyPolicy::Strict
                                     };
+                                    if let Some(tree) = &mut state.body_tree {
+                                        tree.zoom_to(stable_hash(&label));
+                                    }
                                     state.view = AppView::Connecting { label: label.clone() };
                                     // Force-render the connecting screen before blocking on SSH.
-                                    terminal.draw(|buf| ui::render(buf, &state))?;
+                                    terminal.draw(|buf| ui::render(buf, &mut state))?;
                                     // Create a temporary client for get_vm_ips (SSH host discovery).
                                     let temp_pve = if let (Some(url), Some(token)) =
                                         (&state.proxmox_url, &state.proxmox_token)
@@ -2850,9 +2934,11 @@ fn main() -> Result<()> {
                                             state.entries = vec![];
                                             state.snap_count = 0;
                                             state.error = None;
+                                            state.sync_body_tree();
                                         }
                                         Err(diag) => {
                                             // Connection failed; show diagnostics in error bar.
+                                            if let Some(tree) = &mut state.body_tree { tree.zoom_reset(); }
                                             state.view = AppView::Groups;
                                             state.error = Some(diag.join("\n"));
                                         }
