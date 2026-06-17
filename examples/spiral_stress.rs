@@ -17,11 +17,21 @@
 // Why it doubles as a stress test: every frame the entire screen is repainted
 // cell-by-cell (full clear + N nested frame perimeters + animated ports) at the
 // target frame rate, so the cell-write counter in the HUD is a rough proxy for
-// per-frame draw throughput. Crank the depth with +/- to push it harder.
+// per-frame draw throughput. Crank the depth with +/- to push it harder, or
+// switch to SWARM mode (`s` / `--swarm`) to tile the screen with many
+// independent spirals laid out by mullion's `layout::solve`.
 //
-// Run:   cargo run --release --example spiral_stress
+// Swarm mode also demonstrates ZOOM: it periodically zooms one tile up to fill
+// the screen and back. mullion's built-in `Tree::zoom_to` is a *discrete* state
+// change (a sudden jump); here the zoom is driven through the layout solver by
+// easing the focused tile's `Fill` weight every frame, so the solver itself
+// grows the tile smoothly — an animated zoom, not a jump.
+//
+// Run:   cargo run --release --example spiral_stress [--swarm]
 // Keys:  q / Esc / Ctrl-C  quit
 //        space             pause / resume the animation
+//        s                 toggle single / swarm mode
+//        z                 toggle the animated zoom (swarm mode)
 //        + / -             more / fewer nested boxes (depth)
 //        [ / ]             tighten / loosen the curl
 //        r                 reverse the curl direction
@@ -34,6 +44,7 @@ use crossterm::event::Event;
 use mullion::backend::CrosstermBackend;
 use mullion::capabilities::Capabilities;
 use mullion::input::{KeyCode, KeyModifiers};
+use mullion::layout::{self, Constraint, Node, Orientation, Size, TileId};
 use mullion::style::{Color, Modifier, Style};
 use mullion::{poll_event, Buffer, Rect, Terminal};
 use std::io;
@@ -50,6 +61,9 @@ fn main() -> Result<()> {
     terminal.enter()?;
 
     let mut state = Demo::new();
+    if std::env::args().any(|a| a == "--swarm") {
+        state.mode = Mode::Swarm;
+    }
     let mut last = Instant::now();
 
     // Run the loop in a closure so a `?` early-exit still falls through to the
@@ -69,6 +83,13 @@ fn main() -> Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char(' ') => state.paused = !state.paused,
+                    KeyCode::Char('s') => {
+                        state.mode = match state.mode {
+                            Mode::Single => Mode::Swarm,
+                            Mode::Swarm => Mode::Single,
+                        }
+                    }
+                    KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
                     KeyCode::Char('+') | KeyCode::Char('=') => state.depth = (state.depth + 1).min(40),
                     KeyCode::Char('-') | KeyCode::Char('_') => {
                         state.depth = state.depth.saturating_sub(1).max(2)
@@ -87,11 +108,21 @@ fn main() -> Result<()> {
     result
 }
 
+/// Single big spiral, or a grid of many small ones.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Single,
+    Swarm,
+}
+
 /// Animation + interaction state for the demo.
 struct Demo {
     /// Seconds of animation elapsed (frozen while paused).
     t: f32,
     paused: bool,
+    mode: Mode,
+    /// Whether the swarm's animated zoom is running.
+    zoom_on: bool,
     /// Number of nested boxes requested (actual count is also bounded by how
     /// many frames fit before they collapse below the minimum drawable size).
     depth: usize,
@@ -111,6 +142,8 @@ impl Demo {
         Demo {
             t: 0.0,
             paused: false,
+            mode: Mode::Single,
+            zoom_on: true,
             depth: 14,
             curl: 1.0,
             dir: 1.0,
@@ -147,23 +180,46 @@ impl Demo {
             p.put_str(area.x as i32, y as i32, &blank, bg);
         }
 
-        // --- spiral geometry -------------------------------------------------
-        // Each level shrinks the rectangle by a fixed fraction `f` and re-anchors
-        // it somewhere on an inscribed circle whose angle advances by `dtheta`
-        // per level. A large |dtheta| (~quarter turn) hugs a rotating corner and
-        // traces a golden-rectangle spiral; `dtheta == 0` telescopes straight in
-        // (concentric); negative `dtheta` curls the opposite way.
-        let t = self.t;
+        let spirals = match self.mode {
+            Mode::Single => {
+                self.draw_spiral(&mut p, area, self.t, true);
+                1
+            }
+            Mode::Swarm => self.render_swarm(&mut p, area),
+        };
+
+        // Single mode shows its stats in the outer box's bottom port; swarm
+        // mode has no room for that, so it gets a global overlay status line.
+        if self.mode == Mode::Swarm {
+            self.draw_status_line(&mut p, area, spirals);
+        }
+
+        self.last_cells = p.cells;
+    }
+
+    /// Draw one full spiral (a stack of nested boxes) inside `rect`. `t` is the
+    /// animation phase for this spiral (offset per tile in swarm mode so each
+    /// looks distinct); `allow_text` enables the level-0 brand + HUD ports.
+    ///
+    /// Each level shrinks the rectangle by a fixed fraction `f` and re-anchors
+    /// it somewhere on an inscribed circle whose angle advances by `dtheta` per
+    /// level. A large |dtheta| (~quarter turn) hugs a rotating corner and traces
+    /// a golden-rectangle spiral; `dtheta == 0` telescopes straight in
+    /// (concentric); negative `dtheta` curls the opposite way.
+    fn draw_spiral(&self, p: &mut Painter, rect: Rect, t: f32, allow_text: bool) {
+        if rect.width < 3 || rect.height < 3 {
+            return;
+        }
         // Automatic curl envelope: starts at full curl (cos 0 = 1 → spiral),
         // relaxes to 0 (uncurled) and swings negative (curls the other way).
         let dtheta = 1.5 * (t * 0.12).cos() * self.curl * self.dir;
         let theta0 = t * 0.3; // global slow spin of the whole figure
         let f = 0.18 + 0.04 * (t * 0.25).sin(); // gentle "breathing" of the inset
 
-        let mut rx = area.x as f32;
-        let mut ry = area.y as f32;
-        let mut rw = area.width as f32;
-        let mut rh = area.height as f32;
+        let mut rx = rect.x as f32;
+        let mut ry = rect.y as f32;
+        let mut rw = rect.width as f32;
+        let mut rh = rect.height as f32;
         let mut theta = theta0;
 
         for i in 0..self.depth {
@@ -182,7 +238,7 @@ impl Demo {
             let val = 0.65 + 0.35 * ((t * 0.7 + i as f32 * 0.5).sin() * 0.5 + 0.5);
             let style = Style::default().fg(hsv(hue, 0.85, val));
 
-            self.draw_box(&mut p, ix, iy, iw, ih, style, i, area);
+            self.draw_box(p, ix, iy, iw, ih, style, i, rect, t, allow_text);
 
             // Re-anchor + shrink for the next level inward.
             let ax = 0.5 + 0.5 * theta.cos();
@@ -195,14 +251,109 @@ impl Demo {
             rh -= dh;
             theta += dtheta;
         }
+    }
 
-        self.last_cells = p.cells;
+    /// Tile the screen into a grid of independent mini-spirals using mullion's
+    /// `layout::solve`, then animate a zoom that grows one tile to fill the
+    /// screen and back. Returns the number of spirals drawn.
+    ///
+    /// The zoom is produced *through the solver*: the focused row and column are
+    /// given a `Fill` weight that eases up from 1 toward a large value, so the
+    /// solver itself expands that tile smoothly. (mullion's `Tree::zoom_to`
+    /// would do this in one discrete step — a jump — which is what we're
+    /// deliberately avoiding here.)
+    fn render_swarm(&self, p: &mut Painter, area: Rect) -> usize {
+        let (cols, rows) = grid_dims(area);
+        let n = rows * cols;
+
+        let (focus, eased) = self.zoom_state(n);
+        let (frow, fcol) = (focus / cols, focus % cols);
+        // Eased focus weight: 1 (grid) → ~400 (one tile nearly fills its axis).
+        let big = 1 + (eased * 400.0) as u16;
+
+        // Build a row-split of column-splits and let mullion solve the rects.
+        let mut row_children: Vec<(Constraint, Node)> = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let mut col_children: Vec<(Constraint, Node)> = Vec::with_capacity(cols);
+            for c in 0..cols {
+                let w = if r == frow && c == fcol { big } else { 1 };
+                let id = (r * cols + c) as TileId + 1;
+                col_children.push((Constraint::new(Size::Fill(w)), Node::Tile(id)));
+            }
+            let row_weight = if r == frow { big } else { 1 };
+            let row = Node::Split {
+                orientation: Orientation::Horizontal,
+                children: col_children,
+            };
+            row_children.push((Constraint::new(Size::Fill(row_weight)), row));
+        }
+        let mut root = Node::Split {
+            orientation: Orientation::Vertical,
+            children: row_children,
+        };
+        let tiles = layout::solve(&mut root, area);
+
+        for (id, rect) in &tiles {
+            let idx = (*id as usize).saturating_sub(1);
+            // Per-tile phase + curl offsets so neighbours never march in lockstep.
+            let t = self.t + idx as f32 * 1.7;
+            // The focused tile, once it has grown enough, earns text ports.
+            let allow_text = idx == focus && rect.width >= 28 && rect.height >= 10;
+            self.draw_spiral(p, *rect, t, allow_text);
+        }
+
+        n
+    }
+
+    /// Which tile is the zoom focus and how far the zoom has eased in (0..1).
+    /// Auto-cycles through every tile, holding each zoomed for a beat. Returns
+    /// `(0, 0.0)` — a no-op grid — when zoom is disabled.
+    fn zoom_state(&self, n: usize) -> (usize, f32) {
+        if !self.zoom_on || n == 0 {
+            return (0, 0.0);
+        }
+        const PERIOD: f32 = 8.0; // seconds spent per tile
+        let cycle = (self.t / PERIOD).floor();
+        let idx = (cycle as usize) % n;
+        let local = self.t - cycle * PERIOD; // 0..PERIOD
+        let raw = if local < 1.2 {
+            local / 1.2 // ease in
+        } else if local < 5.0 {
+            1.0 // hold zoomed
+        } else if local < 6.2 {
+            1.0 - (local - 5.0) / 1.2 // ease out
+        } else {
+            0.0 // hold grid
+        };
+        (idx, smoothstep(raw))
+    }
+
+    /// A one-row overlay status line for swarm mode.
+    fn draw_status_line(&self, p: &mut Painter, area: Rect, spirals: usize) {
+        let y = (area.y + area.height - 1) as i32;
+        let zoom = if self.zoom_on { "on" } else { "off" };
+        let text = format!(
+            " swarm · {} spirals · zoom {} · {:>3.0} fps · {} cells · {}x{}  │  s single  z zoom  ± depth  [ ] curl  r reverse  q quit ",
+            spirals, zoom, self.fps, self.last_cells, area.width, area.height
+        );
+        let text: String = text.chars().take(area.width as usize).collect();
+        let st = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(120, 200, 255))
+            .add_modifier(Modifier::BOLD);
+        // Pad to full width so the bar reads as a solid status strip.
+        let mut padded = text.clone();
+        for _ in padded.chars().count()..area.width as usize {
+            padded.push(' ');
+        }
+        p.put_str(area.x as i32, y, &padded, st);
     }
 
     /// Draw one nested frame. Level 0 (outermost) carries live text openings:
     /// brand ports that split/merge on the top edge and a stress HUD on the
     /// bottom edge. Every level also gets small decorative ports that drift and
     /// split on all four sides.
+    #[allow(clippy::too_many_arguments)]
     fn draw_box(
         &self,
         p: &mut Painter,
@@ -213,6 +364,8 @@ impl Demo {
         st: Style,
         level: usize,
         area: Rect,
+        t: f32,
+        allow_text: bool,
     ) {
         let (x0, y0, x1, y1) = (x, y, x + w - 1, y + h - 1);
 
@@ -223,13 +376,15 @@ impl Demo {
         p.put(x1, y1, '┘', st);
 
         // Decorative animated ports (gap intervals along each edge).
-        let top = side_gaps(level, self.t, w);
-        let bot = side_gaps(level + 7, self.t * 0.9, w);
-        let lft = side_gaps(level + 13, self.t * 1.1, h);
-        let rgt = side_gaps(level + 19, self.t * 0.8, h);
+        let top = side_gaps(level, t, w);
+        let bot = side_gaps(level + 7, t * 0.9, w);
+        let lft = side_gaps(level + 13, t * 1.1, h);
+        let rgt = side_gaps(level + 19, t * 0.8, h);
 
-        // Top & bottom edges (skip the auto ports on level 0 where text lives).
-        if level == 0 {
+        // On the level-0 text box the top/bottom edges are drawn clean so the
+        // brand and HUD ports own them; otherwise punch the decorative ports.
+        let text_box = level == 0 && allow_text;
+        if text_box {
             h_edge(p, y0, x0, x1, &[], st);
             h_edge(p, y1, x0, x1, &[], st);
         } else {
@@ -239,8 +394,8 @@ impl Demo {
         v_edge(p, x0, y0, y1, &offset(&lft, y0), st);
         v_edge(p, x1, y0, y1, &offset(&rgt, y0), st);
 
-        if level == 0 {
-            self.draw_brand_ports(p, x0, y0, x1, st);
+        if text_box {
+            self.draw_brand_ports(p, x0, y0, x1, st, t);
             self.draw_hud_port(p, x0, y1, x1, st, area);
         }
     }
@@ -248,10 +403,10 @@ impl Demo {
     /// Two text ports on the top edge that split apart and merge back together.
     /// When they would overlap they fuse into a single combined port — the
     /// clearest demonstration of openings splitting and merging.
-    fn draw_brand_ports(&self, p: &mut Painter, x0: i32, y: i32, x1: i32, st: Style) {
+    fn draw_brand_ports(&self, p: &mut Painter, x0: i32, y: i32, x1: i32, st: Style, t: f32) {
         let w = (x1 - x0) as f32;
         let mid = x0 as f32 + w * 0.5;
-        let s = 0.5 + 0.5 * (self.t * 0.5).sin(); // 0 = merged, 1 = fully split
+        let s = 0.5 + 0.5 * (t * 0.5).sin(); // 0 = merged, 1 = fully split
         let spread = 0.26 * w * s;
 
         let la = "aerie";
@@ -428,6 +583,21 @@ fn make_gap(center: f32, hw: f32, len: i32) -> Option<(i32, i32)> {
     } else {
         None
     }
+}
+
+/// Choose a swarm grid (cols, rows) from the terminal size, aiming for tiles
+/// roughly large enough to host a recognisable mini-spiral.
+fn grid_dims(area: Rect) -> (usize, usize) {
+    let cols = (area.width as usize / 18).clamp(2, 8);
+    let rows = (area.height as usize / 9).clamp(2, 6);
+    (cols, rows)
+}
+
+/// Smoothstep easing on `0..=1` (zero slope at both ends) — used to ease the
+/// zoom in and out so it never starts or stops abruptly.
+fn smoothstep(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
 }
 
 /// HSV → mullion RGB color. `h` in degrees (wrapped), `s`/`v` in `0..=1`.
