@@ -751,9 +751,10 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         let label_style = if is_selected {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else if e.fading {
-            let r = lerp_u8(0, 80, e.fade_t);
-            let g = lerp_u8(200, 80, e.fade_t);
-            let b = lerp_u8(200, 80, e.fade_t);
+            let ft = mullion::ease::smoothstep(e.fade_t as f32) as f64;
+            let r = lerp_u8(0, 80, ft);
+            let g = lerp_u8(200, 80, ft);
+            let b = lerp_u8(200, 80, ft);
             Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD)
         } else if is_anomaly {
             Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
