@@ -515,8 +515,8 @@ fn v_edge(p: &mut Painter, x: i32, y0: i32, y1: i32, gaps: &[(i32, i32)], st: St
             p.put(x, y, ' ', st);
         }
         if cb > ca {
-            p.put(x, ca, '┬', st);
-            p.put(x, cb, '┴', st);
+            p.put(x, ca, '┴', st);
+            p.put(x, cb, '┬', st);
         }
     }
 }
