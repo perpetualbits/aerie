@@ -43,6 +43,7 @@ use anyhow::Result;
 use crossterm::event::Event;
 use mullion::backend::CrosstermBackend;
 use mullion::capabilities::Capabilities;
+use mullion::ease::{gaussian, smoothstep};
 use mullion::input::{KeyCode, KeyModifiers};
 use mullion::layout::{self, Constraint, Node, Orientation, Size, TileId};
 use mullion::style::{Color, Modifier, Style};
@@ -236,7 +237,7 @@ impl Demo {
             // Electric-sheep palette: hue flows with time and depth.
             let hue = t * 30.0 + i as f32 * 17.0;
             let val = 0.65 + 0.35 * ((t * 0.7 + i as f32 * 0.5).sin() * 0.5 + 0.5);
-            let style = Style::default().fg(hsv(hue, 0.85, val));
+            let style = Style::default().fg(Color::from_hsv(hue, 0.85, val));
 
             self.draw_box(p, ix, iy, iw, ih, style, i, rect, t, allow_text);
 
@@ -611,48 +612,26 @@ fn grid_dims(area: Rect) -> (usize, usize) {
     (cols, rows)
 }
 
-/// Smoothstep easing on `0..=1` (zero slope at both ends) — used to ease the
-/// zoom in and out so it never starts or stops abruptly.
-fn smoothstep(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
-}
-
 /// Color for one cell on a box's closed perimeter loop.
 ///
-/// All four edges and all four corners of a box are treated as a single
-/// rectangle walked clockwise from the top-left. Each cell's position `s`
-/// on that loop (0 = top-left corner, 1 = one cell after going all the way
-/// around) determines how Gaussian bumps of hue and brightness are applied
-/// on top of the level's static base color.
-///
-/// Bumps travel around the loop (some CW, some CCW) and are independent
-/// of the gap bands, which use a completely separate color path.
+/// Delegates the perimeter geometry to `Rect::border_pos` (mullion) and the
+/// Gaussian bump shape to `ease::gaussian` (mullion).  Application logic —
+/// the level-based base color and the specific bump parameters — stays here.
 fn loop_color(x: i32, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32, t: f32, level: usize) -> Style {
-    let w = bx1 - bx0;  // cells from left corner to right corner
-    let h = by1 - by0;  // cells from top corner to bottom corner
-    let perim = 2 * (w + h);
+    // Map (x, y) to a normalised position on the closed clockwise perimeter.
+    let rect = Rect::new(
+        bx0 as u16, by0 as u16,
+        (bx1 - bx0 + 1) as u16, (by1 - by0 + 1) as u16,
+    );
+    let s_norm = rect.border_pos(x as u16, y as u16);
 
-    // Clockwise position s from the top-left corner.
-    let s = if y == by0 {
-        x - bx0                        // top edge →
-    } else if x == bx1 {
-        w + (y - by0)                  // right edge ↓
-    } else if y == by1 {
-        w + h + (bx1 - x)             // bottom edge ←
-    } else {
-        2 * w + h + (by1 - y)         // left edge ↑
-    };
-    let s_norm = s as f32 / perim as f32;
-
-    // Base color: level-only, no time component, so the identity of each
-    // level stays stable and bumps are the only things that move.
+    // Base color: level-only, no time component, so each level's identity is
+    // stable and the bumps are the only moving parts.
     let base_hue = (level as f32 * 137.508) % 360.0;
     let base_val = 0.50 + 0.20 * ((level as f32 * 1.3).sin() * 0.5 + 0.5);
 
-    // Three Gaussian bumps per loop.  Each tuple:
-    //   (phase_seed, angular_velocity, hue_delta, val_delta, sigma)
-    // Phase seed is offset by level so adjacent levels start differently.
+    // Three bumps: (phase_seed, angular_velocity, hue_delta, val_delta, sigma).
+    // Level-dependent seeds give each nesting level a distinct starting phase.
     let fi = level as f32;
     let bumps = [
         ((fi * 0.19) % 1.0,  0.07 + fi * 0.003,  40.0_f32,  0.30_f32, 0.06_f32),
@@ -664,16 +643,15 @@ fn loop_color(x: i32, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32, t: f32, le
     let mut val_add = 0.0_f32;
     for (phase0, omega, dhue, dval, sigma) in bumps {
         let center = (phase0 + omega * t).rem_euclid(1.0);
-        // Shortest-arc distance on the unit loop, wrapping correctly.
-        let diff = (s_norm - center + 0.5).rem_euclid(1.0) - 0.5;
-        let g = (-diff * diff / (2.0 * sigma * sigma)).exp();
+        let diff = (s_norm - center + 0.5).rem_euclid(1.0) - 0.5; // wrap-around distance
+        let g = gaussian(diff, sigma);
         hue_add += g * dhue;
         val_add += g * dval;
     }
 
     let hue = base_hue + hue_add;
     let val = (base_val + val_add).clamp(0.1, 1.0);
-    Style::default().fg(hsv(hue, 0.85, val))
+    Style::default().fg(Color::from_hsv(hue, 0.85, val))
 }
 
 /// Color for one ◻ cell inside a streaming band.
@@ -691,28 +669,7 @@ fn stream_color(pos: f32, t: f32, band: usize, dir: f32) -> Style {
     // Brightness and saturation shimmer independently for a sparkle feel.
     let val = 0.45 + 0.55 * (p * std::f32::consts::TAU * 1.5).sin().powi(2);
     let sat = 0.70 + 0.30 * (p * std::f32::consts::TAU * 2.3).cos().abs();
-    Style::default().fg(hsv(hue, sat, val))
-}
-
-/// HSV → mullion RGB color. `h` in degrees (wrapped), `s`/`v` in `0..=1`.
-fn hsv(h: f32, s: f32, v: f32) -> Color {
-    let h = ((h % 360.0) + 360.0) % 360.0;
-    let c = v * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = v - c;
-    let (r, g, b) = match (h / 60.0) as i32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    Color::Rgb(
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
-    )
+    Style::default().fg(Color::from_hsv(hue, sat, val))
 }
 
 // Keep `Modifier` referenced so a future bold/styling tweak is one edit away
