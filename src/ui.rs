@@ -931,8 +931,7 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
 /// so the user sees feedback immediately rather than a frozen screen.
 fn render_connecting(buf: &mut Buffer, area: Rect, label: &str) {
     let dim = Style::default().fg(Color::DarkGray);
-    // Row 1: blank (same as ratatui Line::default())
-    // Row 2: "  Connecting to LABEL — trying guest-agent, DNS, hostname…"
+    // Row 1: blank; Row 2: "  Connecting to LABEL — trying guest-agent, DNS, hostname…"
     if area.height >= 2 {
         let mut x = area.x;
         x = buf.set_string(x, area.y + 1, "  Connecting to ", dim);
