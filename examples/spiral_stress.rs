@@ -385,14 +385,14 @@ impl Demo {
         // brand and HUD ports own them; otherwise punch the decorative ports.
         let text_box = level == 0 && allow_text;
         if text_box {
-            h_edge(p, y0, x0, x1, &[], st);
-            h_edge(p, y1, x0, x1, &[], st);
+            h_edge(p, y0, x0, x1, &[], st, t, level);
+            h_edge(p, y1, x0, x1, &[], st, t, level + 7);
         } else {
-            h_edge(p, y0, x0, x1, &offset(&top, x0), st);
-            h_edge(p, y1, x0, x1, &offset(&bot, x0), st);
+            h_edge(p, y0, x0, x1, &offset(&top, x0), st, t, level);
+            h_edge(p, y1, x0, x1, &offset(&bot, x0), st, t, level + 7);
         }
-        v_edge(p, x0, y0, y1, &offset(&lft, y0), st);
-        v_edge(p, x1, y0, y1, &offset(&rgt, y0), st);
+        v_edge(p, x0, y0, y1, &offset(&lft, y0), st, t, level + 13);
+        v_edge(p, x1, y0, y1, &offset(&rgt, y0), st, t, level + 19);
 
         if text_box {
             self.draw_brand_ports(p, x0, y0, x1, st, t);
@@ -482,18 +482,22 @@ impl<'a> Painter<'a> {
 
 /// Draw a horizontal edge between corners at `x0..=x1` on row `y`, punching the
 /// given absolute-x gap intervals (capped with `┤`/`├` connectors).
-fn h_edge(p: &mut Painter, y: i32, x0: i32, x1: i32, gaps: &[(i32, i32)], st: Style) {
+/// Draw a horizontal edge, filling each gap with a streaming ◻ band.
+/// `seed` distinguishes bands so neighbouring gaps get different color families.
+fn h_edge(p: &mut Painter, y: i32, x0: i32, x1: i32, gaps: &[(i32, i32)], st: Style, t: f32, seed: usize) {
     for x in x0 + 1..x1 {
         p.put(x, y, '─', st);
     }
-    for &(a, b) in gaps {
+    for (gi, &(a, b)) in gaps.iter().enumerate() {
         let ca = a.max(x0 + 1);
         let cb = b.min(x1 - 1);
-        if cb < ca {
-            continue;
-        }
+        if cb < ca { continue; }
+        let band = seed.wrapping_add(gi * 3);
+        let dir = if band % 2 == 0 { 1.0_f32 } else { -1.0 };
+        let span = (cb - ca + 1).max(1) as f32;
         for x in ca..=cb {
-            p.put(x, y, ' ', st);
+            let pos = (x - ca) as f32 / span;
+            p.put(x, y, '◻', stream_color(pos, t, band, dir));
         }
         if cb > ca {
             p.put(ca, y, '┤', st);
@@ -502,17 +506,21 @@ fn h_edge(p: &mut Painter, y: i32, x0: i32, x1: i32, gaps: &[(i32, i32)], st: St
     }
 }
 
-/// Draw a vertical edge between corners at `y0..=y1` on column `x`, punching the
-/// given absolute-y gap intervals, bookended with `┬` / `┴` T-connectors.
-fn v_edge(p: &mut Painter, x: i32, y0: i32, y1: i32, gaps: &[(i32, i32)], st: Style) {
+/// Draw a vertical edge, filling each gap with a streaming ◻ band.
+fn v_edge(p: &mut Painter, x: i32, y0: i32, y1: i32, gaps: &[(i32, i32)], st: Style, t: f32, seed: usize) {
     for y in y0 + 1..y1 {
         p.put(x, y, '│', st);
     }
-    for &(a, b) in gaps {
+    for (gi, &(a, b)) in gaps.iter().enumerate() {
         let ca = a.max(y0 + 1);
         let cb = b.min(y1 - 1);
+        if cb < ca { continue; }
+        let band = seed.wrapping_add(gi * 3 + 1);
+        let dir = if band % 2 == 0 { 1.0_f32 } else { -1.0 };
+        let span = (cb - ca + 1).max(1) as f32;
         for y in ca..=cb {
-            p.put(x, y, ' ', st);
+            let pos = (y - ca) as f32 / span;
+            p.put(x, y, '◻', stream_color(pos, t, band, dir));
         }
         if cb > ca {
             p.put(x, ca, '┴', st);
@@ -555,7 +563,8 @@ fn side_gaps(i: usize, t: f32, len: i32) -> Vec<(i32, i32)> {
     let phase = t * 0.8 + fi * 1.3;
     let split = phase.sin() * 0.5 + 0.5; // 0..1
     let base = 0.5 + 0.18 * (t * 0.5 + fi).cos(); // center as fraction of len
-    let hw = 1.0 + 1.4 * ((phase * 1.7).sin() * 0.5 + 0.5); // half-width in cells
+    // Scale gap width with the edge so bands stay visible at all box sizes.
+    let hw = len as f32 * (0.04 + 0.07 * ((phase * 1.7).sin() * 0.5 + 0.5));
     let sep = 0.22 * split;
 
     let mut out = Vec::new();
@@ -602,6 +611,24 @@ fn grid_dims(area: Rect) -> (usize, usize) {
 fn smoothstep(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
+}
+
+/// Color for one ◻ cell inside a streaming band.
+///
+/// `pos` is 0..1 along the gap, `band` seeds the hue family (golden-angle
+/// spacing gives each band a distinct color), `dir` is ±1 for stream direction.
+/// As `t` increases the gradient appears to scroll along the edge.
+fn stream_color(pos: f32, t: f32, band: usize, dir: f32) -> Style {
+    // Golden-angle hue spacing: each band gets a maximally distinct base hue.
+    let base_hue = (band as f32 * 137.508) % 360.0;
+    // Shift position by time so the gradient scrolls (= streaming motion).
+    let p = pos + t * dir * 0.55;
+    // 90° hue sweep within the band; wrapping handled inside hsv().
+    let hue = base_hue + p * 90.0;
+    // Brightness and saturation shimmer independently for a sparkle feel.
+    let val = 0.45 + 0.55 * (p * std::f32::consts::TAU * 1.5).sin().powi(2);
+    let sat = 0.70 + 0.30 * (p * std::f32::consts::TAU * 2.3).cos().abs();
+    Style::default().fg(hsv(hue, sat, val))
 }
 
 /// HSV → mullion RGB color. `h` in degrees (wrapped), `s`/`v` in `0..=1`.
