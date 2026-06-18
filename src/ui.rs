@@ -174,9 +174,10 @@ fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
 
         // "← balanced"  — 10 green chars starting at x0+4 (after ──┤)
         gaps.push(BorderGap::new(Rect::new(x0 + 4, y0, 10, 1)));
-        // swatch         — swatch_w planck-colour chars starting at x0+18+left_pad
-        //                  (after ├── + left_pad×─ + ┤)
-        gaps.push(BorderGap::new(Rect::new(x0 + 18 + left_pad as u16, y0, swatch_w as u16, 1)));
+        // swatch + " = work density" — both sit between the same ┤ ├ bookends
+        //   swatch:            swatch_w planck chars  at x0+18+left_pad
+        //   " = work density": 15 dim   chars  at x0+18+left_pad+swatch_w
+        gaps.push(BorderGap::new(Rect::new(x0 + 18 + left_pad as u16, y0, swatch_w as u16 + 15, 1)));
         // "hot spots →"  — 11 orange chars; offset from right corner is fixed
         //                  regardless of terminal width (left_pad+swatch_w+right_pad = inner_w-50)
         gaps.push(BorderGap::new(Rect::new(x1 - 14, y0, 11, 1)));
