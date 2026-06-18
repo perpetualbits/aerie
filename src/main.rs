@@ -2569,7 +2569,19 @@ fn main() -> Result<()> {
             next_refresh.min(next_hist).saturating_duration_since(now)
         }.min(RENDER_TICK);
 
-        if let Some(event) = poll_event(wait)? {
+        // Drain any events that queued while data collection was running, then
+        // do one blocking wait only if the queue was already empty.  This
+        // prevents "ignore → burst" behaviour when refresh() blocks mid-input.
+        let mut events: Vec<Event> = Vec::new();
+        while let Some(ev) = poll_event(Duration::ZERO)? {
+            events.push(ev);
+        }
+        if events.is_empty() {
+            if let Some(ev) = poll_event(wait)? {
+                events.push(ev);
+            }
+        }
+        for event in events {
             if let Event::Key(key) = event {
                 // In Remote view, treat the data source as local for metric cycling
                 // because the daemon sends local /proc data.
