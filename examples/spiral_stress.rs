@@ -369,16 +369,12 @@ impl Demo {
     ) {
         let (x0, y0, x1, y1) = (x, y, x + w - 1, y + h - 1);
 
-        // Reconstruct the level's base hue and brightness so edges and corners
-        // can modulate them independently of the gap bands.
-        let base_hue = t * 30.0 + level as f32 * 17.0;
-        let base_val = 0.65 + 0.35 * ((t * 0.7 + level as f32 * 0.5).sin() * 0.5 + 0.5);
-
-        // Corners — colored at the positions where their two edges meet.
-        p.put(x0, y0, '╭', edge_color(0.0, t, base_hue, base_val, level));
-        p.put(x1, y0, '╮', edge_color(1.0, t, base_hue, base_val, level));
-        p.put(x0, y1, '╰', edge_color(0.0, t, base_hue, base_val, level + 7));
-        p.put(x1, y1, '╯', edge_color(1.0, t, base_hue, base_val, level + 7));
+        // Corners — loop_color takes the absolute (x,y) and box bounds and
+        // figures out the position on the closed perimeter loop itself.
+        p.put(x0, y0, '╭', loop_color(x0, y0, x0, y0, x1, y1, t, level));
+        p.put(x1, y0, '╮', loop_color(x1, y0, x0, y0, x1, y1, t, level));
+        p.put(x0, y1, '╰', loop_color(x0, y1, x0, y0, x1, y1, t, level));
+        p.put(x1, y1, '╯', loop_color(x1, y1, x0, y0, x1, y1, t, level));
 
         // Decorative animated ports (gap intervals along each edge).
         let top = side_gaps(level, t, w);
@@ -390,14 +386,14 @@ impl Demo {
         // brand and HUD ports own them; otherwise punch the decorative ports.
         let text_box = level == 0 && allow_text;
         if text_box {
-            h_edge(p, y0, x0, x1, &[], t, level,      base_hue, base_val);
-            h_edge(p, y1, x0, x1, &[], t, level + 7,  base_hue, base_val);
+            h_edge(p, y0, x0, y0, x1, y1, &[],               t, level,      level);
+            h_edge(p, y1, x0, y0, x1, y1, &[],               t, level + 7,  level);
         } else {
-            h_edge(p, y0, x0, x1, &offset(&top, x0), t, level,     base_hue, base_val);
-            h_edge(p, y1, x0, x1, &offset(&bot, x0), t, level + 7, base_hue, base_val);
+            h_edge(p, y0, x0, y0, x1, y1, &offset(&top, x0), t, level,      level);
+            h_edge(p, y1, x0, y0, x1, y1, &offset(&bot, x0), t, level + 7,  level);
         }
-        v_edge(p, x0, y0, y1, &offset(&lft, y0), t, level + 13, base_hue, base_val);
-        v_edge(p, x1, y0, y1, &offset(&rgt, y0), t, level + 19, base_hue, base_val);
+        v_edge(p, x0, x0, y0, x1, y1, &offset(&lft, y0), t, level + 13, level);
+        v_edge(p, x1, x0, y0, x1, y1, &offset(&rgt, y0), t, level + 19, level);
 
         if text_box {
             self.draw_brand_ports(p, x0, y0, x1, st, t);
@@ -487,17 +483,17 @@ impl<'a> Painter<'a> {
 
 /// Draw a horizontal edge between corners at `x0..=x1` on row `y`, punching the
 /// given absolute-x gap intervals (capped with `┤`/`├` connectors).
-/// Draw a horizontal edge with a smoothly animated color gradient, filling each
-/// gap with a streaming ◻ band. Bookend connectors follow the edge color.
-fn h_edge(p: &mut Painter, y: i32, x0: i32, x1: i32, gaps: &[(i32, i32)], t: f32, seed: usize, base_hue: f32, base_val: f32) {
-    let total = (x1 - x0).max(1) as f32;
-    for x in x0 + 1..x1 {
-        let pos = (x - x0) as f32 / total;
-        p.put(x, y, '─', edge_color(pos, t, base_hue, base_val, seed));
+/// Draw a horizontal edge of the box at row `y`. The box spans `bx0..=bx1`,
+/// `by0..=by1`. Each cell is colored by `loop_color` using its position on the
+/// closed perimeter loop. Gaps are filled with streaming ◻ bands (independent).
+fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
+          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize) {
+    for x in bx0 + 1..bx1 {
+        p.put(x, y, '─', loop_color(x, y, bx0, by0, bx1, by1, t, level));
     }
     for (gi, &(a, b)) in gaps.iter().enumerate() {
-        let ca = a.max(x0 + 1);
-        let cb = b.min(x1 - 1);
+        let ca = a.max(bx0 + 1);
+        let cb = b.min(bx1 - 1);
         if cb < ca { continue; }
         let band = seed.wrapping_add(gi * 3);
         let dir = if band % 2 == 0 { 1.0_f32 } else { -1.0 };
@@ -507,25 +503,22 @@ fn h_edge(p: &mut Painter, y: i32, x0: i32, x1: i32, gaps: &[(i32, i32)], t: f32
             p.put(x, y, '◻', stream_color(pos, t, band, dir));
         }
         if cb > ca {
-            let pa = (ca - x0) as f32 / total;
-            let pb = (cb - x0) as f32 / total;
-            p.put(ca, y, '┤', edge_color(pa, t, base_hue, base_val, seed));
-            p.put(cb, y, '├', edge_color(pb, t, base_hue, base_val, seed));
+            p.put(ca, y, '┤', loop_color(ca, y, bx0, by0, bx1, by1, t, level));
+            p.put(cb, y, '├', loop_color(cb, y, bx0, by0, bx1, by1, t, level));
         }
     }
 }
 
-/// Draw a vertical edge with a smoothly animated color gradient, filling each
-/// gap with a streaming ◻ band. Bookend connectors follow the edge color.
-fn v_edge(p: &mut Painter, x: i32, y0: i32, y1: i32, gaps: &[(i32, i32)], t: f32, seed: usize, base_hue: f32, base_val: f32) {
-    let total = (y1 - y0).max(1) as f32;
-    for y in y0 + 1..y1 {
-        let pos = (y - y0) as f32 / total;
-        p.put(x, y, '│', edge_color(pos, t, base_hue, base_val, seed));
+/// Draw a vertical edge of the box at column `x`. The box spans `bx0..=bx1`,
+/// `by0..=by1`. Each cell is colored by `loop_color`. Gaps are independent.
+fn v_edge(p: &mut Painter, x: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
+          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize) {
+    for y in by0 + 1..by1 {
+        p.put(x, y, '│', loop_color(x, y, bx0, by0, bx1, by1, t, level));
     }
     for (gi, &(a, b)) in gaps.iter().enumerate() {
-        let ca = a.max(y0 + 1);
-        let cb = b.min(y1 - 1);
+        let ca = a.max(by0 + 1);
+        let cb = b.min(by1 - 1);
         if cb < ca { continue; }
         let band = seed.wrapping_add(gi * 3 + 1);
         let dir = if band % 2 == 0 { 1.0_f32 } else { -1.0 };
@@ -535,10 +528,8 @@ fn v_edge(p: &mut Painter, x: i32, y0: i32, y1: i32, gaps: &[(i32, i32)], t: f32
             p.put(x, y, '◻', stream_color(pos, t, band, dir));
         }
         if cb > ca {
-            let pa = (ca - y0) as f32 / total;
-            let pb = (cb - y0) as f32 / total;
-            p.put(x, ca, '┴', edge_color(pa, t, base_hue, base_val, seed));
-            p.put(x, cb, '┬', edge_color(pb, t, base_hue, base_val, seed));
+            p.put(x, ca, '┴', loop_color(x, ca, bx0, by0, bx1, by1, t, level));
+            p.put(x, cb, '┬', loop_color(x, cb, bx0, by0, bx1, by1, t, level));
         }
     }
 }
@@ -627,20 +618,62 @@ fn smoothstep(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// Color for one cell of the edge line itself (─ │ and connector glyphs).
+/// Color for one cell on a box's closed perimeter loop.
 ///
-/// Modulates the spiral level's own `base_hue` and `base_val` so the edge
-/// stays visually coherent with its level while still breathing independently.
-/// Drift speed is deliberately slow (~0.12) so it reads as a gentle tide
-/// rather than competing with the faster-streaming gap bands.
-fn edge_color(pos: f32, t: f32, base_hue: f32, base_val: f32, seed: usize) -> Style {
-    let phase = t * 0.12 + seed as f32 * 1.1;
-    // Narrow hue sweep so it stays recognisably "the same level's color".
-    let hue = base_hue + (pos + phase * 0.25) * 45.0;
-    // Brightness pulses between ~70 % and ~100 % of the level's base value.
-    let val = base_val * (0.70 + 0.30 * (pos * std::f32::consts::TAU * 1.3 + phase).sin().abs());
-    let sat = 0.78 + 0.17 * (pos * std::f32::consts::TAU * 0.9 + phase * 1.4).cos();
-    Style::default().fg(hsv(hue, sat, val))
+/// All four edges and all four corners of a box are treated as a single
+/// rectangle walked clockwise from the top-left. Each cell's position `s`
+/// on that loop (0 = top-left corner, 1 = one cell after going all the way
+/// around) determines how Gaussian bumps of hue and brightness are applied
+/// on top of the level's static base color.
+///
+/// Bumps travel around the loop (some CW, some CCW) and are independent
+/// of the gap bands, which use a completely separate color path.
+fn loop_color(x: i32, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32, t: f32, level: usize) -> Style {
+    let w = bx1 - bx0;  // cells from left corner to right corner
+    let h = by1 - by0;  // cells from top corner to bottom corner
+    let perim = 2 * (w + h);
+
+    // Clockwise position s from the top-left corner.
+    let s = if y == by0 {
+        x - bx0                        // top edge →
+    } else if x == bx1 {
+        w + (y - by0)                  // right edge ↓
+    } else if y == by1 {
+        w + h + (bx1 - x)             // bottom edge ←
+    } else {
+        2 * w + h + (by1 - y)         // left edge ↑
+    };
+    let s_norm = s as f32 / perim as f32;
+
+    // Base color: level-only, no time component, so the identity of each
+    // level stays stable and bumps are the only things that move.
+    let base_hue = (level as f32 * 137.508) % 360.0;
+    let base_val = 0.50 + 0.20 * ((level as f32 * 1.3).sin() * 0.5 + 0.5);
+
+    // Three Gaussian bumps per loop.  Each tuple:
+    //   (phase_seed, angular_velocity, hue_delta, val_delta, sigma)
+    // Phase seed is offset by level so adjacent levels start differently.
+    let fi = level as f32;
+    let bumps = [
+        ((fi * 0.19) % 1.0,  0.07 + fi * 0.003,  40.0_f32,  0.30_f32, 0.06_f32),
+        ((fi * 0.41) % 1.0, -0.05 - fi * 0.002, -30.0,      0.18,     0.09),
+        ((fi * 0.67) % 1.0,  0.11 + fi * 0.004,  18.0,       0.12,     0.05),
+    ];
+
+    let mut hue_add = 0.0_f32;
+    let mut val_add = 0.0_f32;
+    for (phase0, omega, dhue, dval, sigma) in bumps {
+        let center = (phase0 + omega * t).rem_euclid(1.0);
+        // Shortest-arc distance on the unit loop, wrapping correctly.
+        let diff = (s_norm - center + 0.5).rem_euclid(1.0) - 0.5;
+        let g = (-diff * diff / (2.0 * sigma * sigma)).exp();
+        hue_add += g * dhue;
+        val_add += g * dval;
+    }
+
+    let hue = base_hue + hue_add;
+    let val = (base_val + val_add).clamp(0.1, 1.0);
+    Style::default().fg(hsv(hue, 0.85, val))
 }
 
 /// Color for one ◻ cell inside a streaming band.
