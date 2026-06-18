@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
-use mullion::{Buffer, Rect, render_carousel, tree::id_from_key};
+use mullion::{Buffer, Rect, gaussian, render_carousel, tree::id_from_key};
 use mullion::layout::TileId;
 use mullion::label::Align;
 use mullion::style::{Color, Modifier, Style};
@@ -111,6 +111,7 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     }
     draw_top_border(buf, y0, x0, x1, state, dim);
     draw_bottom_border(buf, y1, x0, x1, state, dim);
+    apply_border_glow(buf, area);
 }
 
 /// Top border row: `╭─…─╮` with the histogram legend carved in as a gap when active.
@@ -189,6 +190,65 @@ fn draw_bottom_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppSta
         let mut x = buf.set_string(gap_start, y, "┤ ", dim);
         x = buf.set_string(x, y, &keys, keys_style);
         buf.set_string(x, y, " ├", dim);
+    }
+}
+
+/// Animate two Gaussian blobs (yellow CW, red CCW) around the outer border.
+///
+/// Speed ratio 2 : 5 — yellow makes one orbit every 10 s, red every 4 s.
+/// Where they overlap the channels add like light, producing orange → warm-white.
+fn apply_border_glow(buf: &mut Buffer, area: Rect) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let t = START.get_or_init(Instant::now).elapsed().as_secs_f32();
+
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let x0 = area.x;
+    let y0 = area.y;
+    let x1 = area.x + area.width - 1;
+    let y1 = area.y + area.height - 1;
+
+    // Enumerate every border cell exactly once, clockwise from the top-left corner.
+    let cap = 2 * (area.width + area.height) as usize;
+    let mut cells: Vec<(u16, u16)> = Vec::with_capacity(cap);
+    for x in x0..=x1           { cells.push((x, y0)); }  // top:    L → R
+    for y in y0+1..=y1         { cells.push((x1, y)); }  // right:  T → B
+    for x in (x0..x1).rev()   { cells.push((x, y1)); }  // bottom: R → L
+    for y in (y0+1..y1).rev() { cells.push((x0, y)); }  // left:   B → T
+
+    let n = cells.len() as f32;
+
+    // 2 : 5 speed ratio.  Base unit = 1 / 20 s⁻¹ so yellow orbits in 10 s,
+    // red in 4 s.  They travel in opposite directions on the same loop.
+    const BASE: f32 = 1.0 / 20.0;
+    let cw_pos  = (t * 2.0 * BASE).rem_euclid(1.0);        // yellow, CW
+    let ccw_pos = 1.0 - (t * 5.0 * BASE).rem_euclid(1.0); // red,    CCW
+
+    // Blob half-width: 5 % of perimeter length.
+    const SIGMA: f32 = 0.05;
+
+    for (idx, &(x, y)) in cells.iter().enumerate() {
+        let p = idx as f32 / n;
+
+        // Shortest angular distance on the closed loop.
+        let d_cw  = { let d = (p - cw_pos).abs();  d.min(1.0 - d) };
+        let d_ccw = { let d = (p - ccw_pos).abs(); d.min(1.0 - d) };
+
+        let i_y = gaussian(d_cw,  SIGMA); // yellow blob intensity
+        let i_r = gaussian(d_ccw, SIGMA); // red blob intensity
+
+        // Additive RGB mix.  Yellow ≈ (255, 200, 0), Red ≈ (220, 50, 0).
+        // Where they coincide: (255, 250, 0) ≈ bright warm-white — like two
+        // coloured spotlights overlapping.
+        let r = (255.0 * i_y + 220.0 * i_r).min(255.0) as u8;
+        let g = (200.0 * i_y +  50.0 * i_r).min(255.0) as u8;
+
+        if r > 12 || g > 12 {
+            buf.get_mut(x, y).style.fg = Color::Rgb(r, g, 0);
+        }
     }
 }
 
