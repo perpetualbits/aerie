@@ -100,11 +100,12 @@ fn render_header_content(buf: &mut Buffer, area: Rect, state: &AppState) {
 /// histogram legend gap, bottom border with status and key-hint gaps.
 /// Three-pass outer border rendering:
 ///   1. structural glyphs — corners, side bars, dash fills
-///   2. rim glow          — gap-aware animated colour sweep
-///   3. gap content       — text/animations drawn into gap rects
+///   2. gap content       — text/animations drawn into gap rects
+///   3. rim glow          — applied last; gap-aware skip protects content cells
 ///
-/// Gaps that opt out of rim glow (`rim_glow = false`) receive clean dim cells
-/// in pass 3; gaps that opt in (`rim_glow = true`) receive pre-coloured cells.
+/// With glow last, `rim_glow = false` gaps are skipped entirely so their
+/// content colours survive.  `rim_glow = true` gaps are coloured by the
+/// animation even though content has already been drawn there.
 fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     let dim = Style::default().fg(Color::DarkGray);
     let x0 = area.x;
@@ -120,14 +121,13 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     draw_top_border_structure(buf, y0, x0, x1, dim);
     draw_bottom_border_structure(buf, y1, x0, x1, dim);
 
-    // Pass 2 — rim glow (skips cells inside non-glow gaps).
-    let gaps = border_gaps(area, state);
-    apply_border_glow(buf, area, &gaps);
-
-    // Pass 3 — gap content (drawn after glow; overrides rim colour on
-    //           rim_glow gaps, or fills untouched dim cells on non-glow gaps).
+    // Pass 2 — gap content (drawn before glow so the skip logic protects it).
     draw_top_border_content(buf, y0, x0, x1, state, dim);
     draw_bottom_border_content(buf, y1, x0, x1, state, dim);
+
+    // Pass 3 — rim glow (applied last; skips cells inside non-glow gaps).
+    let gaps = border_gaps(area, state);
+    apply_border_glow(buf, area, &gaps);
 }
 
 // ── Border structure (pass 1) ──────────────────────────────────────────────────
@@ -158,17 +158,15 @@ fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
     let mut gaps: Vec<BorderGap> = Vec::new();
 
     // Top border — histogram legend gap.
-    // rim_glow: true so the orbit sweeps through uninterrupted; the legend
-    // text is drawn on top in pass 3 at its own colours.
+    // rim_glow: false (default) — glow runs after content and must skip
+    // these cells so the legend colours survive.
     const FIXED: usize = 50;
     const MIN_SWATCH: usize = 4;
     let show_legend = state.show_histogram
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
     let inner_w = (x1 - x0).saturating_sub(1) as usize;
     if show_legend && inner_w >= FIXED + MIN_SWATCH {
-        gaps.push(
-            BorderGap::new(Rect::new(x0 + 1, y0, x1 - x0 - 1, 1)).with_rim_glow()
-        );
+        gaps.push(BorderGap::new(Rect::new(x0 + 1, y0, x1 - x0 - 1, 1)));
     }
 
     // Bottom border — GPU selector overrides both text gaps with one wide region.
