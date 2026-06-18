@@ -152,7 +152,6 @@ fn draw_bottom_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim:
 /// rim-glow function before content is drawn.
 fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
     let x0 = area.x;
-    let y0 = area.y;
     let x1 = area.x + area.width - 1;
     let y1 = area.y + area.height - 1;
     let mut gaps: Vec<BorderGap> = Vec::new();
@@ -160,14 +159,9 @@ fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
     // Top border — histogram legend gap.
     // rim_glow: false (default) — glow runs after content and must skip
     // these cells so the legend colours survive.
-    const FIXED: usize = 50;
-    const MIN_SWATCH: usize = 4;
-    let show_legend = state.show_histogram
-        && matches!(state.view, AppView::Groups | AppView::Remote { .. });
-    let inner_w = (x1 - x0).saturating_sub(1) as usize;
-    if show_legend && inner_w >= FIXED + MIN_SWATCH {
-        gaps.push(BorderGap::new(Rect::new(x0 + 1, y0, x1 - x0 - 1, 1)));
-    }
+    // Top border — no gap declared.  The rim animation visits all top-border
+    // cells; legend content drawn before it may be transiently tinted as a
+    // blob passes through, which is the intended "light" effect.
 
     // Bottom border — GPU selector overrides both text gaps with one wide region.
     if state.gpu_enabled && !state.gpu_devices.is_empty() {
@@ -175,18 +169,21 @@ fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
         return gaps;
     }
 
-    // Bottom border — status gap (┤ text ├) at x0+2.
+    // Bottom border — gaps cover only the content *between* the ┤ ├ bookends.
+    // The bookends themselves sit outside the gap so they receive rim glow
+    // just like structural border characters.
     let status = border_status(state);
-    let status_gap_w = 4 + status.chars().count() as u16;
-    gaps.push(BorderGap::new(Rect::new(x0 + 2, y1, status_gap_w, 1)));
+    let status_full_w = 4 + status.chars().count() as u16; // full "┤ text ├" span
+    // Gap: " {text} " = status_full_w - 2, starts one past the ┤ bookend
+    gaps.push(BorderGap::new(Rect::new(x0 + 3, y1, status_full_w - 2, 1)));
 
-    // Bottom border — keys gap (┤ text ├) near the right corner.
     let keys = border_keys(state);
-    let keys_gap_w = 4 + keys.chars().count() as u16;
-    let keys_start = x1.saturating_sub(keys_gap_w + 2); // +2 for trailing ──
-    let after_status = x0 + 2 + status_gap_w;
-    if keys_start > after_status + 1 {
-        gaps.push(BorderGap::new(Rect::new(keys_start, y1, keys_gap_w, 1)));
+    let keys_full_w = 4 + keys.chars().count() as u16;
+    let keys_start = x1.saturating_sub(keys_full_w + 2); // x-pos of leading ┤
+    let after_status_bookend = x0 + 2 + status_full_w;   // x-pos just past ├
+    if keys_start > after_status_bookend + 1 {
+        // Gap: " {text} " = keys_full_w - 2, starts one past the ┤ bookend
+        gaps.push(BorderGap::new(Rect::new(keys_start + 1, y1, keys_full_w - 2, 1)));
     }
 
     gaps
