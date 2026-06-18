@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
-use mullion::{Buffer, Rect, gaussian, render_carousel, tree::id_from_key};
+use mullion::{Buffer, BorderGap, Rect, gaussian, render_carousel, tree::id_from_key};
 use mullion::layout::TileId;
 use mullion::label::Align;
 use mullion::style::{Color, Modifier, Style};
@@ -98,6 +98,13 @@ fn render_header_content(buf: &mut Buffer, area: Rect, state: &AppState) {
 
 /// Draw the outer box: `╭`/`╮`/`╰`/`╯` corners, `│` sides, top border with
 /// histogram legend gap, bottom border with status and key-hint gaps.
+/// Three-pass outer border rendering:
+///   1. structural glyphs — corners, side bars, dash fills
+///   2. rim glow          — gap-aware animated colour sweep
+///   3. gap content       — text/animations drawn into gap rects
+///
+/// Gaps that opt out of rim glow (`rim_glow = false`) receive clean dim cells
+/// in pass 3; gaps that opt in (`rim_glow = true`) receive pre-coloured cells.
 fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     let dim = Style::default().fg(Color::DarkGray);
     let x0 = area.x;
@@ -105,35 +112,98 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     let x1 = area.x + area.width - 1;
     let y1 = area.y + area.height - 1;
 
+    // Pass 1 — structural glyphs only.
     for y in y0 + 1..y1 {
         buf.set_string(x0, y, "│", dim);
         buf.set_string(x1, y, "│", dim);
     }
-    draw_top_border(buf, y0, x0, x1, state, dim);
-    draw_bottom_border(buf, y1, x0, x1, state, dim);
-    apply_border_glow(buf, area);
+    draw_top_border_structure(buf, y0, x0, x1, dim);
+    draw_bottom_border_structure(buf, y1, x0, x1, dim);
+
+    // Pass 2 — rim glow (skips cells inside non-glow gaps).
+    let gaps = border_gaps(area, state);
+    apply_border_glow(buf, area, &gaps);
+
+    // Pass 3 — gap content (drawn after glow; overrides rim colour on
+    //           rim_glow gaps, or fills untouched dim cells on non-glow gaps).
+    draw_top_border_content(buf, y0, x0, x1, state, dim);
+    draw_bottom_border_content(buf, y1, x0, x1, state, dim);
 }
 
-/// Top border row: `╭─…─╮` with the histogram legend carved in as a gap when active.
-fn draw_top_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
+// ── Border structure (pass 1) ──────────────────────────────────────────────────
+
+fn draw_top_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim: Style) {
     buf.set_string(x0, y, "╭", dim);
     buf.set_string(x1, y, "╮", dim);
+    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
+}
 
+fn draw_bottom_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim: Style) {
+    buf.set_string(x0, y, "╰", dim);
+    buf.set_string(x1, y, "╯", dim);
+    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
+}
+
+// ── Gap declarations (between passes 1 and 2) ─────────────────────────────────
+
+/// Compute [BorderGap]s for the current render frame.
+///
+/// Called after the structural pass so gap rects can be passed to the
+/// rim-glow function before content is drawn.
+fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
+    let x0 = area.x;
+    let y0 = area.y;
+    let x1 = area.x + area.width - 1;
+    let y1 = area.y + area.height - 1;
+    let mut gaps: Vec<BorderGap> = Vec::new();
+
+    // Top border — histogram legend gap.
+    // rim_glow: true so the orbit sweeps through uninterrupted; the legend
+    // text is drawn on top in pass 3 at its own colours.
+    const FIXED: usize = 50;
+    const MIN_SWATCH: usize = 4;
     let show_legend = state.show_histogram
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
+    let inner_w = (x1 - x0).saturating_sub(1) as usize;
+    if show_legend && inner_w >= FIXED + MIN_SWATCH {
+        gaps.push(
+            BorderGap::new(Rect::new(x0 + 1, y0, x1 - x0 - 1, 1)).with_rim_glow()
+        );
+    }
 
+    // Bottom border — GPU selector overrides both text gaps with one wide region.
+    if state.gpu_enabled && !state.gpu_devices.is_empty() {
+        gaps.push(BorderGap::new(Rect::new(x0 + 2, y1, x1.saturating_sub(x0 + 2), 1)));
+        return gaps;
+    }
+
+    // Bottom border — status gap (┤ text ├) at x0+2.
+    let status = border_status(state);
+    let status_gap_w = 4 + status.chars().count() as u16;
+    gaps.push(BorderGap::new(Rect::new(x0 + 2, y1, status_gap_w, 1)));
+
+    // Bottom border — keys gap (┤ text ├) near the right corner.
+    let keys = border_keys(state);
+    let keys_gap_w = 4 + keys.chars().count() as u16;
+    let keys_start = x1.saturating_sub(keys_gap_w + 2); // +2 for trailing ──
+    let after_status = x0 + 2 + status_gap_w;
+    if keys_start > after_status + 1 {
+        gaps.push(BorderGap::new(Rect::new(keys_start, y1, keys_gap_w, 1)));
+    }
+
+    gaps
+}
+
+// ── Gap content (pass 3) ──────────────────────────────────────────────────────
+
+fn draw_top_border_content(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
+    let show_legend = state.show_histogram
+        && matches!(state.view, AppView::Groups | AppView::Remote { .. });
     const FIXED: usize = 50;
     const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
-
-    let inner_w = (x1 - x0).saturating_sub(1) as usize; // cols between corners
-
-    if !show_legend || inner_w < FIXED + MIN_SWATCH {
-        for x in x0 + 1..x1 {
-            buf.set_string(x, y, "─", dim);
-        }
-        return;
-    }
+    let inner_w = (x1 - x0).saturating_sub(1) as usize;
+    if !show_legend || inner_w < FIXED + MIN_SWATCH { return; }
 
     let available = inner_w - FIXED;
     let swatch_w  = available.min(MAX_SWATCH);
@@ -160,13 +230,7 @@ fn draw_top_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState,
     let _ = x;
 }
 
-/// Bottom border row: `╰─…─╯` with a status gap on the left and key hints on the right.
-fn draw_bottom_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
-    buf.set_string(x0, y, "╰", dim);
-    buf.set_string(x1, y, "╯", dim);
-    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
-
-    // GPU selector overrides both gaps.
+fn draw_bottom_border_content(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
     if write_gpu_selector_line(buf, state, x0 + 2, y) { return; }
 
     let status = border_status(state);
@@ -177,15 +241,13 @@ fn draw_bottom_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppSta
         Style::default().fg(Color::Rgb(55, 55, 55))
     };
 
-    // Left gap: ┤ status ├ starting two cols in from the corner.
     let mut after = x0 + 2;
     after = buf.set_string(after, y, "┤ ", dim);
     after = buf.set_string(after, y, &status, Style::default().fg(Color::DarkGray));
     after = buf.set_string(after, y, " ├", dim);
 
-    // Right gap: ┤ keys ├ ending two cols before the corner.
-    let keys_w = (4 + keys.chars().count()) as u16; // "┤ " + text + " ├"
-    let gap_start = x1.saturating_sub(keys_w + 2);  // + 2 for the trailing "──"
+    let keys_w    = (4 + keys.chars().count()) as u16;
+    let gap_start = x1.saturating_sub(keys_w + 2);
     if gap_start > after + 1 {
         let mut x = buf.set_string(gap_start, y, "┤ ", dim);
         x = buf.set_string(x, y, &keys, keys_style);
@@ -197,7 +259,10 @@ fn draw_bottom_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppSta
 ///
 /// Speed ratio 2 : 5 — yellow makes one orbit every 10 s, red every 4 s.
 /// Where they overlap the channels add like light, producing orange → warm-white.
-fn apply_border_glow(buf: &mut Buffer, area: Rect) {
+///
+/// Cells that fall inside a `BorderGap` with `rim_glow = false` are skipped
+/// entirely so the gap can render its own colours in the subsequent content pass.
+fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap]) {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
@@ -231,6 +296,11 @@ fn apply_border_glow(buf: &mut Buffer, area: Rect) {
     const SIGMA: f32 = 0.05;
 
     for (idx, &(x, y)) in cells.iter().enumerate() {
+        // Skip cells inside any non-glow gap — those are owned by pass 3.
+        if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
+            continue;
+        }
+
         let p = idx as f32 / n;
 
         // Shortest angular distance on the closed loop.
