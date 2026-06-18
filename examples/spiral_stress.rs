@@ -369,11 +369,11 @@ impl Demo {
     ) {
         let (x0, y0, x1, y1) = (x, y, x + w - 1, y + h - 1);
 
-        // Corners.
-        p.put(x0, y0, '┌', st);
-        p.put(x1, y0, '┐', st);
-        p.put(x0, y1, '└', st);
-        p.put(x1, y1, '┘', st);
+        // Corners — rounded for a softer look.
+        p.put(x0, y0, '╭', st);
+        p.put(x1, y0, '╮', st);
+        p.put(x0, y1, '╰', st);
+        p.put(x1, y1, '╯', st);
 
         // Decorative animated ports (gap intervals along each edge).
         let top = side_gaps(level, t, w);
@@ -503,7 +503,7 @@ fn h_edge(p: &mut Painter, y: i32, x0: i32, x1: i32, gaps: &[(i32, i32)], st: St
 }
 
 /// Draw a vertical edge between corners at `y0..=y1` on column `x`, punching the
-/// given absolute-y gap intervals (clean openings, no caps).
+/// given absolute-y gap intervals, bookended with `┬` / `┴` T-connectors.
 fn v_edge(p: &mut Painter, x: i32, y0: i32, y1: i32, gaps: &[(i32, i32)], st: Style) {
     for y in y0 + 1..y1 {
         p.put(x, y, '│', st);
@@ -513,6 +513,10 @@ fn v_edge(p: &mut Painter, x: i32, y0: i32, y1: i32, gaps: &[(i32, i32)], st: St
         let cb = b.min(y1 - 1);
         for y in ca..=cb {
             p.put(x, y, ' ', st);
+        }
+        if cb > ca {
+            p.put(x, ca, '┬', st);
+            p.put(x, cb, '┴', st);
         }
     }
 }
