@@ -157,16 +157,29 @@ fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
     let y1 = area.y + area.height - 1;
     let mut gaps: Vec<BorderGap> = Vec::new();
 
-    // Top border — histogram legend gap (rim_glow: false, the default).
-    // The corners ╭ and ╮ at x0/x1 are outside this rect and receive the
-    // rim glow normally; the inner legend content keeps its own colours.
+    // Top border — three precise gaps, one per coloured legend section.
+    // Structural chars (──, ┤, ├, " = work density", padding dashes) between
+    // and around the sections are left exposed so the rim glow travels visibly
+    // across the full top edge and only skips the coloured content.
     const FIXED: usize = 50;
+    const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
     let show_legend = state.show_histogram
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
     let inner_w = (x1 - x0).saturating_sub(1) as usize;
     if show_legend && inner_w >= FIXED + MIN_SWATCH {
-        gaps.push(BorderGap::new(Rect::new(x0 + 1, y0, x1 - x0 - 1, 1)));
+        let available = inner_w - FIXED;
+        let swatch_w  = available.min(MAX_SWATCH);
+        let left_pad  = (available - swatch_w) / 2;
+
+        // "← balanced"  — 10 green chars starting at x0+4 (after ──┤)
+        gaps.push(BorderGap::new(Rect::new(x0 + 4, y0, 10, 1)));
+        // swatch         — swatch_w planck-colour chars starting at x0+18+left_pad
+        //                  (after ├── + left_pad×─ + ┤)
+        gaps.push(BorderGap::new(Rect::new(x0 + 18 + left_pad as u16, y0, swatch_w as u16, 1)));
+        // "hot spots →"  — 11 orange chars; offset from right corner is fixed
+        //                  regardless of terminal width (left_pad+swatch_w+right_pad = inner_w-50)
+        gaps.push(BorderGap::new(Rect::new(x1 - 14, y0, 11, 1)));
     }
 
     // Bottom border — GPU selector overrides both text gaps with one wide region.
