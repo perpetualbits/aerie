@@ -33,6 +33,10 @@ assets = [
     { source = "LICENSE", dest = "/usr/share/licenses/aerie/LICENSE", mode = "644" },
 ]
 
+[[bin]]
+name = "spiral_stress"
+path = "examples/spiral_stress.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
