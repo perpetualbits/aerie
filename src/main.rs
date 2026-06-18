@@ -496,6 +496,22 @@ pub struct HistoryEntry {
     pub member_vals: HashMap<GroupLabel, MemberSeries>,
 }
 
+/// Exponential moving average of per-group metric values.
+///
+/// Updated every refresh tick with α = 1 − exp(−Δt / τ), where τ = 5 s.
+/// At a 2 s refresh interval α ≈ 0.33 (moderate smoothing); at 0.1 s α ≈ 0.02
+/// (heavy smoothing that visually stabilises fast-rate data).
+#[derive(Clone, Default)]
+pub struct MetricEwma {
+    pub cpu:           f64,
+    pub disk_read_s:   f64,
+    pub disk_write_s:  f64,
+    pub ctx_switches_s: f64,
+    pub page_faults_s: f64,
+    pub sched_wait_pct: f64,
+    pub gpu_pct:       f64,
+}
+
 /// Per-group concentration-anomaly tracking state.
 pub struct AnomalyState {
     /// N_eff / N — effective balance fraction [0, 1]. 1.0 = perfectly balanced.
@@ -947,6 +963,11 @@ pub struct AppState {
     pub body_tree: Option<Tree>,
     /// Active colour palette; swap to re-theme the whole UI atomically.
     pub theme: Theme,
+    /// Per-group EWMA state; updated each refresh tick.
+    pub ewma_vals: HashMap<GroupLabel, MetricEwma>,
+    /// When true, display uses EWMA-smoothed values instead of raw tick values.
+    /// Useful at sub-second refresh rates where raw values are too noisy to read.
+    pub smooth_display: bool,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1474,6 +1495,8 @@ impl AppState {
             gpu_devices: Vec::new(),
             selected_gpu: 0,
             theme: Theme::default(),
+            ewma_vals: HashMap::new(),
+            smooth_display: Duration::from_secs_f64(cli.interval) < Duration::from_millis(400),
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
                 orientation: Orientation::Vertical,
@@ -2158,6 +2181,24 @@ impl AppState {
                 self.entries = entries;
                 self.error = None;
 
+                // Update per-group EWMA.  α adapts to the actual refresh interval so
+                // the time constant τ = 5 s is independent of the configured rate.
+                {
+                    let interval_s = self.interval.as_secs_f64();
+                    let alpha = 1.0 - (-interval_s / 5.0_f64).exp();
+                    for e in &self.entries {
+                        if e.fading { continue; }
+                        let ew = self.ewma_vals.entry(e.label.clone()).or_default();
+                        ew.cpu            = alpha * e.value            + (1.0 - alpha) * ew.cpu;
+                        ew.disk_read_s    = alpha * e.disk_read_s      + (1.0 - alpha) * ew.disk_read_s;
+                        ew.disk_write_s   = alpha * e.disk_write_s     + (1.0 - alpha) * ew.disk_write_s;
+                        ew.ctx_switches_s = alpha * e.ctx_switches_s   + (1.0 - alpha) * ew.ctx_switches_s;
+                        ew.page_faults_s  = alpha * e.page_faults_s    + (1.0 - alpha) * ew.page_faults_s;
+                        ew.sched_wait_pct = alpha * e.sched_wait_pct   + (1.0 - alpha) * ew.sched_wait_pct;
+                        ew.gpu_pct        = alpha * e.gpu_pct           + (1.0 - alpha) * ew.gpu_pct;
+                    }
+                }
+
                 // Update rolling peaks (only non-fading entries contribute).
                 self.peak_vals.update(&self.entries);
 
@@ -2508,9 +2549,9 @@ fn main() -> Result<()> {
             ui::render(buf, &mut state);
         })?;
 
-        // Compute the shortest possible poll timeout so we wake exactly when the next
-        // event is expected: in Remote view we poll at 100 ms to pick up daemon snapshots
-        // quickly; otherwise we sleep until the next refresh or histogram tick.
+        // Render at least at RENDER_TICK rate for smooth animations (fade-outs, etc.),
+        // but still wake early for data/histogram deadlines and remote snapshots.
+        const RENDER_TICK: Duration = Duration::from_millis(50); // 20 fps cap
         let now = Instant::now();
         let wait = if in_remote {
             Duration::from_millis(100)
@@ -2525,9 +2566,8 @@ fn main() -> Result<()> {
             } else {
                 next_refresh
             };
-            // Wake at whichever of the two comes first.
             next_refresh.min(next_hist).saturating_duration_since(now)
-        };
+        }.min(RENDER_TICK);
 
         if let Some(event) = poll_event(wait)? {
             if let Event::Key(key) = event {
@@ -2547,7 +2587,6 @@ fn main() -> Result<()> {
                             AppView::Threads { .. } => {
                                 // Clear thread state so the next Enter into a different group
                                 // doesn't momentarily show stale data.
-                                if let Some(tree) = &mut state.body_tree { tree.zoom_out(); }
                                 state.view = AppView::Groups;
                                 state.thread_snap = None;
                                 state.thread_samples = vec![];
@@ -2585,6 +2624,9 @@ fn main() -> Result<()> {
                         if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
                             state.show_histogram = !state.show_histogram;
                         }
+                    }
+                    KeyCode::Char('v') => {
+                        state.smooth_display = !state.smooth_display;
                     }
                     // Cycle grouping strategy (Groups view, local or Proxmox mode)
                     KeyCode::Char('g') if matches!(state.view, AppView::Groups) => {
@@ -2843,10 +2885,7 @@ fn main() -> Result<()> {
                             } else if let Some(e) = state.focused_entry_idx().and_then(|i| state.entries.get(i)) {
                                 let label = e.label.clone();
                                 if matches!(state.mode, AppMode::Local) {
-                                    // Local: open per-thread heat-map view.
-                                    if let Some(tree) = &mut state.body_tree {
-                                        tree.zoom_to(id_from_key(&label));
-                                    }
+                                    // Local: open thread split-pane view.
                                     state.view = AppView::Threads { label };
                                     state.thread_snap = None;
                                     state.thread_samples = vec![];

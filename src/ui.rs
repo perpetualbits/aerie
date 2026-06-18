@@ -1,153 +1,122 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
 use mullion::{Buffer, Rect, render_carousel, tree::id_from_key};
-use mullion::layout::{Constraint, Node, Orientation, Size, TileId};
+use mullion::layout::TileId;
+use mullion::label::Align;
 use mullion::style::{Color, Modifier, Style};
+use mullion::table::{ColumnDef, ColumnGrid, ColumnKind};
 use std::collections::HashMap;
 
-const HEADER_ID: TileId = 1;
 pub const BODY_ID: TileId = 2;
-const FOOTER_ID: TileId = 3;
 
-/// Top-level render entry point: splits the terminal into header / body / footer
-/// using a mullion `Node::Split` and dispatches to per-section renderers.
+/// Top-level render entry point.
+///
+/// The terminal is framed by a single outer box whose top edge carries the
+/// histogram legend (when active) and whose bottom edge carries compact status
+/// and key-hint gaps.  Inside the box an optional 1-row header-content strip
+/// holds contextual info (errors, remote mode, manual title).  The remaining
+/// interior is the body — either a single pane or a 2/3 + 1/3 horizontal split
+/// when the thread view is open.
 pub fn render(buf: &mut Buffer, state: &mut AppState) {
     let area = buf.area;
-    if area.height == 0 { return; }
-    let term_w = area.width as usize;
-    let hh = header_height(state);
-    let fw = footer_height(state, term_w);
-    let bh = area.height.saturating_sub(hh + fw);
+    if area.width < 6 || area.height < 4 { return; }
 
-    let mut root = Node::Split {
-        orientation: Orientation::Vertical,
-        children: vec![
-            (Constraint::new(Size::Fixed(hh)), Node::Tile(HEADER_ID)),
-            (Constraint::new(Size::Fill(1)),   Node::Tile(BODY_ID)),
-            (Constraint::new(Size::Fixed(fw)), Node::Tile(FOOTER_ID)),
-        ],
+    draw_outer_border(buf, area, state);
+
+    // Interior is inset by 1 on all sides.
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+    if inner.height == 0 { return; }
+
+    // One optional header-content row.
+    let has_hdr = has_header_content(state);
+    let (content_row, body_rect) = if has_hdr && inner.height >= 2 {
+        (Some(Rect::new(inner.x, inner.y, inner.width, 1)),
+         Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1))
+    } else {
+        (None, inner)
     };
-    let tiles = mullion::layout::solve(&mut root, area);
+    if let Some(cr) = content_row { render_header_content(buf, cr, state); }
 
-    let mut header_rect = Rect::new(area.x, area.y, area.width, hh);
-    let mut body_rect   = Rect::new(area.x, area.y + hh, area.width, bh);
-    let mut footer_rect = Rect::new(area.x, area.y + hh + bh, area.width, fw);
-    for (id, r) in &tiles {
-        match *id {
-            HEADER_ID => header_rect = *r,
-            BODY_ID   => body_rect   = *r,
-            FOOTER_ID => footer_rect = *r,
-            _ => {}
-        }
-    }
-
-    render_header(buf, header_rect, state);
+    let outer_y0 = area.y;
+    let outer_y1 = area.y + area.height - 1;
     match state.view.clone() {
         AppView::Groups | AppView::Remote { .. } => render_body(buf, body_rect, state),
-        AppView::Threads { .. } => render_threads(buf, body_rect, state),
+        AppView::Threads { .. } if matches!(state.mode, AppMode::Local) =>
+            render_body_with_threads(buf, body_rect, outer_y0, outer_y1, state),
+        AppView::Threads { .. } => render_body(buf, body_rect, state),
         AppView::Manual => render_manual(buf, body_rect, state),
         AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
     }
-    render_footer(buf, footer_rect, state);
 }
 
-/// Compute the height of the header area.
-///
-/// The header is always at least 1 row (the divider line). A second row is added
-/// when there is content to display above the divider: an error, a TLS warning,
-/// remote/connecting info, the threads heat swatch, or the manual title.
-fn header_height(state: &AppState) -> u16 {
-    let has_content = match &state.view {
+/// Returns true when a 1-row content strip is needed just inside the top border.
+fn has_header_content(state: &AppState) -> bool {
+    match &state.view {
         AppView::Groups => state.error.is_some() || state.proxmox_insecure,
-        AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Threads { .. } | AppView::Manual => true,
-    };
-    if has_content { 2 } else { 1 }
+        AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Manual => true,
+        AppView::Threads { .. } => false, // thread info lives in the right pane
+    }
 }
 
-/// Render the header: an optional content row followed by a divider line.
-///
-/// Content row (when present):
-///   Groups:     error message  OR  TLS warning
-///   Remote:     "remote: <label> · [Esc] disconnect"
-///   Connecting: "Connecting to <label> …"
-///   Threads:    heat colour swatch (idle → hot)
-///   Manual:     title + scroll/close hints
-///
-/// Divider row: a `─` line, with the histogram legend carved in when the
-/// overlay is active: `──┤← balanced├──┤◻◻…◻◻ = work density├──┤hot spots →├──`
-fn render_header(buf: &mut Buffer, area: Rect, state: &AppState) {
-    let h = area.height;
-    if h == 0 { return; }
-
-    let (content_y, divider_y) = if h == 1 {
-        (None, area.y)
-    } else {
-        (Some(area.y), area.y + h - 1)
-    };
-
+/// Render the 1-row header content strip (errors, remote info, manual title).
+fn render_header_content(buf: &mut Buffer, area: Rect, state: &AppState) {
     let dim = Style::default().fg(Color::DarkGray);
-
-    if let Some(cy) = content_y {
-        let mut x = area.x;
-        match &state.view {
-            AppView::Groups => {
-                if let Some(err) = &state.error {
-                    x = buf.set_string(x, cy,
-                        &format!(" error: {}", err.lines().next().unwrap_or("")),
-                        Style::default().fg(Color::Red));
-                } else if state.proxmox_insecure {
-                    x = buf.set_string(x, cy, "  ⚠ TLS OFF",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-                }
-            }
-            AppView::Remote { label } => {
-                x = buf.set_string(x, cy, " remote: ", dim);
-                x = buf.set_string(x, cy, label,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-                x = buf.set_string(x, cy, "  ·  [Esc] disconnect", dim);
-            }
-            AppView::Connecting { label } => {
-                x = buf.set_string(x, cy, " Connecting to ", dim);
-                x = buf.set_string(x, cy, label,
+    let mut x = area.x;
+    match &state.view {
+        AppView::Groups => {
+            if let Some(err) = &state.error {
+                x = buf.set_string(x, area.y,
+                    &format!(" error: {}", err.lines().next().unwrap_or("")),
+                    Style::default().fg(Color::Red));
+            } else if state.proxmox_insecure {
+                x = buf.set_string(x, area.y, "  ⚠ TLS OFF",
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-                x = buf.set_string(x, cy, "  …", dim);
-            }
-            AppView::Threads { .. } => {
-                x = buf.set_string(x, cy, " heat: idle ", dim);
-                const SWATCH: usize = 24;
-                for i in 0..SWATCH {
-                    let frac = i as f64 / (SWATCH - 1) as f64;
-                    x = buf.set_string(x, cy, "◻", Style::default().fg(planck_color(frac)));
-                }
-                x = buf.set_string(x, cy, " hot", dim);
-            }
-            AppView::Manual => {
-                x = buf.set_string(x, cy, " manual",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-                x = buf.set_string(x, cy,
-                    "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", dim);
             }
         }
-        let _ = x;
+        AppView::Remote { label } => {
+            x = buf.set_string(x, area.y, " remote: ", dim);
+            x = buf.set_string(x, area.y, label,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, area.y, "  ·  [Esc] disconnect", dim);
+        }
+        AppView::Connecting { label } => {
+            x = buf.set_string(x, area.y, " Connecting to ", dim);
+            x = buf.set_string(x, area.y, label,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, area.y, "  …", dim);
+        }
+        AppView::Manual => {
+            x = buf.set_string(x, area.y, " manual",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, area.y,
+                "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", dim);
+        }
+        AppView::Threads { .. } => {}
     }
-
-    render_divider(buf, Rect::new(area.x, divider_y, area.width, 1), state);
+    let _ = x;
 }
 
-/// Render the horizontal divider between header and body.
-///
-/// When the histogram overlay is active, the divider carries a three-section
-/// legend showing the meaning of the colour scale:
-///
-///   ──┤← balanced├──┤◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻◻ = work density├──┤hot spots →├──
-///
-/// The coloured ◻ strip fills all available width between the fixed labels.
-/// Below a minimum terminal width the divider degrades to a plain ─ line.
-fn render_divider(buf: &mut Buffer, area: Rect, state: &AppState) {
-    let w = area.width as usize;
-    if w == 0 { return; }
-    let y = area.y;
+/// Draw the outer box: `╭`/`╮`/`╰`/`╯` corners, `│` sides, top border with
+/// histogram legend gap, bottom border with status and key-hint gaps.
+fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     let dim = Style::default().fg(Color::DarkGray);
+    let x0 = area.x;
+    let y0 = area.y;
+    let x1 = area.x + area.width - 1;
+    let y1 = area.y + area.height - 1;
+
+    for y in y0 + 1..y1 {
+        buf.set_string(x0, y, "│", dim);
+        buf.set_string(x1, y, "│", dim);
+    }
+    draw_top_border(buf, y0, x0, x1, state, dim);
+    draw_bottom_border(buf, y1, x0, x1, state, dim);
+}
+
+/// Top border row: `╭─…─╮` with the histogram legend carved in as a gap when active.
+fn draw_top_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
+    buf.set_string(x0, y, "╭", dim);
+    buf.set_string(x1, y, "╮", dim);
 
     let show_legend = state.show_histogram
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
@@ -156,24 +125,26 @@ fn render_divider(buf: &mut Buffer, area: Rect, state: &AppState) {
     const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
 
-    if !show_legend || w < FIXED + MIN_SWATCH {
-        buf.set_string(area.x, y, &"─".repeat(w), dim);
+    let inner_w = (x1 - x0).saturating_sub(1) as usize; // cols between corners
+
+    if !show_legend || inner_w < FIXED + MIN_SWATCH {
+        for x in x0 + 1..x1 {
+            buf.set_string(x, y, "─", dim);
+        }
         return;
     }
 
-    let available = w - FIXED;
+    let available = inner_w - FIXED;
     let swatch_w  = available.min(MAX_SWATCH);
     let extra     = available - swatch_w;
     let left_pad  = extra / 2;
     let right_pad = extra - left_pad;
 
-    let mut x = area.x;
+    let mut x = x0 + 1;
     x = buf.set_string(x, y, "──┤", dim);
     x = buf.set_string(x, y, "← balanced", Style::default().fg(Color::Rgb(60, 180, 60)));
     x = buf.set_string(x, y, "├──", dim);
-    if left_pad > 0 {
-        x = buf.set_string(x, y, &"─".repeat(left_pad), dim);
-    }
+    if left_pad > 0 { x = buf.set_string(x, y, &"─".repeat(left_pad), dim); }
     x = buf.set_string(x, y, "┤", dim);
     for i in 0..swatch_w {
         let frac = i as f64 / (swatch_w - 1).max(1) as f64;
@@ -181,13 +152,118 @@ fn render_divider(buf: &mut Buffer, area: Rect, state: &AppState) {
     }
     x = buf.set_string(x, y, " = work density", dim);
     x = buf.set_string(x, y, "├", dim);
-    if right_pad > 0 {
-        x = buf.set_string(x, y, &"─".repeat(right_pad), dim);
-    }
+    if right_pad > 0 { x = buf.set_string(x, y, &"─".repeat(right_pad), dim); }
     x = buf.set_string(x, y, "──┤", dim);
     x = buf.set_string(x, y, "hot spots →", Style::default().fg(Color::Rgb(220, 80, 0)));
     x = buf.set_string(x, y, "├──", dim);
     let _ = x;
+}
+
+/// Bottom border row: `╰─…─╯` with a status gap on the left and key hints on the right.
+fn draw_bottom_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
+    buf.set_string(x0, y, "╰", dim);
+    buf.set_string(x1, y, "╯", dim);
+    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
+
+    // GPU selector overrides both gaps.
+    if write_gpu_selector_line(buf, state, x0 + 2, y) { return; }
+
+    let status = border_status(state);
+    let keys   = border_keys(state);
+    let keys_style = if state.history_cursor.is_some() {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(55, 55, 55))
+    };
+
+    // Left gap: ┤ status ├ starting two cols in from the corner.
+    let mut after = x0 + 2;
+    after = buf.set_string(after, y, "┤ ", dim);
+    after = buf.set_string(after, y, &status, Style::default().fg(Color::DarkGray));
+    after = buf.set_string(after, y, " ├", dim);
+
+    // Right gap: ┤ keys ├ ending two cols before the corner.
+    let keys_w = (4 + keys.chars().count()) as u16; // "┤ " + text + " ├"
+    let gap_start = x1.saturating_sub(keys_w + 2);  // + 2 for the trailing "──"
+    if gap_start > after + 1 {
+        let mut x = buf.set_string(gap_start, y, "┤ ", dim);
+        x = buf.set_string(x, y, &keys, keys_style);
+        buf.set_string(x, y, " ├", dim);
+    }
+}
+
+/// Compact single-line status text for the bottom border left gap.
+fn border_status(state: &AppState) -> String {
+    match &state.view {
+        AppView::Threads { label } => {
+            let n = state.thread_samples.len();
+            let total: f64 = state.thread_samples.iter().map(|t| t.cpu_pct).sum();
+            format!("{label}  ·  {n} threads  ·  {total:.1}% total")
+        }
+        AppView::Manual => "manual".to_string(),
+        AppView::Connecting { label } => format!("connecting to {label}"),
+        _ => {
+            let parts = groups_status_parts(state);
+            parts.join("  ·  ")
+        }
+    }
+}
+
+/// Key hints text for the bottom border right gap.
+fn border_keys(state: &AppState) -> String {
+    if let Some(cursor) = state.history_cursor {
+        let age   = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
+        let total = state.history.len();
+        return format!("PAUSED  ◀ {age}s ago ▶  {}/{}  [←/→] scrub  [p] resume  [q] quit",
+            cursor + 1, total);
+    }
+    match &state.view {
+        AppView::Groups => {
+            let enter = if matches!(state.mode, AppMode::Local) {
+                "  [Enter] threads"
+            } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. })
+                   || state.enable_remote {
+                "  [Enter] drill"
+            } else { "" };
+            let smooth = if state.smooth_display { "  [v] raw" } else { "  [v] smooth" };
+            format!("[←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group{enter}  [p] pause{smooth}  [m] manual  [q] quit")
+        }
+        AppView::Remote { .. } =>
+            "[Esc] disconnect  [p] pause  [r] refresh  [q] quit".to_string(),
+        AppView::Threads { .. } =>
+            "[Esc] close  [r] refresh  [q] quit".to_string(),
+        AppView::Manual =>
+            "[↑/↓] scroll  [m] close  [q] quit".to_string(),
+        AppView::Connecting { .. } =>
+            "[Esc] cancel  [q] quit".to_string(),
+    }
+}
+
+/// Body split for thread view: left 2/3 shows the group list, right 1/3 the thread detail.
+/// The vertical divider connects to the outer border via `┬`/`┴` connectors.
+fn render_body_with_threads(
+    buf: &mut Buffer, body: Rect, outer_y0: u16, outer_y1: u16, state: &mut AppState,
+) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let left_w = body.width * 2 / 3;
+    let right_w = body.width.saturating_sub(left_w + 1);
+
+    // Fall back to body-only if the terminal is too narrow for a useful split.
+    if right_w < 24 || left_w < 30 {
+        render_body(buf, body, state);
+        return;
+    }
+
+    let split_x = body.x + left_w;
+    let left  = Rect::new(body.x,       body.y, left_w,  body.height);
+    let right = Rect::new(split_x + 1,  body.y, right_w, body.height);
+
+    for y in body.y..body.bottom() { buf.set_string(split_x, y, "│", dim); }
+    buf.set_string(split_x, outer_y0, "┬", dim);
+    buf.set_string(split_x, outer_y1, "┴", dim);
+
+    render_body(buf, left, state);
+    render_threads(buf, right, state);
 }
 
 
@@ -656,17 +732,29 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
                 | Metric::DiskWrite | Metric::CtxSwitches | Metric::SchedWait
                 | Metric::CfsThrottle | Metric::PsiCpu | Metric::PsiMem | Metric::PsiIo);
 
-    let label_w = state.entries.iter().map(|e| e.label.len()).max().unwrap_or(8).clamp(8, 28);
-    const VAL_W: usize = 9;
-    const ARROW_W: usize = 3;
-    let total_w = area.width as usize;
-    let fixed = label_w + 1 + ARROW_W + VAL_W + VAL_W + ARROW_W;
-    let bar_w = total_w.saturating_sub(fixed).max(16);
+    let label_w = state.entries.iter().map(|e| e.label.len()).max().unwrap_or(8).clamp(8, 28) as u16;
+    const VAL_W: u16 = 9;
+    const ARROW_W: u16 = 3;
+
+    // Declare the 7-column layout declaratively; bar fills remaining space.
+    //   label | sep | left_arrow | left_val | bar | right_val | right_arrow
+    let grid = ColumnGrid::new(vec![
+        ColumnDef::fixed(label_w, ColumnKind::Text),
+        ColumnDef::fixed(1,       ColumnKind::Custom),
+        ColumnDef::fixed(ARROW_W, ColumnKind::Custom),
+        ColumnDef::fixed(VAL_W,   ColumnKind::Text).with_align(Align::End),
+        ColumnDef::fill(1,        ColumnKind::Bar).with_min(16),
+        ColumnDef::fixed(VAL_W,   ColumnKind::Text),
+        ColumnDef::fixed(ARROW_W, ColumnKind::Custom),
+    ]);
+
+    // Resolve column positions once for this area width.
+    let cols = grid.resolve(Rect::new(area.x, area.y, area.width, 1));
+    let bar_w = cols[4].width as usize;
 
     // ── column-header row ─────────────────────────────────────────────────────
     let lname = lm.name();
     let rname = rm.name();
-    let mid_spaces = bar_w.saturating_sub(lname.len() + rname.len());
     let left_hdr_style = if state.active_side == Side::Left {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
@@ -685,59 +773,77 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         String::new()
     };
     let hy = area.y;
-    let mut x = area.x;
-    x = buf.set_string(x, hy, &truncate_label(&group_by_label, label_w),
-        Style::default().fg(Color::Rgb(60, 60, 60)));
-    x = buf.set_string(x, hy, &" ".repeat(1 + ARROW_W + VAL_W), Style::default());
-    x = buf.set_string(x, hy, lname, left_hdr_style);
-    x = buf.set_string(x, hy, &" ".repeat(mid_spaces), Style::default());
-    x = buf.set_string(x, hy, rname, right_hdr_style);
-    let _ = x;
+    // Group-by label in the label column.
+    ColumnGrid::write_text(buf, cols[0], hy, &truncate_label(&group_by_label, label_w as usize),
+        Align::Start, Style::default().fg(Color::Rgb(60, 60, 60)));
+    // Left/right metric names spread across the bar column.
+    buf.set_string(cols[4].x, hy, lname, left_hdr_style);
+    let rname_x = cols[4].x + cols[4].width.saturating_sub(rname.len() as u16);
+    buf.set_string(rname_x, hy, rname, right_hdr_style);
 
     // ── carousel body ─────────────────────────────────────────────────────────
     let carousel_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
     if carousel_area.height == 0 { return; }
 
-    // Capture focus before taking the tree out.
-    let focused_id = state.body_tree.as_ref().and_then(|t| t.focus());
-
-    // Take the tree out so we can borrow the rest of state in the draw closure.
-    let mut tree = match state.body_tree.take() {
-        Some(t) => t,
-        None => return,
-    };
+    let focused_id    = state.body_tree.as_ref().and_then(|t| t.focus());
+    let mut tree      = match state.body_tree.take() { Some(t) => t, None => return };
     tree.scroll_focus_into_view(carousel_area);
 
-    // Build id→index map before the closure captures state fields.
     let entries_by_id: HashMap<TileId, usize> = state.entries.iter()
         .enumerate()
         .map(|(i, e)| (id_from_key(&e.label), i))
         .collect();
 
-    // Snapshot scalar fields and shared-ref fields before the closure.
-    let total_ram_bytes = state.total_ram_bytes;
-    let show_histogram  = state.show_histogram;
-    let entries         = &state.entries;
-    let peaks           = &state.peak_vals;
-    let anomaly_states  = &state.anomaly_states;
+    let total_ram_bytes   = state.total_ram_bytes;
+    let show_histogram    = state.show_histogram;
+    let smooth_display    = state.smooth_display;
+    let entries           = &state.entries;
+    let peaks             = &state.peak_vals;
+    let anomaly_states    = &state.anomaly_states;
     let group_member_vals = &state.group_member_vals;
+    let ewma_vals         = &state.ewma_vals;
+    // Copy column x/width for use in the closure (avoids capturing `cols`).
+    let label_col = cols[0];
+    let arrow_l   = cols[2];
+    let val_l     = cols[3];
+    let bar_col   = cols[4];
+    let val_r     = cols[5];
+    let arrow_r   = cols[6];
 
     render_carousel(buf, tree.root_mut(), carousel_area, &mut |buf: &mut Buffer, id: TileId, rect: Rect| {
         let entry_idx = match entries_by_id.get(&id) { Some(&i) => i, None => return };
-        let e = &entries[entry_idx];
-        let ey = rect.y;
-        let fading     = e.fading;
+        let raw_e = &entries[entry_idx];
+        let ey  = rect.y;
+        let fading     = raw_e.fading;
         let is_selected = Some(id) == focused_id;
+
+        // When smooth_display is on, overlay EWMA values onto a cloned entry so
+        // metric_frac / metric_display_str see smoothed rates without any other
+        // changes to the display logic.
+        let smoothed: Option<crate::BarEntry> = if smooth_display && !fading {
+            ewma_vals.get(&raw_e.label).map(|ew| {
+                let mut e2 = raw_e.clone();
+                e2.value          = ew.cpu;
+                e2.disk_read_s    = ew.disk_read_s;
+                e2.disk_write_s   = ew.disk_write_s;
+                e2.ctx_switches_s = ew.ctx_switches_s;
+                e2.page_faults_s  = ew.page_faults_s;
+                e2.sched_wait_pct = ew.sched_wait_pct;
+                e2.gpu_pct        = ew.gpu_pct;
+                e2
+            })
+        } else { None };
+        let e = smoothed.as_ref().unwrap_or(raw_e);
 
         let lf = if fading { 0.0 } else { metric_frac(e, lm, total_ram_bytes, peaks) };
         let rf = if fading { 0.0 } else { metric_frac(e, rm, total_ram_bytes, peaks) };
-        let l_incomplete = !fading && !entry_complete(e, lm);
-        let r_incomplete = !fading && !entry_complete(e, rm);
         let lc = if fading { Color::DarkGray } else {
-            let c = bar_color(lm, lf); if l_incomplete { dimmed(c) } else { c }
+            let c = bar_color(lm, lf);
+            if !entry_complete(e, lm) { dimmed(c) } else { c }
         };
         let rc = if fading { Color::DarkGray } else {
-            let c = bar_color(rm, rf); if r_incomplete { dimmed(c) } else { c }
+            let c = bar_color(rm, rf);
+            if !entry_complete(e, rm) { dimmed(c) } else { c }
         };
 
         let usable      = (bar_w / 2).saturating_sub(1);
@@ -752,10 +858,11 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else if e.fading {
             let ft = mullion::ease::smoothstep(e.fade_t as f32) as f64;
-            let r = lerp_u8(0, 80, ft);
-            let g = lerp_u8(200, 80, ft);
-            let b = lerp_u8(200, 80, ft);
-            Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Rgb(
+                lerp_u8(0,   80, ft),
+                lerp_u8(200, 80, ft),
+                lerp_u8(200, 80, ft),
+            )).add_modifier(Modifier::BOLD)
         } else if is_anomaly {
             Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
         } else {
@@ -763,9 +870,9 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         };
 
         let display_label = if is_anomaly && !e.fading && !is_selected {
-            truncate_label(&format!("! {}", e.label), label_w)
+            truncate_label(&format!("! {}", e.label), label_w as usize)
         } else {
-            truncate_label(&e.label, label_w)
+            truncate_label(&e.label, label_w as usize)
         };
 
         let l_str = metric_display_str(e, lm, total_ram_bytes);
@@ -774,11 +881,8 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         let hist: Option<Vec<f64>> = if show_histogram {
             if overlay_enabled && !fading {
                 Some(group_member_vals.get(&e.label).map(|v| {
-                    if v.metric == hist_metric {
-                        fair_share_bins(&v.vals, bar_w)
-                    } else {
-                        vec![0.0; bar_w]
-                    }
+                    if v.metric == hist_metric { fair_share_bins(&v.vals, bar_w) }
+                    else { vec![0.0; bar_w] }
                 }).unwrap_or_else(|| vec![0.0; bar_w]))
             } else {
                 Some(vec![0.0; bar_w])
@@ -787,39 +891,40 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
             None
         };
 
-        let arrow_style = Style::default().fg(Color::Cyan);
-        let blank_arrow = Style::default();
         let (l_arrow, r_arrow, a_style) = if is_selected {
-            ("▶▶▶", "◀◀◀", arrow_style)
+            ("▶▶▶", "◀◀◀", Style::default().fg(Color::Cyan))
         } else {
-            ("   ", "   ", blank_arrow)
+            ("   ", "   ", Style::default())
         };
 
-        let mut x = rect.x;
-        x = buf.set_string(x, ey, &display_label, label_style);
-        x = buf.set_string(x, ey, " ", Style::default());
-        x = buf.set_string(x, ey, l_arrow, a_style);
-        x = buf.set_string(x, ey, &format!("{:>VAL_W$}", l_str), Style::default().fg(lc));
+        // Label column
+        ColumnGrid::write_text(buf, Rect::new(label_col.x, ey, label_col.width, 1),
+            ey, &display_label, Align::Start, label_style);
+        // Arrows and values use fixed columns from the resolved grid.
+        buf.set_string(arrow_l.x, ey, l_arrow, a_style);
+        ColumnGrid::write_text(buf, Rect::new(val_l.x, ey, val_l.width, 1),
+            ey, &l_str, Align::End, Style::default().fg(lc));
+        // Two-sided bar: rendered cell by cell into the bar column.
         for bi in 0..bar_w {
+            let bx = bar_col.x + bi as u16;
             let in_left  = bi < l_filled;
             let in_right = bi >= right_start;
             if let Some(ref h) = hist {
                 let bg = if in_left { lc } else if in_right { rc } else { Color::Reset };
-                x = buf.set_string(x, ey, "◻", Style::default().fg(planck_color(h[bi])).bg(bg));
+                buf.set_string(bx, ey, "◻", Style::default().fg(planck_color(h[bi])).bg(bg));
             } else if in_left {
-                x = buf.set_string(x, ey, "█", Style::default().fg(lc));
+                buf.set_string(bx, ey, "█", Style::default().fg(lc));
             } else if in_right {
-                x = buf.set_string(x, ey, "█", Style::default().fg(rc));
+                buf.set_string(bx, ey, "█", Style::default().fg(rc));
             } else {
-                x = buf.set_string(x, ey, "░", Style::default().fg(Color::DarkGray));
+                buf.set_string(bx, ey, "░", Style::default().fg(Color::DarkGray));
             }
         }
-        x = buf.set_string(x, ey, &format!("{:<VAL_W$}", r_str), Style::default().fg(rc));
-        x = buf.set_string(x, ey, r_arrow, a_style);
-        let _ = x;
+        ColumnGrid::write_text(buf, Rect::new(val_r.x, ey, val_r.width, 1),
+            ey, &r_str, Align::Start, Style::default().fg(rc));
+        buf.set_string(arrow_r.x, ey, r_arrow, a_style);
     });
 
-    // Restore the tree and record visible height for histogram sampling.
     state.body_tree = Some(tree);
     state.last_body_height = area.height as usize;
 }
@@ -906,22 +1011,41 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
 
     // Thread list
     if list_y < area.bottom() && list_h > 0 {
-        let name_w = state.thread_samples.iter().map(|t| t.name.len())
-            .max().unwrap_or(10).clamp(8, 24);
-        buf.set_string(area.x, list_y,
-            &format!("  {:<name_w$}  {:>6}  pid:tid", "thread", "cpu%"), dim);
+        let name_w = (state.thread_samples.iter().map(|t| t.name.len())
+            .max().unwrap_or(10).clamp(8, 24)) as u16;
+
+        // Columns: [marker:2] [name:fill 8-24] [sep:2] [cpu%:6] [pid:tid:fill]
+        let tgrid = ColumnGrid::new(vec![
+            ColumnDef::fixed(2,       ColumnKind::Custom),
+            ColumnDef::fill(1,        ColumnKind::Text).with_min(name_w).with_max(name_w),
+            ColumnDef::fixed(2,       ColumnKind::Custom),
+            ColumnDef::fixed(6,       ColumnKind::Number { unit_cols: 1 }),
+            ColumnDef::fill(1,        ColumnKind::Text),
+        ]);
+        let tcols = tgrid.resolve(Rect::new(area.x, list_y, area.width, 1));
+
+        // Header row
+        buf.set_string(tcols[0].x, list_y, "  ", dim);
+        ColumnGrid::write_text(buf, tcols[1], list_y, "thread", Align::Start, dim);
+        ColumnGrid::write_text(buf, Rect::new(tcols[3].x, list_y, tcols[3].width, 1), list_y,
+            "cpu%", Align::End, dim);
+        ColumnGrid::write_text(buf, tcols[4], list_y, "pid:tid", Align::Start, dim);
+
+        // Data rows
         for (row, t) in state.thread_samples.iter()
             .take(list_h.saturating_sub(1) as usize).enumerate()
         {
             let ty = list_y + 1 + row as u16;
             if ty >= area.bottom() { break; }
-            let mut x = area.x;
-            x = buf.set_string(x, ty, "◻ ",
+            let gray = Style::default().fg(Color::Gray);
+            buf.set_string(tcols[0].x, ty, "◻ ",
                 Style::default().fg(planck_color(t.cpu_pct / max_cpu)));
-            x = buf.set_string(x, ty,
-                &format!("{:<name_w$}  {:>5.2}%  {}:{}", t.name, t.cpu_pct, t.pid, t.tid),
-                Style::default().fg(Color::Gray));
-            let _ = x;
+            ColumnGrid::write_text(buf, Rect::new(tcols[1].x, ty, tcols[1].width, 1),
+                ty, &t.name, Align::Start, gray);
+            ColumnGrid::write_number(buf, Rect::new(tcols[3].x, ty, tcols[3].width, 1), ty,
+                &format!("{:>5.1}", t.cpu_pct), gray, "%", dim, 1);
+            ColumnGrid::write_text(buf, Rect::new(tcols[4].x, ty, tcols[4].width, 1),
+                ty, &format!("{}:{}", t.pid, t.tid), Align::Start, gray);
         }
     }
 }
@@ -946,20 +1070,6 @@ fn render_connecting(buf: &mut Buffer, area: Rect, label: &str) {
         buf.set_string(area.x, area.y + 2,
             "  This may take a few seconds. [Esc] to cancel.",
             Style::default().fg(Color::Rgb(80, 80, 80)));
-    }
-}
-
-/// Compute the footer height for the current view and terminal width.
-///
-/// The Groups view status line is made of wrapping parts, so its height varies.
-/// All other views use a fixed 2-row footer.
-fn footer_height(state: &AppState, term_w: usize) -> u16 {
-    match &state.view {
-        AppView::Groups => {
-            let parts = groups_status_parts(state);
-            (packed_row_count(&parts, term_w) as u16 + 1).min(6)
-        }
-        _ => 2,
     }
 }
 
@@ -1072,61 +1182,7 @@ fn groups_status_parts(state: &AppState) -> Vec<String> {
     parts
 }
 
-/// Count how many display rows `parts` need when packed left-to-right with
-/// `"  │  "` separators and a 1-space left margin, wrapping at `width`.
-fn packed_row_count(parts: &[String], width: usize) -> usize {
-    if parts.is_empty() || width == 0 {
-        return 1;
-    }
-    const SEP: usize = 5; // "  │  "
-    let mut rows = 1usize;
-    let mut col  = 0usize;
-    for (i, p) in parts.iter().enumerate() {
-        if i == 0 {
-            col = 1 + p.len();
-        } else if col + SEP + p.len() > width {
-            rows += 1;
-            col   = 1 + p.len();
-        } else {
-            col  += SEP + p.len();
-        }
-    }
-    rows
-}
-
-/// Greedy-pack `parts` into rows: each part is separated by "  │  ".
-/// Returns (row_index, col_x) offsets for each part in `area`, for direct buffer writes.
-fn write_packed_parts(buf: &mut Buffer, parts: &[String], area: Rect) {
-    const SEP: &str = "  │  ";
-    let dim    = Style::default().fg(Color::DarkGray);
-    let sep_st = Style::default().fg(Color::Rgb(50, 50, 50));
-    let w = area.width as usize;
-    let mut y = area.y;
-    let mut col = 0usize;
-    let mut x = area.x;
-
-    for (i, p) in parts.iter().enumerate() {
-        if y >= area.bottom() { break; }
-        if i == 0 {
-            x = buf.set_string(area.x, y, " ", dim);
-            x = buf.set_string(x, y, p, dim);
-            col = 1 + p.len();
-        } else if col + SEP.len() + p.len() > w {
-            y += 1;
-            if y >= area.bottom() { break; }
-            x = buf.set_string(area.x, y, " ", dim);
-            x = buf.set_string(x, y, p, dim);
-            col = 1 + p.len();
-        } else {
-            x = buf.set_string(x, y, SEP, sep_st);
-            x = buf.set_string(x, y, p, dim);
-            col += SEP.len() + p.len();
-        }
-    }
-    let _ = x;
-}
-
-/// Write the GPU device selector row at `(area.x, y)`. Returns `true` if written.
+/// Write the GPU device selector row at `(x0, y)`. Returns `true` if written.
 fn write_gpu_selector_line(buf: &mut Buffer, state: &AppState, x0: u16, y: u16) -> bool {
     if !state.gpu_enabled || state.gpu_devices.is_empty() {
         return false;
@@ -1150,155 +1206,6 @@ fn write_gpu_selector_line(buf: &mut Buffer, state: &AppState, x0: u16, y: u16) 
     }
     let _ = x;
     true
-}
-
-/// Render the Groups-view footer: parts-based status rows + key hints (or GPU selector).
-fn render_footer_groups(buf: &mut Buffer, area: Rect, state: &AppState) {
-    if area.height == 0 { return; }
-    let w = area.width as usize;
-    let parts = groups_status_parts(state);
-    let status_rows = packed_row_count(&parts, w);
-    // Write status rows (may occupy 1 or 2 lines depending on width).
-    let status_area = Rect::new(area.x, area.y, area.width,
-        (status_rows as u16).min(area.height));
-    write_packed_parts(buf, &parts, status_area);
-
-    // Last row: key hints, GPU selector, or replay indicator.
-    let last_y = area.y + area.height.saturating_sub(1);
-    if last_y < area.bottom() {
-        let keys_style = if state.history_cursor.is_some() {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Rgb(60, 60, 60))
-        };
-
-        if write_gpu_selector_line(buf, state, area.x, last_y) {
-            // GPU selector replaces key hints.
-        } else if let Some(cursor) = state.history_cursor {
-            let age   = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
-            let total = state.history.len();
-            buf.set_string(area.x, last_y,
-                &format!(" PAUSED  ◀ {age}s ago ▶  sample {}/{total}  [←/→] scrub  [p] resume  [q] quit",
-                    cursor + 1),
-                keys_style);
-        } else {
-            let enter_part = if matches!(state.mode, AppMode::Local) {
-                "  [Enter] threads"
-            } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. }) || state.enable_remote {
-                "  [Enter] drill down"
-            } else {
-                ""
-            };
-            buf.set_string(area.x, last_y,
-                &format!(" [←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group-by  [↑/↓] cursor{enter_part}  [p] pause  [r] refresh  [m] manual  [q] quit"),
-                keys_style);
-        }
-    }
-}
-
-/// Render the footer: status line(s) + key hints.
-///
-/// The Groups view uses a parts-based variable-height layout (see
-/// `render_footer_groups`). All other views use a fixed 2-row layout.
-fn render_footer(buf: &mut Buffer, area: Rect, state: &AppState) {
-    if matches!(state.view, AppView::Groups) {
-        render_footer_groups(buf, area, state);
-        return;
-    }
-    let mode_label = match &state.mode {
-        AppMode::Local                          => "local /proc".to_string(),
-        AppMode::Proxmox { url, .. }           => format!("proxmox {url}"),
-        AppMode::Fleet { .. }                  => "fleet".to_string(),
-        AppMode::Kube { namespace, .. }        => format!("kube/{namespace}"),
-        AppMode::Nomad { addr, namespace, .. } => format!("nomad/{namespace} {addr}"),
-    };
-    let interval_s = state.interval.as_secs_f64();
-    let interval_str = if interval_s < 1.0 {
-        format!("{interval_s:.2}")
-    } else if interval_s.fract() == 0.0 {
-        format!("{}", interval_s as u64)
-    } else {
-        format!("{interval_s:.1}")
-    };
-
-    let sys_metrics = |state: &AppState| -> String {
-        let mut s = format!(
-            "  │  net ↓{}  ↑{}",
-            fmt_bytes_rate(state.sys_net_rx_s),
-            fmt_bytes_rate(state.sys_net_tx_s),
-        );
-        if let Some(gpu) = state.sys_gpu_pct {
-            s.push_str(&format!("  │  gpu {:.0}%", gpu));
-        }
-        if state.sys_rapl_w > 0.0 {
-            s.push_str(&format!("  │  {} total", fmt_watts(state.sys_rapl_w)));
-        }
-        let any_psi = state.sys_psi_cpu.is_some()
-            || state.sys_psi_mem.is_some()
-            || state.sys_psi_io.is_some();
-        if any_psi {
-            let fmt_psi = |v: Option<f64>| v.map_or("?".into(), |x| format!("{:.1}%", x));
-            s.push_str(&format!(
-                "  │  psi cpu:{} mem:{} io:{}",
-                fmt_psi(state.sys_psi_cpu),
-                fmt_psi(state.sys_psi_mem),
-                fmt_psi(state.sys_psi_io),
-            ));
-        }
-        s
-    };
-
-    let (status, keys) = match &state.view {
-        AppView::Manual => (
-            " manual".to_string(),
-            " [↑/↓] scroll  [m] close  [q] quit".to_string(),
-        ),
-        AppView::Connecting { label } => (
-            format!(" Connecting to {label}…"),
-            " [Esc] cancel  [q] quit".to_string(),
-        ),
-        AppView::Threads { label } => {
-            let n = state.thread_samples.len();
-            let total: f64 = state.thread_samples.iter().map(|t| t.cpu_pct).sum();
-            let s = format!(" {label}  │  {n} threads  │  total {total:.2}%  │  {mode_label}  │  {interval_str}s");
-            let k = " [Esc] back  [r] refresh  [q] quit".to_string();
-            (s, k)
-        }
-        AppView::Remote { label } => {
-            let host = state.remote_client.as_ref().map(|c| c.host.as_str()).unwrap_or("?");
-            let sys = sys_metrics(state);
-            let s = format!(" remote: {label} ({host})  │  {} processes{sys}", state.entries.len());
-            let k = if let Some(cursor) = state.history_cursor {
-                let age = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
-                let total = state.history.len();
-                format!(" PAUSED  ◀ {}s ago ▶  sample {}/{}  [←/→] scrub  [p] resume  [Esc] disconnect  [q] quit",
-                    age, cursor + 1, total)
-            } else {
-                " [←/→] metric  [Tab] side  [s] sort  [↑/↓] cursor  [p] pause  [Esc] disconnect  [q] quit".to_string()
-            };
-            (s, k)
-        }
-        AppView::Groups => unreachable!("handled by render_footer_groups"),
-    };
-
-    let keys_style = if state.history_cursor.is_some() {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(60, 60, 60))
-    };
-
-    if area.height >= 1 {
-        buf.set_string(area.x, area.y, &status, Style::default().fg(Color::DarkGray));
-    }
-    if area.height >= 2 {
-        let last_y = area.y + 1;
-        // For Remote view, GPU selector replaces key hints when devices are present.
-        let wrote_gpu = matches!(state.view, AppView::Remote { .. })
-            && write_gpu_selector_line(buf, state, area.x, last_y);
-        if !wrote_gpu {
-            buf.set_string(area.x, last_y, &keys, keys_style);
-        }
-    }
 }
 
 // ── Manual ────────────────────────────────────────────────────────────────────
