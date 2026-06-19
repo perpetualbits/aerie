@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
-use mullion::{Buffer, BorderGap, Rect, gaussian, render_carousel, tree::id_from_key};
+use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
 use mullion::layout::TileId;
 use mullion::label::Align;
 use mullion::style::{Color, Modifier, Style};
 use mullion::table::{ColumnDef, ColumnGrid, ColumnKind};
+use mullion::Table;
 use std::collections::HashMap;
 
 pub const BODY_ID: TileId = 2;
@@ -881,8 +882,7 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     const VAL_W: u16 = 9;
     const ARROW_W: u16 = 3;
 
-    // Declare the 7-column layout declaratively; bar fills remaining space.
-    //   label | sep | left_arrow | left_val | bar | right_val | right_arrow
+    // Declare the 7-column layout: label | sep | left_arrow | left_val | bar | right_val | right_arrow
     let grid = ColumnGrid::new(vec![
         ColumnDef::fixed(label_w, ColumnKind::Text),
         ColumnDef::fixed(1,       ColumnKind::Custom),
@@ -892,12 +892,11 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         ColumnDef::fixed(VAL_W,   ColumnKind::Text),
         ColumnDef::fixed(ARROW_W, ColumnKind::Custom),
     ]);
+    // bar_w is needed in the row closure; resolve once before moving grid into Table.
+    let bar_w = grid.resolve(Rect::new(area.x, 0, area.width, 1))[4].width as usize;
+    let table = Table::new(grid);
 
-    // Resolve column positions once for this area width.
-    let cols = grid.resolve(Rect::new(area.x, area.y, area.width, 1));
-    let bar_w = cols[4].width as usize;
-
-    // ── column-header row ─────────────────────────────────────────────────────
+    // ── header values (captured by the header closure below) ──────────────────
     let lname = lm.name();
     let rname = rm.name();
     let left_hdr_style = if state.active_side == Side::Left {
@@ -917,22 +916,11 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     } else {
         String::new()
     };
-    let hy = area.y;
-    // Group-by label in the label column.
-    ColumnGrid::write_text(buf, cols[0], hy, &truncate_label(&group_by_label, label_w as usize),
-        Align::Start, Style::default().fg(Color::Rgb(60, 60, 60)));
-    // Left/right metric names spread across the bar column.
-    buf.set_string(cols[4].x, hy, lname, left_hdr_style);
-    let rname_x = cols[4].x + cols[4].width.saturating_sub(rname.len() as u16);
-    buf.set_string(rname_x, hy, rname, right_hdr_style);
 
-    // ── carousel body ─────────────────────────────────────────────────────────
-    let carousel_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
-    if carousel_area.height == 0 { return; }
-
+    // ── row values (captured by the row closure below) ────────────────────────
     let focused_id    = state.body_tree.as_ref().and_then(|t| t.focus());
     let mut tree      = match state.body_tree.take() { Some(t) => t, None => return };
-    tree.scroll_focus_into_view(carousel_area);
+    tree.scroll_focus_into_view(table.body_area(area, true, false));
 
     let entries_by_id: HashMap<TileId, usize> = state.entries.iter()
         .enumerate()
@@ -947,128 +935,127 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     let anomaly_states    = &state.anomaly_states;
     let group_member_vals = &state.group_member_vals;
     let ewma_vals         = &state.ewma_vals;
-    // Copy column x/width for use in the closure (avoids capturing `cols`).
-    let label_col = cols[0];
-    let arrow_l   = cols[2];
-    let val_l     = cols[3];
-    let bar_col   = cols[4];
-    let val_r     = cols[5];
-    let arrow_r   = cols[6];
 
-    render_carousel(buf, tree.root_mut(), carousel_area, &mut |buf: &mut Buffer, id: TileId, rect: Rect| {
-        let entry_idx = match entries_by_id.get(&id) { Some(&i) => i, None => return };
-        let raw_e = &entries[entry_idx];
-        let ey  = rect.y;
-        let fading     = raw_e.fading;
-        let is_selected = Some(id) == focused_id;
+    table.render(buf, area, tree.root_mut(),
+        Some(|buf: &mut Buffer, cols: &[Rect]| {
+            let hy = cols[0].y;
+            ColumnGrid::write_text(buf, cols[0], hy,
+                &truncate_label(&group_by_label, label_w as usize),
+                Align::Start, Style::default().fg(Color::Rgb(60, 60, 60)));
+            buf.set_string(cols[4].x, hy, lname, left_hdr_style);
+            let rname_x = cols[4].x + cols[4].width.saturating_sub(rname.len() as u16);
+            buf.set_string(rname_x, hy, rname, right_hdr_style);
+        }),
+        None::<fn(&mut Buffer, &[Rect])>,
+        |buf: &mut Buffer, id: TileId, cols: &[Rect]| {
+            let entry_idx = match entries_by_id.get(&id) { Some(&i) => i, None => return };
+            let raw_e = &entries[entry_idx];
+            let ey = cols[0].y;
+            let fading      = raw_e.fading;
+            let is_selected = Some(id) == focused_id;
 
-        // When smooth_display is on, overlay EWMA values onto a cloned entry so
-        // metric_frac / metric_display_str see smoothed rates without any other
-        // changes to the display logic.
-        let smoothed: Option<crate::BarEntry> = if smooth_display && !fading {
-            ewma_vals.get(&raw_e.label).map(|ew| {
-                let mut e2 = raw_e.clone();
-                e2.value          = ew.cpu;
-                e2.disk_read_s    = ew.disk_read_s;
-                e2.disk_write_s   = ew.disk_write_s;
-                e2.ctx_switches_s = ew.ctx_switches_s;
-                e2.page_faults_s  = ew.page_faults_s;
-                e2.sched_wait_pct = ew.sched_wait_pct;
-                e2.gpu_pct        = ew.gpu_pct;
-                e2
-            })
-        } else { None };
-        let e = smoothed.as_ref().unwrap_or(raw_e);
+            // When smooth_display is on, overlay EWMA values onto a cloned entry so
+            // metric_frac / metric_display_str see smoothed rates without any other
+            // changes to the display logic.
+            let smoothed: Option<crate::BarEntry> = if smooth_display && !fading {
+                ewma_vals.get(&raw_e.label).map(|ew| {
+                    let mut e2 = raw_e.clone();
+                    e2.value          = ew.cpu;
+                    e2.disk_read_s    = ew.disk_read_s;
+                    e2.disk_write_s   = ew.disk_write_s;
+                    e2.ctx_switches_s = ew.ctx_switches_s;
+                    e2.page_faults_s  = ew.page_faults_s;
+                    e2.sched_wait_pct = ew.sched_wait_pct;
+                    e2.gpu_pct        = ew.gpu_pct;
+                    e2
+                })
+            } else { None };
+            let e = smoothed.as_ref().unwrap_or(raw_e);
 
-        let lf = if fading { 0.0 } else { metric_frac(e, lm, total_ram_bytes, peaks) };
-        let rf = if fading { 0.0 } else { metric_frac(e, rm, total_ram_bytes, peaks) };
-        let lc = if fading { Color::DarkGray } else {
-            let c = bar_color(lm, lf);
-            if !entry_complete(e, lm) { dimmed(c) } else { c }
-        };
-        let rc = if fading { Color::DarkGray } else {
-            let c = bar_color(rm, rf);
-            if !entry_complete(e, rm) { dimmed(c) } else { c }
-        };
+            let lf = if fading { 0.0 } else { metric_frac(e, lm, total_ram_bytes, peaks) };
+            let rf = if fading { 0.0 } else { metric_frac(e, rm, total_ram_bytes, peaks) };
+            let lc = if fading { Color::DarkGray } else {
+                let c = bar_color(lm, lf);
+                if !entry_complete(e, lm) { dimmed(c) } else { c }
+            };
+            let rc = if fading { Color::DarkGray } else {
+                let c = bar_color(rm, rf);
+                if !entry_complete(e, rm) { dimmed(c) } else { c }
+            };
 
-        let usable      = (bar_w / 2).saturating_sub(1);
-        let l_filled    = (lf * usable as f64).round() as usize;
-        let r_filled    = (rf * usable as f64).round() as usize;
-        let right_start = bar_w - r_filled;
+            let usable      = (bar_w / 2).saturating_sub(1);
+            let l_filled    = (lf * usable as f64).round() as usize;
+            let r_filled    = (rf * usable as f64).round() as usize;
+            let right_start = bar_w - r_filled;
 
-        let anomaly    = anomaly_states.get(&e.label);
-        let is_anomaly = anomaly.is_some_and(|s: &AnomalyState| s.alerting);
+            let anomaly    = anomaly_states.get(&e.label);
+            let is_anomaly = anomaly.is_some_and(|s: &AnomalyState| s.alerting);
 
-        let label_style = if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else if e.fading {
-            let ft = mullion::ease::smoothstep(e.fade_t as f32) as f64;
-            Style::default().fg(Color::Rgb(
-                lerp_u8(0,   80, ft),
-                lerp_u8(200, 80, ft),
-                lerp_u8(200, 80, ft),
-            )).add_modifier(Modifier::BOLD)
-        } else if is_anomaly {
-            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-        };
-
-        let display_label = if is_anomaly && !e.fading && !is_selected {
-            truncate_label(&format!("! {}", e.label), label_w as usize)
-        } else {
-            truncate_label(&e.label, label_w as usize)
-        };
-
-        let l_str = metric_display_str(e, lm, total_ram_bytes);
-        let r_str = metric_display_str(e, rm, total_ram_bytes);
-
-        let hist: Option<Vec<f64>> = if show_histogram {
-            if overlay_enabled && !fading {
-                Some(group_member_vals.get(&e.label).map(|v| {
-                    if v.metric == hist_metric { fair_share_bins(&v.vals, bar_w) }
-                    else { vec![0.0; bar_w] }
-                }).unwrap_or_else(|| vec![0.0; bar_w]))
+            let label_style = if is_selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else if e.fading {
+                let ft = mullion::ease::smoothstep(e.fade_t as f32) as f64;
+                Style::default().fg(Color::Rgb(
+                    lerp_u8(0,   80, ft),
+                    lerp_u8(200, 80, ft),
+                    lerp_u8(200, 80, ft),
+                )).add_modifier(Modifier::BOLD)
+            } else if is_anomaly {
+                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
             } else {
-                Some(vec![0.0; bar_w])
-            }
-        } else {
-            None
-        };
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            };
 
-        let (l_arrow, r_arrow, a_style) = if is_selected {
-            ("▶▶▶", "◀◀◀", Style::default().fg(Color::Cyan))
-        } else {
-            ("   ", "   ", Style::default())
-        };
-
-        // Label column
-        ColumnGrid::write_text(buf, Rect::new(label_col.x, ey, label_col.width, 1),
-            ey, &display_label, Align::Start, label_style);
-        // Arrows and values use fixed columns from the resolved grid.
-        buf.set_string(arrow_l.x, ey, l_arrow, a_style);
-        ColumnGrid::write_text(buf, Rect::new(val_l.x, ey, val_l.width, 1),
-            ey, &l_str, Align::End, Style::default().fg(lc));
-        // Two-sided bar: rendered cell by cell into the bar column.
-        for bi in 0..bar_w {
-            let bx = bar_col.x + bi as u16;
-            let in_left  = bi < l_filled;
-            let in_right = bi >= right_start;
-            if let Some(ref h) = hist {
-                let bg = if in_left { lc } else if in_right { rc } else { Color::Reset };
-                buf.set_string(bx, ey, "◻", Style::default().fg(planck_color(h[bi])).bg(bg));
-            } else if in_left {
-                buf.set_string(bx, ey, "█", Style::default().fg(lc));
-            } else if in_right {
-                buf.set_string(bx, ey, "█", Style::default().fg(rc));
+            let display_label = if is_anomaly && !e.fading && !is_selected {
+                truncate_label(&format!("! {}", e.label), label_w as usize)
             } else {
-                buf.set_string(bx, ey, "░", Style::default().fg(Color::DarkGray));
+                truncate_label(&e.label, label_w as usize)
+            };
+
+            let l_str = metric_display_str(e, lm, total_ram_bytes);
+            let r_str = metric_display_str(e, rm, total_ram_bytes);
+
+            let hist: Option<Vec<f64>> = if show_histogram {
+                if overlay_enabled && !fading {
+                    Some(group_member_vals.get(&e.label).map(|v| {
+                        if v.metric == hist_metric { fair_share_bins(&v.vals, bar_w) }
+                        else { vec![0.0; bar_w] }
+                    }).unwrap_or_else(|| vec![0.0; bar_w]))
+                } else {
+                    Some(vec![0.0; bar_w])
+                }
+            } else {
+                None
+            };
+
+            let (l_arrow, r_arrow, a_style) = if is_selected {
+                ("▶▶▶", "◀◀◀", Style::default().fg(Color::Cyan))
+            } else {
+                ("   ", "   ", Style::default())
+            };
+
+            ColumnGrid::write_text(buf, cols[0], ey, &display_label, Align::Start, label_style);
+            buf.set_string(cols[2].x, ey, l_arrow, a_style);
+            ColumnGrid::write_text(buf, cols[3], ey, &l_str, Align::End, Style::default().fg(lc));
+            for bi in 0..bar_w {
+                let bx = cols[4].x + bi as u16;
+                let in_left  = bi < l_filled;
+                let in_right = bi >= right_start;
+                if let Some(ref h) = hist {
+                    let bg = if in_left { lc } else if in_right { rc } else { Color::Reset };
+                    buf.set_string(bx, ey, "◻", Style::default().fg(planck_color(h[bi])).bg(bg));
+                } else if in_left {
+                    buf.set_string(bx, ey, "█", Style::default().fg(lc));
+                } else if in_right {
+                    buf.set_string(bx, ey, "█", Style::default().fg(rc));
+                } else {
+                    buf.set_string(bx, ey, "░", Style::default().fg(Color::DarkGray));
+                }
             }
-        }
-        ColumnGrid::write_text(buf, Rect::new(val_r.x, ey, val_r.width, 1),
-            ey, &r_str, Align::Start, Style::default().fg(rc));
-        buf.set_string(arrow_r.x, ey, r_arrow, a_style);
-    });
+            ColumnGrid::write_text(buf, cols[5], ey, &r_str, Align::Start, Style::default().fg(rc));
+            buf.set_string(cols[6].x, ey, r_arrow, a_style);
+        },
+    );
 
     state.body_tree = Some(tree);
     state.last_body_height = area.height as usize;
