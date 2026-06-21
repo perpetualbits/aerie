@@ -203,12 +203,14 @@ alongside `aerie`.
 
 Every frame fully repaints nested, colour-flowing frames; the border gaps stream
 the demo's own live telemetry as a scrolling binary feed (filled = 1, hollow = 0).
-The `t` (tree) mode shown above subdivides each box at the *valleys* of a
-travelling multi-octave cosine height field rather than on any regular grid: cell
-sizes follow the field's steepness — steep, high-frequency water breaks into many
-narrow border-sharing cells while gentle stretches stay coarse — and as the
-field's animated Fourier coefficients drift, the fine region washes across the
-screen like surf.
+The `t` (surf) mode shown above is a swarm of free-floating bordered tiles, each
+riding a crest of a travelling 2-D wave field (a sum of plane waves heading in
+many directions, so crests run every which way and interfere). Each tile is sized
+to its crest's breadth, so broad swells become big windows and sharp chop becomes
+little floating boxes. As the wave's animated coefficients beat against each
+other, crests are born, drift, merge and split — so tiles cluster and overlap
+into stacks of windows, then break free and float apart, on the rhythm of the
+wave.
 
 ```bash
 spiral_stress            # one big spiral

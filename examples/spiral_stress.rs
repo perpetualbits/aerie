@@ -69,7 +69,7 @@ KEYS (while running):
     q, Esc       Quit
     space        Pause / resume the animation
     s            Toggle single spiral <-> swarm grid
-    t            Toggle the surf treemap (cosine-field recursive subdivision)
+    t            Toggle the surf field (floating tiles riding a 2-D wave field)
     z            Toggle the swarm auto-zoom
     +, =         Increase nesting depth / treemap detail
     -, _         Decrease nesting depth / treemap detail
@@ -315,97 +315,108 @@ impl Demo {
         }
     }
 
-    /// The surf treemap: recursively subdivide `area` into a tree of boxes whose
-    /// cuts follow the actual shape of a travelling cosine height field
-    /// (`surf_height`) rather than any regular grid. As the field's animated
-    /// Fourier coefficients drift, the whole partition flows like surf.
+    /// The surf field: a swarm of free-floating bordered tiles, each riding a
+    /// crest of a travelling 2-D wave field (`surf_height`). Every frame the
+    /// field is sampled over the screen, its local maxima found, and a tile sized
+    /// to each crest's breadth is drawn there. Because the waves travel in many
+    /// directions and interfere, crests appear, drift, merge and split in 2-D —
+    /// so tiles cluster and overlap into menus-of-windows, then break free and
+    /// float apart, all on the rhythm of the wave. `+`/`-` tune crest density.
     fn draw_tree(&self, p: &mut Painter, area: Rect) {
-        self.draw_node(p, area, 0, area);
-    }
-
-    /// One node of the surf treemap: draw this rectangle as a streaming-gap
-    /// frame, then cut its longer axis at the *valleys* of the height field
-    /// sampled along that axis, and recurse into each piece. Children share the
-    /// boundary column/row (one wall between neighbours), and their widths track
-    /// the field: closely-spaced valleys (steep, high-frequency water) yield many
-    /// narrow cells, gentle stretches stay coarse, and a locally smooth node is a
-    /// leaf. `depth` colours the frame; `area` is the whole screen, used to
-    /// sample the field in normalised coordinates.
-    fn draw_node(&self, p: &mut Painter, rect: Rect, depth: usize, area: Rect) {
-        let (w, h) = (rect.width as i32, rect.height as i32);
+        let (w, h) = (area.width as i32, area.height as i32);
         if w < 3 || h < 3 {
             return;
         }
+        let x0 = area.x as i32;
+        let y0 = area.y as i32;
+        let at = |fld: &[f32], x: i32, y: i32| fld[(y * w + x) as usize];
 
-        // Frame colour: hue flows with depth + time, like draw_spiral's palette.
-        let hue = self.t * 24.0 + depth as f32 * 23.0;
-        let val = 0.60 + 0.35 * ((self.t * 0.6 + depth as f32 * 0.5).sin() * 0.5 + 0.5);
-        let style = Style::default().fg(Color::from_hsv(hue, 0.85, val));
-        self.draw_box(p, rect.x as i32, rect.y as i32, w, h, style, depth, area, self.t, false);
-
-        // Resolution / runaway bound: stop once we run out of coordinate depth.
-        if depth >= 24 {
-            return;
+        // Sample the height field over the whole screen.
+        let mut fld = vec![0.0_f32; (w * h) as usize];
+        for yy in 0..h {
+            for xx in 0..w {
+                let nx = (xx as f32 + 0.5) / w as f32;
+                let ny = (yy as f32 + 0.5) / h as f32;
+                fld[(yy * w + xx) as usize] = surf_height(nx, ny, self.t);
+            }
         }
 
-        // Interior available to children (inset by 1 to clear the parent border).
-        let ix = rect.x as i32 + 1;
-        let iy = rect.y as i32 + 1;
-        let iw = w - 2;
-        let ih = h - 2;
-        let horizontal = iw >= ih; // always cut the longer interior axis
-        let axis_len = if horizontal { iw } else { ih };
+        // Detail knob (via self.depth): a lower crest line and tighter spacing
+        // let more, smaller crests through for a busier, finer wave pattern. The
+        // tight default spacing means neighbouring crests' tiles overlap into
+        // clusters, while lone crests stay free-floating.
+        let thresh = (0.64 - 0.008 * self.depth as f32).clamp(0.50, 0.64);
+        let supp = (10 - self.depth as i32 / 2).clamp(3, 9);
 
-        // `sep` is the minimum cell size along the cut, and the detail knob: +/-
-        // (via self.depth) trade coarse, wide cells for a fine wash of rectlets.
-        let sep = (84 / self.depth.max(1) as i32).clamp(4, 28);
-        if axis_len < 2 * sep + 1 {
-            return; // no room for an interior cut -> leaf
+        // Collect 8-neighbour local maxima above the crest line.
+        let mut peaks: Vec<(i32, i32, f32)> = Vec::new();
+        for yy in 1..h - 1 {
+            for xx in 1..w - 1 {
+                let v = at(&fld, xx, yy);
+                if v < thresh {
+                    continue;
+                }
+                let mut is_max = true;
+                'nb: for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if (dx != 0 || dy != 0) && at(&fld, xx + dx, yy + dy) > v {
+                            is_max = false;
+                            break 'nb;
+                        }
+                    }
+                }
+                if is_max {
+                    peaks.push((xx, yy, v));
+                }
+            }
         }
 
-        // Sample the field's 1-D profile along the cut axis at the node's centre.
-        let prof: Vec<f32> = (0..axis_len)
-            .map(|k| {
-                let (ax, ay) = if horizontal {
-                    (ix + k, iy + ih / 2)
-                } else {
-                    (ix + iw / 2, iy + k)
-                };
-                let nx = (ax as f32 + 0.5 - area.x as f32) / area.width as f32;
-                let ny = (ay as f32 + 0.5 - area.y as f32) / area.height as f32;
-                surf_height(nx, ny, self.t)
-            })
-            .collect();
-
-        // Cut at the field's most prominent valleys (deepest troughs relative to
-        // the surrounding crests), so each level takes a few field-aligned cuts
-        // and finer harmonics resolve into cells as the recursion descends. A
-        // node with no valley prominent enough is locally smooth -> a leaf.
-        let max_cuts = (axis_len / (3 * sep)).clamp(1, 5) as usize;
-        let prom_min = (2.4 / self.depth.max(1) as f32).clamp(0.06, 0.6);
-        let cuts = field_cuts(&prof, sep, max_cuts, prom_min);
-        if cuts.is_empty() {
-            return;
+        // Strongest first, then suppress crests within a `supp`-box of a kept one
+        // so the swarm thins out without losing the tallest peaks.
+        peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let mut tiles: Vec<(i32, i32, f32)> = Vec::new();
+        for pk in peaks {
+            if tiles.len() >= 256 {
+                break;
+            }
+            if tiles
+                .iter()
+                .all(|t| (t.0 - pk.0).abs() >= supp || (t.1 - pk.1).abs() >= supp)
+            {
+                tiles.push(pk);
+            }
         }
 
-        // Children span consecutive boundaries inclusively, so each shares one
-        // wall with its neighbour instead of drawing a doubled border.
-        let mut bounds = Vec::with_capacity(cuts.len() + 2);
-        bounds.push(0);
-        bounds.extend(cuts);
-        bounds.push(axis_len - 1);
-        for win in bounds.windows(2) {
-            let (a, b) = (win[0], win[1]);
-            let len = b - a + 1;
-            if len < 3 {
+        // Draw each crest as a tile sized to how far its bump extends before the
+        // field falls `drop` below the peak — broad swells become big windows,
+        // sharp chop becomes little floating boxes.
+        let drop = 0.10;
+        let maxr = 11;
+        for &(cx, cy, v) in &tiles {
+            let mut rl = 0;
+            while rl < maxr && cx - rl - 1 >= 0 && at(&fld, cx - rl - 1, cy) >= v - drop {
+                rl += 1;
+            }
+            let mut rr = 0;
+            while rr < maxr && cx + rr + 1 < w && at(&fld, cx + rr + 1, cy) >= v - drop {
+                rr += 1;
+            }
+            let mut ru = 0;
+            while ru < maxr && cy - ru - 1 >= 0 && at(&fld, cx, cy - ru - 1) >= v - drop {
+                ru += 1;
+            }
+            let mut rd = 0;
+            while rd < maxr && cy + rd + 1 < h && at(&fld, cx, cy + rd + 1) >= v - drop {
+                rd += 1;
+            }
+            let (tw, th) = (rl + rr + 1, ru + rd + 1);
+            if tw < 3 || th < 3 {
                 continue;
             }
-            let child = if horizontal {
-                Rect::new((ix + a) as u16, iy as u16, len as u16, ih as u16)
-            } else {
-                Rect::new(ix as u16, (iy + a) as u16, iw as u16, len as u16)
-            };
-            self.draw_node(p, child, depth + 1, area);
+            // Per-crest colour seed: golden-angle hue tied to position so tiles
+            // stay distinct yet shift gently as their crest drifts.
+            let level = (cx + cy * 7) as usize;
+            self.draw_box(p, x0 + cx - rl, y0 + cy - ru, tw, th, Style::default(), level, area, self.t, false);
         }
     }
 
@@ -490,7 +501,7 @@ impl Demo {
         let zoom = if self.zoom_on { "on" } else { "off" };
         let text = match self.mode {
             Mode::Tree => format!(
-                " tree · {:>3.0} fps · {} cells · {}x{}  │  s single  t spiral  ± detail  q quit ",
+                " surf · {:>3.0} fps · {} cells · {}x{}  │  s single  t spiral  ± detail  q quit ",
                 self.fps, self.last_cells, area.width, area.height
             ),
             _ => format!(
@@ -783,78 +794,36 @@ fn make_gap(center: f32, hw: f32, len: i32) -> Option<(i32, i32)> {
 /// this field's valleys, so as the coefficients drift the partition flows.
 fn surf_height(nx: f32, ny: f32, t: f32) -> f32 {
     use std::f32::consts::TAU;
-    // Multi-octave spectrum so the field has detail at every scale: as the
-    // treemap recurses into smaller boxes, higher harmonics keep supplying
-    // valleys to cut at. Each component: (frequency, travel speed, amplitude,
-    // breathing rate). Amplitudes fall off with frequency (a ~1/f surf
-    // spectrum) and wax/wane over time — the animated Fourier coefficients.
-    let xs = [
-        (1.3_f32, 0.9_f32, 0.55_f32, 0.23_f32), // primary swell
-        (3.1, 1.7, 0.28, 0.31),                 // wash
-        (6.7, 2.3, 0.15, 0.17),                 // chop
-        (13.3, 3.1, 0.08, 0.41),                // ripples
-    ];
-    let ys = [
-        (1.7_f32, 0.5_f32, 0.32_f32, 0.19_f32), // cross-shore swell
-        (4.3, 1.1, 0.17, 0.29),
-        (9.1, 1.9, 0.09, 0.37),
+    // A sum of plane waves travelling in many 2-D directions, so the field is
+    // isotropic — crests run every which way and interfere, giving ordered
+    // chaos rather than x/y banding. Each: (kx, ky, speed, amplitude, breathe).
+    // Amplitudes fall off with wavenumber (a ~1/|k| surf spectrum) and each
+    // coefficient waxes and wanes over time, so the pattern is alive, not just
+    // scrolled — crests are born, merge and split as the components beat.
+    let waves = [
+        (1.2_f32, 0.3_f32, 0.7_f32, 0.45_f32, 0.21_f32),
+        (-0.5, 1.4, 0.9, 0.40, 0.27),
+        (2.3, 1.1, 1.3, 0.34, 0.17),
+        (1.1, -2.4, 1.1, 0.30, 0.33),
+        (3.4, 2.2, 1.7, 0.28, 0.41),
+        (-2.6, 3.0, 1.9, 0.26, 0.29),
+        (4.8, -1.6, 2.3, 0.24, 0.47),
+        (0.6, 4.3, 2.1, 0.24, 0.37),
+        (5.5, 2.7, 2.5, 0.20, 0.53),
+        (-4.0, 5.1, 2.2, 0.20, 0.23),
+        (6.8, -3.4, 2.9, 0.17, 0.61),
+        (-6.2, -5.0, 3.0, 0.16, 0.31),
+        (8.0, 4.5, 3.3, 0.14, 0.43),
+        (3.0, 7.6, 3.1, 0.14, 0.19),
     ];
     let mut h = 0.0;
     let mut amp = 0.0;
-    for (f, spd, a0, br) in xs {
+    for (kx, ky, spd, a0, br) in waves {
         let a = a0 * (0.7 + 0.3 * (t * br).sin());
-        h += a * (nx * TAU * f - t * spd).cos();
+        h += a * (TAU * (kx * nx + ky * ny) - spd * t).cos();
         amp += a0;
     }
-    for (f, spd, a0, br) in ys {
-        let a = a0 * (0.7 + 0.3 * (t * br + 1.0).sin());
-        h += a * (ny * TAU * f - t * spd).cos();
-        amp += a0;
-    }
-    // Diagonal interference so contours aren't axis-aligned bands.
-    h += 0.14 * ((nx + ny) * TAU * 5.0 - t * 0.6).cos();
-    amp += 0.14;
     (h / (2.0 * amp) + 0.5).clamp(0.0, 1.0)
-}
-
-/// Pick the cut indices for one node: the most *prominent* interior valleys of
-/// the field profile — those whose trough sits deepest below the higher of the
-/// crests flanking it. Valleys are taken strongest-first, each at least `sep`
-/// from the ends and from already-chosen cuts, up to `max_cuts`, and only if
-/// their prominence clears `prom_min`. This makes coarse swell troughs the cuts
-/// at shallow levels while finer harmonics surface deeper, and leaves locally
-/// smooth nodes uncut — so cell sizes follow the field's steepness, not a grid.
-fn field_cuts(prof: &[f32], sep: i32, max_cuts: usize, prom_min: f32) -> Vec<i32> {
-    let n = prof.len() as i32;
-    if n < 2 * sep + 1 {
-        return Vec::new();
-    }
-    // (prominence, index) for every interior local minimum clearing prom_min.
-    let mut cand: Vec<(f32, i32)> = Vec::new();
-    for k in sep..=n - 1 - sep {
-        let (ku, kl, kr) = (k as usize, (k - 1) as usize, (k + 1) as usize);
-        if prof[ku] <= prof[kl] && prof[ku] <= prof[kr] {
-            let max_l = prof[..ku].iter().copied().fold(f32::MIN, f32::max);
-            let max_r = prof[ku + 1..].iter().copied().fold(f32::MIN, f32::max);
-            let prom = max_l.min(max_r) - prof[ku];
-            if prom >= prom_min {
-                cand.push((prom, k));
-            }
-        }
-    }
-    cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut chosen: Vec<i32> = Vec::new();
-    for (_, k) in cand {
-        if chosen.len() >= max_cuts {
-            break;
-        }
-        if chosen.iter().all(|&c| (c - k).abs() >= sep) {
-            chosen.push(k);
-        }
-    }
-    chosen.sort_unstable();
-    chosen
 }
 
 /// Choose a swarm grid (cols, rows) from the terminal size, aiming for tiles
