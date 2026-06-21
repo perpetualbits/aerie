@@ -55,14 +55,41 @@ use std::time::{Duration, Instant};
 /// input before producing the next animation frame.
 const FRAME: Duration = Duration::from_millis(16);
 
+const HELP: &str = "\
+spiral_stress — a mullion stress + \"wow\" demo
+
+USAGE:
+    spiral_stress [OPTIONS]
+
+OPTIONS:
+    --swarm      Start in swarm mode (a grid of mini-spirals) instead of one big spiral
+    -h, --help   Print this help and exit
+
+KEYS (while running):
+    q, Esc       Quit
+    space        Pause / resume the animation
+    s            Toggle single spiral <-> swarm grid
+    z            Toggle the swarm auto-zoom
+    +, =         Increase nesting depth
+    -, _         Decrease nesting depth
+    [, ]         Decrease / increase curl
+    r            Reverse curl direction
+";
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{HELP}");
+        return Ok(());
+    }
+
     let mut backend = CrosstermBackend::new(io::stdout());
     backend.apply_capabilities(&Capabilities::detect());
     let mut terminal = Terminal::new(backend)?;
     terminal.enter()?;
 
     let mut state = Demo::new();
-    if std::env::args().any(|a| a == "--swarm") {
+    if args.iter().any(|a| a == "--swarm") {
         state.mode = Mode::Swarm;
     }
     let mut last = Instant::now();
