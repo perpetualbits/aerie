@@ -55,14 +55,43 @@ use std::time::{Duration, Instant};
 /// input before producing the next animation frame.
 const FRAME: Duration = Duration::from_millis(16);
 
+const HELP: &str = "\
+spiral_stress — a mullion stress + \"wow\" demo
+
+USAGE:
+    spiral_stress [OPTIONS]
+
+OPTIONS:
+    --swarm      Start in swarm mode (a grid of mini-spirals) instead of one big spiral
+    -h, --help   Print this help and exit
+
+KEYS (while running):
+    q, Esc       Quit
+    space        Pause / resume the animation
+    s            Toggle single spiral <-> swarm grid
+    t            Toggle the surf field (floating tiles riding a 2-D wave field)
+    o            Surf tile overlap: cycle none / border / full
+    z            Toggle the swarm auto-zoom
+    +, =         Increase nesting depth / treemap detail
+    -, _         Decrease nesting depth / treemap detail
+    [, ]         Decrease / increase curl
+    r            Reverse curl direction
+";
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{HELP}");
+        return Ok(());
+    }
+
     let mut backend = CrosstermBackend::new(io::stdout());
     backend.apply_capabilities(&Capabilities::detect());
     let mut terminal = Terminal::new(backend)?;
     terminal.enter()?;
 
     let mut state = Demo::new();
-    if std::env::args().any(|a| a == "--swarm") {
+    if args.iter().any(|a| a == "--swarm") {
         state.mode = Mode::Swarm;
     }
     let mut last = Instant::now();
@@ -87,9 +116,16 @@ fn main() -> Result<()> {
                     KeyCode::Char('s') => {
                         state.mode = match state.mode {
                             Mode::Single => Mode::Swarm,
-                            Mode::Swarm => Mode::Single,
+                            Mode::Swarm | Mode::Tree => Mode::Single,
                         }
                     }
+                    KeyCode::Char('t') => {
+                        state.mode = match state.mode {
+                            Mode::Tree => Mode::Single,
+                            _ => Mode::Tree,
+                        }
+                    }
+                    KeyCode::Char('o') => state.overlap = state.overlap.next(),
                     KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
                     KeyCode::Char('+') | KeyCode::Char('=') => state.depth = (state.depth + 1).min(40),
                     KeyCode::Char('-') | KeyCode::Char('_') => {
@@ -109,11 +145,42 @@ fn main() -> Result<()> {
     result
 }
 
-/// Single big spiral, or a grid of many small ones.
+/// Single big spiral, a grid of many small ones, or the surf treemap.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Single,
     Swarm,
+    /// Recursive subdivision driven by a travelling cosine height field — the
+    /// spiral generalised to a tree of boxes (see `draw_tree` / `surf_height`).
+    Tree,
+}
+
+/// How crest tiles in surf mode may sit relative to one another.
+#[derive(Clone, Copy, PartialEq)]
+enum Overlap {
+    /// A clear cell between every tile — all free-floating.
+    None,
+    /// Tiles may share a wall/corner but their interiors never overlap.
+    Border,
+    /// Tiles overlap freely, stacking into menus of windows.
+    Full,
+}
+
+impl Overlap {
+    fn name(self) -> &'static str {
+        match self {
+            Overlap::None => "none",
+            Overlap::Border => "border",
+            Overlap::Full => "full",
+        }
+    }
+    fn next(self) -> Overlap {
+        match self {
+            Overlap::None => Overlap::Border,
+            Overlap::Border => Overlap::Full,
+            Overlap::Full => Overlap::None,
+        }
+    }
 }
 
 /// Animation + interaction state for the demo.
@@ -136,6 +203,11 @@ struct Demo {
     /// Cells written on the previous frame (stress proxy), shown in the HUD.
     last_cells: usize,
     frames: u64,
+    /// Live telemetry encoded as ASCII bytes, rebuilt once per frame and streamed
+    /// out through the border gaps as a scrolling binary feed (see `stream_bit`).
+    telemetry: Vec<u8>,
+    /// Surf-mode tile packing: free-floating, shared-wall, or stacked.
+    overlap: Overlap,
 }
 
 impl Demo {
@@ -151,7 +223,22 @@ impl Demo {
             fps: 0.0,
             last_cells: 0,
             frames: 0,
+            telemetry: Vec::new(),
+            overlap: Overlap::Border,
         }
+    }
+
+    /// Snapshot the live HUD numbers into the ASCII payload that the border gaps
+    /// broadcast as a binary feed. Kept compact and label-prefixed so a decoded
+    /// gap reads as legible telemetry. Uses last frame's `last_cells`/`fps` — the
+    /// same already-settled values the on-screen HUD shows, so the two agree.
+    fn telemetry(&self, area: Rect) -> Vec<u8> {
+        let mode = if self.mode == Mode::Swarm { "SWARM" } else { "SINGLE" };
+        format!(
+            " {mode} FPS={:.0} CELLS={} DEPTH={} {}x{} ",
+            self.fps, self.last_cells, self.depth, area.width, area.height
+        )
+        .into_bytes()
     }
 
     fn advance(&mut self, dt: f32) {
@@ -173,6 +260,9 @@ impl Demo {
         }
         let mut p = Painter::new(buf);
 
+        // Refresh the binary feed broadcast through the border gaps this frame.
+        self.telemetry = self.telemetry(area);
+
         // Full repaint each frame — both to avoid ghosting and to make the
         // per-frame cell count a meaningful stress figure.
         let bg = Style::default();
@@ -187,11 +277,15 @@ impl Demo {
                 1
             }
             Mode::Swarm => self.render_swarm(&mut p, area),
+            Mode::Tree => {
+                self.draw_tree(&mut p, area);
+                0
+            }
         };
 
-        // Single mode shows its stats in the outer box's bottom port; swarm
-        // mode has no room for that, so it gets a global overlay status line.
-        if self.mode == Mode::Swarm {
+        // Single mode shows its stats in the outer box's bottom port; the other
+        // modes have no room for that, so they get a global overlay status line.
+        if self.mode != Mode::Single {
             self.draw_status_line(&mut p, area, spirals);
         }
 
@@ -251,6 +345,193 @@ impl Demo {
             rw -= dw;
             rh -= dh;
             theta += dtheta;
+        }
+    }
+
+    /// The surf field: a swarm of free-floating bordered tiles, each riding a
+    /// crest of a travelling 2-D wave field (`surf_height`). Every frame the
+    /// field is sampled over the screen, its local maxima found, and a tile sized
+    /// to each crest's breadth is drawn there. Because the waves travel in many
+    /// directions and interfere, crests appear, drift, merge and split in 2-D —
+    /// so tiles cluster and overlap into menus-of-windows, then break free and
+    /// float apart, all on the rhythm of the wave. `+`/`-` tune crest density.
+    fn draw_tree(&self, p: &mut Painter, area: Rect) {
+        let (w, h) = (area.width as i32, area.height as i32);
+        if w < 3 || h < 3 {
+            return;
+        }
+        let x0 = area.x as i32;
+        let y0 = area.y as i32;
+        let at = |fld: &[f32], x: i32, y: i32| fld[(y * w + x) as usize];
+
+        // Sample the height field over the whole screen.
+        let mut fld = vec![0.0_f32; (w * h) as usize];
+        for yy in 0..h {
+            for xx in 0..w {
+                let nx = (xx as f32 + 0.5) / w as f32;
+                let ny = (yy as f32 + 0.5) / h as f32;
+                fld[(yy * w + xx) as usize] = surf_height(nx, ny, self.t);
+            }
+        }
+
+        // Detail knob (via self.depth): a lower crest line and tighter spacing
+        // let more, smaller crests through for a busier, finer wave pattern. The
+        // tight default spacing means neighbouring crests' tiles overlap into
+        // clusters, while lone crests stay free-floating.
+        let thresh = (0.64 - 0.008 * self.depth as f32).clamp(0.50, 0.64);
+        let supp = (10 - self.depth as i32 / 2).clamp(3, 9);
+
+        // Collect 8-neighbour local maxima above the crest line.
+        let mut peaks: Vec<(i32, i32, f32)> = Vec::new();
+        for yy in 1..h - 1 {
+            for xx in 1..w - 1 {
+                let v = at(&fld, xx, yy);
+                if v < thresh {
+                    continue;
+                }
+                let mut is_max = true;
+                'nb: for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if (dx != 0 || dy != 0) && at(&fld, xx + dx, yy + dy) > v {
+                            is_max = false;
+                            break 'nb;
+                        }
+                    }
+                }
+                if is_max {
+                    peaks.push((xx, yy, v));
+                }
+            }
+        }
+
+        // Strongest first, then suppress crests within a `supp`-box of a kept one
+        // so the swarm thins out without losing the tallest peaks.
+        peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let mut tiles: Vec<(i32, i32, f32)> = Vec::new();
+        for pk in peaks {
+            if tiles.len() >= 256 {
+                break;
+            }
+            if tiles
+                .iter()
+                .all(|t| (t.0 - pk.0).abs() >= supp || (t.1 - pk.1).abs() >= supp)
+            {
+                tiles.push(pk);
+            }
+        }
+
+        // Draw each crest as a tile sized to how far its bump extends before the
+        // field falls `drop` below the peak — broad swells become big windows,
+        // sharp chop becomes little floating boxes.
+        let drop = 0.10;
+        let maxr = 11;
+        // Already-placed tile rects (grid coords, inclusive) for overlap control.
+        let mut placed: Vec<(i32, i32, i32, i32)> = Vec::new();
+        for &(cx, cy, v) in &tiles {
+            // Grow each side to the crest's breadth (field still within `drop`).
+            let mut rl = 0;
+            while rl < maxr && cx - rl - 1 >= 0 && at(&fld, cx - rl - 1, cy) >= v - drop {
+                rl += 1;
+            }
+            let mut rr = 0;
+            while rr < maxr && cx + rr + 1 < w && at(&fld, cx + rr + 1, cy) >= v - drop {
+                rr += 1;
+            }
+            let mut ru = 0;
+            while ru < maxr && cy - ru - 1 >= 0 && at(&fld, cx, cy - ru - 1) >= v - drop {
+                ru += 1;
+            }
+            let mut rd = 0;
+            while rd < maxr && cy + rd + 1 < h && at(&fld, cx, cy + rd + 1) >= v - drop {
+                rd += 1;
+            }
+
+            // Clip against placed tiles to honour the overlap mode. Tiles are
+            // taken strongest-crest first, so the tallest peaks keep their size
+            // and weaker ones shrink to fit around them. `None` keeps a 1-cell
+            // gap; `Border` allows a shared wall but no interior overlap; `Full`
+            // does nothing (free stacking).
+            if self.overlap != Overlap::Full {
+                let mut guard = 0;
+                loop {
+                    guard += 1;
+                    if guard > 128 || rl + rr < 2 || ru + rd < 2 {
+                        break;
+                    }
+                    let (cx0, cy0, cx1, cy1) = (cx - rl, cy - ru, cx + rr, cy + rd);
+                    let mut hit: Option<(i32, i32)> = None;
+                    for &(px0, py0, px1, py1) in &placed {
+                        let conflict = match self.overlap {
+                            // Require a clear cell all around the candidate.
+                            Overlap::None => {
+                                cx0 - 1 <= px1
+                                    && px0 <= cx1 + 1
+                                    && cy0 - 1 <= py1
+                                    && py0 <= cy1 + 1
+                            }
+                            // Overlap of >1 cell on *both* axes means interiors
+                            // intersect; a shared wall/corner (<=1) is allowed.
+                            Overlap::Border => {
+                                let ow = cx1.min(px1) - cx0.max(px0) + 1;
+                                let oh = cy1.min(py1) - cy0.max(py0) + 1;
+                                ow >= 2 && oh >= 2
+                            }
+                            Overlap::Full => false,
+                        };
+                        if conflict {
+                            hit = Some(((px0 + px1) / 2, (py0 + py1) / 2));
+                            break;
+                        }
+                    }
+                    let Some((pcx, pcy)) = hit else { break };
+                    // Shrink the side facing the blocker; fall back to any side.
+                    let mut cut = false;
+                    if (pcx - cx).abs() >= (pcy - cy).abs() {
+                        if pcx >= cx && rr > 0 {
+                            rr -= 1;
+                            cut = true;
+                        } else if rl > 0 {
+                            rl -= 1;
+                            cut = true;
+                        }
+                        if !cut && rd > 0 {
+                            rd -= 1;
+                            cut = true;
+                        } else if !cut && ru > 0 {
+                            ru -= 1;
+                            cut = true;
+                        }
+                    } else {
+                        if pcy >= cy && rd > 0 {
+                            rd -= 1;
+                            cut = true;
+                        } else if ru > 0 {
+                            ru -= 1;
+                            cut = true;
+                        }
+                        if !cut && rr > 0 {
+                            rr -= 1;
+                            cut = true;
+                        } else if !cut && rl > 0 {
+                            rl -= 1;
+                            cut = true;
+                        }
+                    }
+                    if !cut {
+                        break;
+                    }
+                }
+            }
+
+            let (tw, th) = (rl + rr + 1, ru + rd + 1);
+            if tw < 3 || th < 3 {
+                continue;
+            }
+            placed.push((cx - rl, cy - ru, cx + rr, cy + rd));
+            // Per-crest colour seed: golden-angle hue tied to position so tiles
+            // stay distinct yet shift gently as their crest drifts.
+            let level = (cx + cy * 7) as usize;
+            self.draw_box(p, x0 + cx - rl, y0 + cy - ru, tw, th, Style::default(), level, area, self.t, false);
         }
     }
 
@@ -329,14 +610,20 @@ impl Demo {
         (idx, smoothstep(raw))
     }
 
-    /// A one-row overlay status line for swarm mode.
+    /// A one-row overlay status line for the non-single modes.
     fn draw_status_line(&self, p: &mut Painter, area: Rect, spirals: usize) {
         let y = (area.y + area.height - 1) as i32;
         let zoom = if self.zoom_on { "on" } else { "off" };
-        let text = format!(
-            " swarm · {} spirals · zoom {} · {:>3.0} fps · {} cells · {}x{}  │  s single  z zoom  ± depth  [ ] curl  r reverse  q quit ",
-            spirals, zoom, self.fps, self.last_cells, area.width, area.height
-        );
+        let text = match self.mode {
+            Mode::Tree => format!(
+                " surf · overlap {} · {:>3.0} fps · {} cells · {}x{}  │  s single  o overlap  ± detail  q quit ",
+                self.overlap.name(), self.fps, self.last_cells, area.width, area.height
+            ),
+            _ => format!(
+                " swarm · {} spirals · zoom {} · {:>3.0} fps · {} cells · {}x{}  │  s single  z zoom  ± depth  [ ] curl  r reverse  q quit ",
+                spirals, zoom, self.fps, self.last_cells, area.width, area.height
+            ),
+        };
         let text: String = text.chars().take(area.width as usize).collect();
         let st = Style::default()
             .fg(Color::Black)
@@ -386,15 +673,16 @@ impl Demo {
         // On the level-0 text box the top/bottom edges are drawn clean so the
         // brand and HUD ports own them; otherwise punch the decorative ports.
         let text_box = level == 0 && allow_text;
+        let tele = &self.telemetry;
         if text_box {
-            h_edge(p, y0, x0, y0, x1, y1, &[],               t, level,      level);
-            h_edge(p, y1, x0, y0, x1, y1, &[],               t, level + 7,  level);
+            h_edge(p, y0, x0, y0, x1, y1, &[],               t, level,      level, tele);
+            h_edge(p, y1, x0, y0, x1, y1, &[],               t, level + 7,  level, tele);
         } else {
-            h_edge(p, y0, x0, y0, x1, y1, &offset(&top, x0), t, level,      level);
-            h_edge(p, y1, x0, y0, x1, y1, &offset(&bot, x0), t, level + 7,  level);
+            h_edge(p, y0, x0, y0, x1, y1, &offset(&top, x0), t, level,      level, tele);
+            h_edge(p, y1, x0, y0, x1, y1, &offset(&bot, x0), t, level + 7,  level, tele);
         }
-        v_edge(p, x0, x0, y0, x1, y1, &offset(&lft, y0), t, level + 13, level);
-        v_edge(p, x1, x0, y0, x1, y1, &offset(&rgt, y0), t, level + 19, level);
+        v_edge(p, x0, x0, y0, x1, y1, &offset(&lft, y0), t, level + 13, level, tele);
+        v_edge(p, x1, x0, y0, x1, y1, &offset(&rgt, y0), t, level + 19, level, tele);
 
         if text_box {
             self.draw_brand_ports(p, x0, y0, x1, st, t);
@@ -486,9 +774,9 @@ impl<'a> Painter<'a> {
 /// given absolute-x gap intervals (capped with `┤`/`├` connectors).
 /// Draw a horizontal edge of the box at row `y`. The box spans `bx0..=bx1`,
 /// `by0..=by1`. Each cell is colored by `loop_color` using its position on the
-/// closed perimeter loop. Gaps are filled with streaming ◻ bands (independent).
+/// closed perimeter loop. Gaps stream a scrolling binary payload (see `stream_bit`).
 fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
-          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize) {
+          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize, msg: &[u8]) {
     for x in bx0 + 1..bx1 {
         p.put(x, y, '─', loop_color(x, y, bx0, by0, bx1, by1, t, level));
     }
@@ -501,7 +789,11 @@ fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
         let span = (cb - ca + 1).max(1) as f32;
         for x in ca..=cb {
             let pos = (x - ca) as f32 / span;
-            p.put(x, y, '◻', stream_color(pos, t, band, dir));
+            // Pin the bit to the absolute column so the gap is a window sliding
+            // over a fixed broadcast; `band` offsets each band into the stream.
+            let one = stream_bit(msg, x as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
+            let ch = if one { '▮' } else { '◻' }; // vertical bar = 1, square = 0
+            p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
             p.put(ca, y, '┤', loop_color(ca, y, bx0, by0, bx1, by1, t, level));
@@ -513,7 +805,7 @@ fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
 /// Draw a vertical edge of the box at column `x`. The box spans `bx0..=bx1`,
 /// `by0..=by1`. Each cell is colored by `loop_color`. Gaps are independent.
 fn v_edge(p: &mut Painter, x: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
-          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize) {
+          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize, msg: &[u8]) {
     for y in by0 + 1..by1 {
         p.put(x, y, '│', loop_color(x, y, bx0, by0, bx1, by1, t, level));
     }
@@ -526,7 +818,11 @@ fn v_edge(p: &mut Painter, x: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
         let span = (cb - ca + 1).max(1) as f32;
         for y in ca..=cb {
             let pos = (y - ca) as f32 / span;
-            p.put(x, y, '◻', stream_color(pos, t, band, dir));
+            // Same broadcast, read top-to-bottom; horizontal bar reads as 1
+            // along a vertical edge the way a vertical bar does on a row.
+            let one = stream_bit(msg, y as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
+            let ch = if one { '▬' } else { '◻' }; // horizontal bar = 1, square = 0
+            p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
             p.put(x, ca, '┴', loop_color(x, ca, bx0, by0, bx1, by1, t, level));
@@ -604,6 +900,47 @@ fn make_gap(center: f32, hw: f32, len: i32) -> Option<(i32, i32)> {
     }
 }
 
+/// Travelling cosine height field over normalised coordinates `(nx, ny)` in
+/// 0..1, returning 0..1 — a small 2-D Fourier sum (cosine-transform field). Each
+/// spectral component's *coefficient breathes* on its own slow cycle while its
+/// phase travels, so the field is genuinely animated, not just scrolled: a
+/// dominant swell and a steeper wash roll along +x, with a cross-shore
+/// undulation and a diagonal interference term. The treemap cuts its boxes at
+/// this field's valleys, so as the coefficients drift the partition flows.
+fn surf_height(nx: f32, ny: f32, t: f32) -> f32 {
+    use std::f32::consts::TAU;
+    // A sum of plane waves travelling in many 2-D directions, so the field is
+    // isotropic — crests run every which way and interfere, giving ordered
+    // chaos rather than x/y banding. Each: (kx, ky, speed, amplitude, breathe).
+    // Amplitudes fall off with wavenumber (a ~1/|k| surf spectrum) and each
+    // coefficient waxes and wanes over time, so the pattern is alive, not just
+    // scrolled — crests are born, merge and split as the components beat.
+    let waves = [
+        (1.2_f32, 0.3_f32, 0.7_f32, 0.45_f32, 0.21_f32),
+        (-0.5, 1.4, 0.9, 0.40, 0.27),
+        (2.3, 1.1, 1.3, 0.34, 0.17),
+        (1.1, -2.4, 1.1, 0.30, 0.33),
+        (3.4, 2.2, 1.7, 0.28, 0.41),
+        (-2.6, 3.0, 1.9, 0.26, 0.29),
+        (4.8, -1.6, 2.3, 0.24, 0.47),
+        (0.6, 4.3, 2.1, 0.24, 0.37),
+        (5.5, 2.7, 2.5, 0.20, 0.53),
+        (-4.0, 5.1, 2.2, 0.20, 0.23),
+        (6.8, -3.4, 2.9, 0.17, 0.61),
+        (-6.2, -5.0, 3.0, 0.16, 0.31),
+        (8.0, 4.5, 3.3, 0.14, 0.43),
+        (3.0, 7.6, 3.1, 0.14, 0.19),
+    ];
+    let mut h = 0.0;
+    let mut amp = 0.0;
+    for (kx, ky, spd, a0, br) in waves {
+        let a = a0 * (0.7 + 0.3 * (t * br).sin());
+        h += a * (TAU * (kx * nx + ky * ny) - spd * t).cos();
+        amp += a0;
+    }
+    (h / (2.0 * amp) + 0.5).clamp(0.0, 1.0)
+}
+
 /// Choose a swarm grid (cols, rows) from the terminal size, aiming for tiles
 /// roughly large enough to host a recognisable mini-spiral.
 fn grid_dims(area: Rect) -> (usize, usize) {
@@ -654,12 +991,31 @@ fn loop_color(x: i32, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32, t: f32, le
     Style::default().fg(Color::from_hsv(hue, 0.85, val))
 }
 
-/// Color for one ◻ cell inside a streaming band.
+/// Cells the bitstream scrolls past per second of animation time.
+const BIT_SPEED: f32 = 5.0;
+
+/// The bit of `msg` at continuous stream coordinate `s` (measured in edge cells).
+/// `msg` is the live telemetry rebuilt each frame (see `Demo::telemetry`): 8 bits
+/// per byte, MSB first, looping. The fractional part of `s` is floored to a cell,
+/// so every position on every edge is a window onto the same endless broadcast.
+/// Screenshot a gap, read filled = 1 / hollow = 0, and it decodes back to ASCII.
+fn stream_bit(msg: &[u8], s: f32) -> bool {
+    if msg.is_empty() {
+        return false;
+    }
+    let total = (msg.len() * 8) as i32;
+    let idx = (s.floor() as i32).rem_euclid(total);
+    let byte = msg[(idx / 8) as usize];
+    (byte >> (7 - (idx % 8))) & 1 == 1 // MSB first
+}
+
+/// Color for one cell inside a streaming band.
 ///
 /// `pos` is 0..1 along the gap, `band` seeds the hue family (golden-angle
 /// spacing gives each band a distinct color), `dir` is ±1 for stream direction.
-/// As `t` increases the gradient appears to scroll along the edge.
-fn stream_color(pos: f32, t: f32, band: usize, dir: f32) -> Style {
+/// As `t` increases the gradient appears to scroll along the edge. `one` lifts
+/// the brightness of set bits so the data reads clearly against the zeros.
+fn stream_color(pos: f32, t: f32, band: usize, dir: f32, one: bool) -> Style {
     // Golden-angle hue spacing: each band gets a maximally distinct base hue.
     let base_hue = (band as f32 * 137.508) % 360.0;
     // Shift position by time so the gradient scrolls (= streaming motion).
@@ -669,6 +1025,8 @@ fn stream_color(pos: f32, t: f32, band: usize, dir: f32) -> Style {
     // Brightness and saturation shimmer independently for a sparkle feel.
     let val = 0.45 + 0.55 * (p * std::f32::consts::TAU * 1.5).sin().powi(2);
     let sat = 0.70 + 0.30 * (p * std::f32::consts::TAU * 2.3).cos().abs();
+    // Set bits glow brighter than the zeros so the payload is legible.
+    let val = if one { (val + 0.30).min(1.0) } else { val * 0.75 };
     Style::default().fg(Color::from_hsv(hue, sat, val))
 }
 
