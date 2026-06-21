@@ -69,9 +69,10 @@ KEYS (while running):
     q, Esc       Quit
     space        Pause / resume the animation
     s            Toggle single spiral <-> swarm grid
+    t            Toggle the surf treemap (cosine-field recursive subdivision)
     z            Toggle the swarm auto-zoom
-    +, =         Increase nesting depth
-    -, _         Decrease nesting depth
+    +, =         Increase nesting depth / treemap detail
+    -, _         Decrease nesting depth / treemap detail
     [, ]         Decrease / increase curl
     r            Reverse curl direction
 ";
@@ -114,7 +115,13 @@ fn main() -> Result<()> {
                     KeyCode::Char('s') => {
                         state.mode = match state.mode {
                             Mode::Single => Mode::Swarm,
-                            Mode::Swarm => Mode::Single,
+                            Mode::Swarm | Mode::Tree => Mode::Single,
+                        }
+                    }
+                    KeyCode::Char('t') => {
+                        state.mode = match state.mode {
+                            Mode::Tree => Mode::Single,
+                            _ => Mode::Tree,
                         }
                     }
                     KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
@@ -136,11 +143,14 @@ fn main() -> Result<()> {
     result
 }
 
-/// Single big spiral, or a grid of many small ones.
+/// Single big spiral, a grid of many small ones, or the surf treemap.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Single,
     Swarm,
+    /// Recursive subdivision driven by a travelling cosine height field — the
+    /// spiral generalised to a tree of boxes (see `draw_tree` / `surf_height`).
+    Tree,
 }
 
 /// Animation + interaction state for the demo.
@@ -234,11 +244,15 @@ impl Demo {
                 1
             }
             Mode::Swarm => self.render_swarm(&mut p, area),
+            Mode::Tree => {
+                self.draw_tree(&mut p, area);
+                0
+            }
         };
 
-        // Single mode shows its stats in the outer box's bottom port; swarm
-        // mode has no room for that, so it gets a global overlay status line.
-        if self.mode == Mode::Swarm {
+        // Single mode shows its stats in the outer box's bottom port; the other
+        // modes have no room for that, so they get a global overlay status line.
+        if self.mode != Mode::Single {
             self.draw_status_line(&mut p, area, spirals);
         }
 
@@ -298,6 +312,78 @@ impl Demo {
             rw -= dw;
             rh -= dh;
             theta += dtheta;
+        }
+    }
+
+    /// The surf treemap: recursively subdivide `area` into a tree of boxes whose
+    /// depth is governed by a travelling cosine height field (`surf_height`).
+    /// Where the field is high the recursion runs deep (a wash of rectlets);
+    /// where it is low it stops early (big rectangles). As the field's crests
+    /// roll across, the fine region sweeps over the screen like surf and recedes.
+    fn draw_tree(&self, p: &mut Painter, area: Rect) {
+        self.draw_node(p, area, 0, area);
+    }
+
+    /// One node of the surf treemap: draw this rectangle as a streaming-gap
+    /// frame, then — if the height field here clears the per-depth waterline —
+    /// split its interior into child rectangles and recurse. `depth` colours the
+    /// frame and sets the waterline; `area` is the whole screen, used to sample
+    /// the field in normalised coordinates.
+    fn draw_node(&self, p: &mut Painter, rect: Rect, depth: usize, area: Rect) {
+        let (w, h) = (rect.width as i32, rect.height as i32);
+        if w < 3 || h < 3 {
+            return;
+        }
+
+        // Frame colour: hue flows with depth + time, like draw_spiral's palette.
+        let hue = self.t * 24.0 + depth as f32 * 23.0;
+        let val = 0.60 + 0.35 * ((self.t * 0.6 + depth as f32 * 0.5).sin() * 0.5 + 0.5);
+        let style = Style::default().fg(Color::from_hsv(hue, 0.85, val));
+        self.draw_box(p, rect.x as i32, rect.y as i32, w, h, style, depth, area, self.t, false);
+
+        // Stop if there is no room left to nest a bordered child inside.
+        if w < 7 || h < 5 {
+            return;
+        }
+
+        // Sample the travelling height field at this rect's centre. Deeper levels
+        // demand a higher field to keep splitting, so the recursion depth traces
+        // the field's contours. `self.depth` is the tide knob driven by +/-:
+        // raising it lowers the per-level waterline, flooding in more detail.
+        let nx = (rect.x as f32 + w as f32 * 0.5 - area.x as f32) / area.width as f32;
+        let ny = (rect.y as f32 + h as f32 * 0.5 - area.y as f32) / area.height as f32;
+        let height = surf_height(nx, ny, self.t);
+        let waterline = depth as f32 * (0.95 / self.depth.max(1) as f32);
+        if height < waterline {
+            return;
+        }
+
+        // Subdivide the interior (inset by 1 so children clear the parent border).
+        let ix = rect.x as i32 + 1;
+        let iy = rect.y as i32 + 1;
+        let iw = w - 2;
+        let ih = h - 2;
+        // More water -> more children -> finer wash. Split the longer axis so
+        // boxes don't degenerate into slivers, and cap the arity so every child
+        // keeps at least ~4 cells along the split (smaller can't host a frame).
+        let horizontal = iw >= ih;
+        let axis_len = if horizontal { iw } else { ih };
+        let arity = (2 + (height * 2.5) as usize)
+            .clamp(2, 4)
+            .min((axis_len / 4).max(1) as usize);
+        if arity < 2 {
+            return;
+        }
+        let parts = split_axis(axis_len, arity);
+        let mut off = 0;
+        for len in parts {
+            let child = if horizontal {
+                Rect::new((ix + off) as u16, iy as u16, len as u16, ih as u16)
+            } else {
+                Rect::new(ix as u16, (iy + off) as u16, iw as u16, len as u16)
+            };
+            off += len;
+            self.draw_node(p, child, depth + 1, area);
         }
     }
 
@@ -376,14 +462,20 @@ impl Demo {
         (idx, smoothstep(raw))
     }
 
-    /// A one-row overlay status line for swarm mode.
+    /// A one-row overlay status line for the non-single modes.
     fn draw_status_line(&self, p: &mut Painter, area: Rect, spirals: usize) {
         let y = (area.y + area.height - 1) as i32;
         let zoom = if self.zoom_on { "on" } else { "off" };
-        let text = format!(
-            " swarm · {} spirals · zoom {} · {:>3.0} fps · {} cells · {}x{}  │  s single  z zoom  ± depth  [ ] curl  r reverse  q quit ",
-            spirals, zoom, self.fps, self.last_cells, area.width, area.height
-        );
+        let text = match self.mode {
+            Mode::Tree => format!(
+                " tree · {:>3.0} fps · {} cells · {}x{}  │  s single  t spiral  ± detail  q quit ",
+                self.fps, self.last_cells, area.width, area.height
+            ),
+            _ => format!(
+                " swarm · {} spirals · zoom {} · {:>3.0} fps · {} cells · {}x{}  │  s single  z zoom  ± depth  [ ] curl  r reverse  q quit ",
+                spirals, zoom, self.fps, self.last_cells, area.width, area.height
+            ),
+        };
         let text: String = text.chars().take(area.width as usize).collect();
         let st = Style::default()
             .fg(Color::Black)
@@ -658,6 +750,38 @@ fn make_gap(center: f32, hw: f32, len: i32) -> Option<(i32, i32)> {
     } else {
         None
     }
+}
+
+/// Travelling cosine height field over normalised coordinates `(nx, ny)` in
+/// 0..1, returning 0..1. A sum of cosine waves (a cheap cosine-transform field):
+/// a dominant low-frequency swell and a steeper wash both travel along +x as `t`
+/// advances (the surf rolling in), with a cross-shore undulation and a diagonal
+/// interference term so the contours aren't straight bands. The treemap samples
+/// this to decide how deep to subdivide, so the field's crests become the dense
+/// regions and visibly wash across the screen.
+fn surf_height(nx: f32, ny: f32, t: f32) -> f32 {
+    use std::f32::consts::TAU;
+    let mut h = 0.0;
+    h += 0.60 * (nx * TAU * 1.3 - t * 0.9).cos(); // primary swell
+    h += 0.25 * (nx * TAU * 3.1 - t * 1.7).cos(); // steeper wash on top
+    h += 0.20 * (ny * TAU * 1.7 + (t * 0.3).sin()).cos(); // cross-shore undulation
+    h += 0.15 * ((nx + ny) * TAU * 2.3 - t * 0.6).cos(); // diagonal interference
+    (h * 0.42 + 0.5).clamp(0.0, 1.0)
+}
+
+/// Partition an integer length into `n` parts as evenly as possible (the first
+/// `len % n` parts are one larger), dropping any zero-length parts.
+fn split_axis(len: i32, n: usize) -> Vec<i32> {
+    if n == 0 || len <= 0 {
+        return Vec::new();
+    }
+    let n = n as i32;
+    let base = len / n;
+    let rem = len % n;
+    (0..n)
+        .map(|i| base + if i < rem { 1 } else { 0 })
+        .filter(|&l| l > 0)
+        .collect()
 }
 
 /// Choose a swarm grid (cols, rows) from the terminal size, aiming for tiles
