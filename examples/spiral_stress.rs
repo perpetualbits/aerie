@@ -136,6 +136,9 @@ struct Demo {
     /// Cells written on the previous frame (stress proxy), shown in the HUD.
     last_cells: usize,
     frames: u64,
+    /// Live telemetry encoded as ASCII bytes, rebuilt once per frame and streamed
+    /// out through the border gaps as a scrolling binary feed (see `stream_bit`).
+    telemetry: Vec<u8>,
 }
 
 impl Demo {
@@ -151,7 +154,21 @@ impl Demo {
             fps: 0.0,
             last_cells: 0,
             frames: 0,
+            telemetry: Vec::new(),
         }
+    }
+
+    /// Snapshot the live HUD numbers into the ASCII payload that the border gaps
+    /// broadcast as a binary feed. Kept compact and label-prefixed so a decoded
+    /// gap reads as legible telemetry. Uses last frame's `last_cells`/`fps` — the
+    /// same already-settled values the on-screen HUD shows, so the two agree.
+    fn telemetry(&self, area: Rect) -> Vec<u8> {
+        let mode = if self.mode == Mode::Swarm { "SWARM" } else { "SINGLE" };
+        format!(
+            " {mode} FPS={:.0} CELLS={} DEPTH={} {}x{} ",
+            self.fps, self.last_cells, self.depth, area.width, area.height
+        )
+        .into_bytes()
     }
 
     fn advance(&mut self, dt: f32) {
@@ -172,6 +189,9 @@ impl Demo {
             return;
         }
         let mut p = Painter::new(buf);
+
+        // Refresh the binary feed broadcast through the border gaps this frame.
+        self.telemetry = self.telemetry(area);
 
         // Full repaint each frame — both to avoid ghosting and to make the
         // per-frame cell count a meaningful stress figure.
@@ -386,15 +406,16 @@ impl Demo {
         // On the level-0 text box the top/bottom edges are drawn clean so the
         // brand and HUD ports own them; otherwise punch the decorative ports.
         let text_box = level == 0 && allow_text;
+        let tele = &self.telemetry;
         if text_box {
-            h_edge(p, y0, x0, y0, x1, y1, &[],               t, level,      level);
-            h_edge(p, y1, x0, y0, x1, y1, &[],               t, level + 7,  level);
+            h_edge(p, y0, x0, y0, x1, y1, &[],               t, level,      level, tele);
+            h_edge(p, y1, x0, y0, x1, y1, &[],               t, level + 7,  level, tele);
         } else {
-            h_edge(p, y0, x0, y0, x1, y1, &offset(&top, x0), t, level,      level);
-            h_edge(p, y1, x0, y0, x1, y1, &offset(&bot, x0), t, level + 7,  level);
+            h_edge(p, y0, x0, y0, x1, y1, &offset(&top, x0), t, level,      level, tele);
+            h_edge(p, y1, x0, y0, x1, y1, &offset(&bot, x0), t, level + 7,  level, tele);
         }
-        v_edge(p, x0, x0, y0, x1, y1, &offset(&lft, y0), t, level + 13, level);
-        v_edge(p, x1, x0, y0, x1, y1, &offset(&rgt, y0), t, level + 19, level);
+        v_edge(p, x0, x0, y0, x1, y1, &offset(&lft, y0), t, level + 13, level, tele);
+        v_edge(p, x1, x0, y0, x1, y1, &offset(&rgt, y0), t, level + 19, level, tele);
 
         if text_box {
             self.draw_brand_ports(p, x0, y0, x1, st, t);
@@ -486,9 +507,9 @@ impl<'a> Painter<'a> {
 /// given absolute-x gap intervals (capped with `┤`/`├` connectors).
 /// Draw a horizontal edge of the box at row `y`. The box spans `bx0..=bx1`,
 /// `by0..=by1`. Each cell is colored by `loop_color` using its position on the
-/// closed perimeter loop. Gaps are filled with streaming ◻ bands (independent).
+/// closed perimeter loop. Gaps stream a scrolling binary payload (see `stream_bit`).
 fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
-          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize) {
+          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize, msg: &[u8]) {
     for x in bx0 + 1..bx1 {
         p.put(x, y, '─', loop_color(x, y, bx0, by0, bx1, by1, t, level));
     }
@@ -501,7 +522,11 @@ fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
         let span = (cb - ca + 1).max(1) as f32;
         for x in ca..=cb {
             let pos = (x - ca) as f32 / span;
-            p.put(x, y, '◻', stream_color(pos, t, band, dir));
+            // Pin the bit to the absolute column so the gap is a window sliding
+            // over a fixed broadcast; `band` offsets each band into the stream.
+            let one = stream_bit(msg, x as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
+            let ch = if one { '▮' } else { '◻' }; // vertical bar = 1, square = 0
+            p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
             p.put(ca, y, '┤', loop_color(ca, y, bx0, by0, bx1, by1, t, level));
@@ -513,7 +538,7 @@ fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
 /// Draw a vertical edge of the box at column `x`. The box spans `bx0..=bx1`,
 /// `by0..=by1`. Each cell is colored by `loop_color`. Gaps are independent.
 fn v_edge(p: &mut Painter, x: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
-          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize) {
+          gaps: &[(i32, i32)], t: f32, seed: usize, level: usize, msg: &[u8]) {
     for y in by0 + 1..by1 {
         p.put(x, y, '│', loop_color(x, y, bx0, by0, bx1, by1, t, level));
     }
@@ -526,7 +551,11 @@ fn v_edge(p: &mut Painter, x: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
         let span = (cb - ca + 1).max(1) as f32;
         for y in ca..=cb {
             let pos = (y - ca) as f32 / span;
-            p.put(x, y, '◻', stream_color(pos, t, band, dir));
+            // Same broadcast, read top-to-bottom; horizontal bar reads as 1
+            // along a vertical edge the way a vertical bar does on a row.
+            let one = stream_bit(msg, y as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
+            let ch = if one { '▬' } else { '◻' }; // horizontal bar = 1, square = 0
+            p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
             p.put(x, ca, '┴', loop_color(x, ca, bx0, by0, bx1, by1, t, level));
@@ -654,12 +683,31 @@ fn loop_color(x: i32, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32, t: f32, le
     Style::default().fg(Color::from_hsv(hue, 0.85, val))
 }
 
-/// Color for one ◻ cell inside a streaming band.
+/// Cells the bitstream scrolls past per second of animation time.
+const BIT_SPEED: f32 = 5.0;
+
+/// The bit of `msg` at continuous stream coordinate `s` (measured in edge cells).
+/// `msg` is the live telemetry rebuilt each frame (see `Demo::telemetry`): 8 bits
+/// per byte, MSB first, looping. The fractional part of `s` is floored to a cell,
+/// so every position on every edge is a window onto the same endless broadcast.
+/// Screenshot a gap, read filled = 1 / hollow = 0, and it decodes back to ASCII.
+fn stream_bit(msg: &[u8], s: f32) -> bool {
+    if msg.is_empty() {
+        return false;
+    }
+    let total = (msg.len() * 8) as i32;
+    let idx = (s.floor() as i32).rem_euclid(total);
+    let byte = msg[(idx / 8) as usize];
+    (byte >> (7 - (idx % 8))) & 1 == 1 // MSB first
+}
+
+/// Color for one cell inside a streaming band.
 ///
 /// `pos` is 0..1 along the gap, `band` seeds the hue family (golden-angle
 /// spacing gives each band a distinct color), `dir` is ±1 for stream direction.
-/// As `t` increases the gradient appears to scroll along the edge.
-fn stream_color(pos: f32, t: f32, band: usize, dir: f32) -> Style {
+/// As `t` increases the gradient appears to scroll along the edge. `one` lifts
+/// the brightness of set bits so the data reads clearly against the zeros.
+fn stream_color(pos: f32, t: f32, band: usize, dir: f32, one: bool) -> Style {
     // Golden-angle hue spacing: each band gets a maximally distinct base hue.
     let base_hue = (band as f32 * 137.508) % 360.0;
     // Shift position by time so the gradient scrolls (= streaming motion).
@@ -669,6 +717,8 @@ fn stream_color(pos: f32, t: f32, band: usize, dir: f32) -> Style {
     // Brightness and saturation shimmer independently for a sparkle feel.
     let val = 0.45 + 0.55 * (p * std::f32::consts::TAU * 1.5).sin().powi(2);
     let sat = 0.70 + 0.30 * (p * std::f32::consts::TAU * 2.3).cos().abs();
+    // Set bits glow brighter than the zeros so the payload is legible.
+    let val = if one { (val + 0.30).min(1.0) } else { val * 0.75 };
     Style::default().fg(Color::from_hsv(hue, sat, val))
 }
 
