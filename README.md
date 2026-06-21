@@ -193,6 +193,29 @@ The hook is called as `CMD GROUP KIND BALANCE_FRACTION` (e.g.
 `alert.sh nginx concentrated 0.12`) when a group's load distribution becomes
 pathological. Rate-limited to once per 60 s per group.
 
+## spiral_stress demo
+
+`spiral_stress` is a bundled stress test and showcase for [mullion](https://github.com/perpetualbits/mullion),
+the TUI layout engine behind aerie. It is installed as a standalone binary
+alongside `aerie`.
+
+![spiral_stress surf treemap](assets/spiral_stress.gif)
+
+Every frame fully repaints nested, colour-flowing frames; the border gaps stream
+the demo's own live telemetry as a scrolling binary feed (filled = 1, hollow = 0).
+The `t` (tree) mode shown above is a recursive subdivision driven by a travelling
+cosine height field — crests recurse into a wash of rectlets, troughs stay coarse,
+and the fine region washes across the screen like surf.
+
+```bash
+spiral_stress            # one big spiral
+spiral_stress --swarm    # a grid of mini-spirals
+spiral_stress --help     # all flags and keys
+```
+
+Keys: `t` surf treemap · `s` single ↔ swarm · `z` swarm zoom · `+`/`-` detail ·
+`[`/`]` curl · `r` reverse · `space` pause · `q` quit.
+
 ## Requirements
 
 - Linux kernel 4.15+ (5.14+ for GPU fdinfo metrics)
