@@ -208,9 +208,10 @@ riding a crest of a travelling 2-D wave field (a sum of plane waves heading in
 many directions, so crests run every which way and interfere). Each tile is sized
 to its crest's breadth, so broad swells become big windows and sharp chop becomes
 little floating boxes. As the wave's animated coefficients beat against each
-other, crests are born, drift, merge and split — so tiles cluster and overlap
-into stacks of windows, then break free and float apart, on the rhythm of the
-wave.
+other, crests are born, drift, merge and split. Press `o` to cycle how tiles may
+sit together — `border` (the default, shown above: tiles share walls but never
+overlap interiors), `full` (overlap freely into stacks of windows), or `none`
+(a clear gap around every tile, all free-floating).
 
 ```bash
 spiral_stress            # one big spiral
@@ -218,8 +219,8 @@ spiral_stress --swarm    # a grid of mini-spirals
 spiral_stress --help     # all flags and keys
 ```
 
-Keys: `t` surf treemap · `s` single ↔ swarm · `z` swarm zoom · `+`/`-` detail ·
-`[`/`]` curl · `r` reverse · `space` pause · `q` quit.
+Keys: `t` surf field · `o` tile overlap · `s` single ↔ swarm · `z` swarm zoom ·
+`+`/`-` detail · `[`/`]` curl · `r` reverse · `space` pause · `q` quit.
 
 ## Requirements
 

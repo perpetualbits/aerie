@@ -70,6 +70,7 @@ KEYS (while running):
     space        Pause / resume the animation
     s            Toggle single spiral <-> swarm grid
     t            Toggle the surf field (floating tiles riding a 2-D wave field)
+    o            Surf tile overlap: cycle none / border / full
     z            Toggle the swarm auto-zoom
     +, =         Increase nesting depth / treemap detail
     -, _         Decrease nesting depth / treemap detail
@@ -124,6 +125,7 @@ fn main() -> Result<()> {
                             _ => Mode::Tree,
                         }
                     }
+                    KeyCode::Char('o') => state.overlap = state.overlap.next(),
                     KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
                     KeyCode::Char('+') | KeyCode::Char('=') => state.depth = (state.depth + 1).min(40),
                     KeyCode::Char('-') | KeyCode::Char('_') => {
@@ -153,6 +155,34 @@ enum Mode {
     Tree,
 }
 
+/// How crest tiles in surf mode may sit relative to one another.
+#[derive(Clone, Copy, PartialEq)]
+enum Overlap {
+    /// A clear cell between every tile — all free-floating.
+    None,
+    /// Tiles may share a wall/corner but their interiors never overlap.
+    Border,
+    /// Tiles overlap freely, stacking into menus of windows.
+    Full,
+}
+
+impl Overlap {
+    fn name(self) -> &'static str {
+        match self {
+            Overlap::None => "none",
+            Overlap::Border => "border",
+            Overlap::Full => "full",
+        }
+    }
+    fn next(self) -> Overlap {
+        match self {
+            Overlap::None => Overlap::Border,
+            Overlap::Border => Overlap::Full,
+            Overlap::Full => Overlap::None,
+        }
+    }
+}
+
 /// Animation + interaction state for the demo.
 struct Demo {
     /// Seconds of animation elapsed (frozen while paused).
@@ -176,6 +206,8 @@ struct Demo {
     /// Live telemetry encoded as ASCII bytes, rebuilt once per frame and streamed
     /// out through the border gaps as a scrolling binary feed (see `stream_bit`).
     telemetry: Vec<u8>,
+    /// Surf-mode tile packing: free-floating, shared-wall, or stacked.
+    overlap: Overlap,
 }
 
 impl Demo {
@@ -192,6 +224,7 @@ impl Demo {
             last_cells: 0,
             frames: 0,
             telemetry: Vec::new(),
+            overlap: Overlap::Border,
         }
     }
 
@@ -392,7 +425,10 @@ impl Demo {
         // sharp chop becomes little floating boxes.
         let drop = 0.10;
         let maxr = 11;
+        // Already-placed tile rects (grid coords, inclusive) for overlap control.
+        let mut placed: Vec<(i32, i32, i32, i32)> = Vec::new();
         for &(cx, cy, v) in &tiles {
+            // Grow each side to the crest's breadth (field still within `drop`).
             let mut rl = 0;
             while rl < maxr && cx - rl - 1 >= 0 && at(&fld, cx - rl - 1, cy) >= v - drop {
                 rl += 1;
@@ -409,10 +445,89 @@ impl Demo {
             while rd < maxr && cy + rd + 1 < h && at(&fld, cx, cy + rd + 1) >= v - drop {
                 rd += 1;
             }
+
+            // Clip against placed tiles to honour the overlap mode. Tiles are
+            // taken strongest-crest first, so the tallest peaks keep their size
+            // and weaker ones shrink to fit around them. `None` keeps a 1-cell
+            // gap; `Border` allows a shared wall but no interior overlap; `Full`
+            // does nothing (free stacking).
+            if self.overlap != Overlap::Full {
+                let mut guard = 0;
+                loop {
+                    guard += 1;
+                    if guard > 128 || rl + rr < 2 || ru + rd < 2 {
+                        break;
+                    }
+                    let (cx0, cy0, cx1, cy1) = (cx - rl, cy - ru, cx + rr, cy + rd);
+                    let mut hit: Option<(i32, i32)> = None;
+                    for &(px0, py0, px1, py1) in &placed {
+                        let conflict = match self.overlap {
+                            // Require a clear cell all around the candidate.
+                            Overlap::None => {
+                                cx0 - 1 <= px1
+                                    && px0 <= cx1 + 1
+                                    && cy0 - 1 <= py1
+                                    && py0 <= cy1 + 1
+                            }
+                            // Overlap of >1 cell on *both* axes means interiors
+                            // intersect; a shared wall/corner (<=1) is allowed.
+                            Overlap::Border => {
+                                let ow = cx1.min(px1) - cx0.max(px0) + 1;
+                                let oh = cy1.min(py1) - cy0.max(py0) + 1;
+                                ow >= 2 && oh >= 2
+                            }
+                            Overlap::Full => false,
+                        };
+                        if conflict {
+                            hit = Some(((px0 + px1) / 2, (py0 + py1) / 2));
+                            break;
+                        }
+                    }
+                    let Some((pcx, pcy)) = hit else { break };
+                    // Shrink the side facing the blocker; fall back to any side.
+                    let mut cut = false;
+                    if (pcx - cx).abs() >= (pcy - cy).abs() {
+                        if pcx >= cx && rr > 0 {
+                            rr -= 1;
+                            cut = true;
+                        } else if rl > 0 {
+                            rl -= 1;
+                            cut = true;
+                        }
+                        if !cut && rd > 0 {
+                            rd -= 1;
+                            cut = true;
+                        } else if !cut && ru > 0 {
+                            ru -= 1;
+                            cut = true;
+                        }
+                    } else {
+                        if pcy >= cy && rd > 0 {
+                            rd -= 1;
+                            cut = true;
+                        } else if ru > 0 {
+                            ru -= 1;
+                            cut = true;
+                        }
+                        if !cut && rr > 0 {
+                            rr -= 1;
+                            cut = true;
+                        } else if !cut && rl > 0 {
+                            rl -= 1;
+                            cut = true;
+                        }
+                    }
+                    if !cut {
+                        break;
+                    }
+                }
+            }
+
             let (tw, th) = (rl + rr + 1, ru + rd + 1);
             if tw < 3 || th < 3 {
                 continue;
             }
+            placed.push((cx - rl, cy - ru, cx + rr, cy + rd));
             // Per-crest colour seed: golden-angle hue tied to position so tiles
             // stay distinct yet shift gently as their crest drifts.
             let level = (cx + cy * 7) as usize;
@@ -501,8 +616,8 @@ impl Demo {
         let zoom = if self.zoom_on { "on" } else { "off" };
         let text = match self.mode {
             Mode::Tree => format!(
-                " surf · {:>3.0} fps · {} cells · {}x{}  │  s single  t spiral  ± detail  q quit ",
-                self.fps, self.last_cells, area.width, area.height
+                " surf · overlap {} · {:>3.0} fps · {} cells · {}x{}  │  s single  o overlap  ± detail  q quit ",
+                self.overlap.name(), self.fps, self.last_cells, area.width, area.height
             ),
             _ => format!(
                 " swarm · {} spirals · zoom {} · {:>3.0} fps · {} cells · {}x{}  │  s single  z zoom  ± depth  [ ] curl  r reverse  q quit ",
