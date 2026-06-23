@@ -792,7 +792,7 @@ fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
             // Pin the bit to the absolute column so the gap is a window sliding
             // over a fixed broadcast; `band` offsets each band into the stream.
             let one = stream_bit(msg, x as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
-            let ch = if one { '▮' } else { '◻' }; // vertical bar = 1, square = 0
+            let ch = if one { '◼' } else { '◻' }; // solid square = 1, open square = 0
             p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
@@ -818,10 +818,10 @@ fn v_edge(p: &mut Painter, x: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
         let span = (cb - ca + 1).max(1) as f32;
         for y in ca..=cb {
             let pos = (y - ca) as f32 / span;
-            // Same broadcast, read top-to-bottom; horizontal bar reads as 1
-            // along a vertical edge the way a vertical bar does on a row.
+            // Same broadcast, read top-to-bottom; solid square reads as 1,
+            // open square as 0 — the same bit glyphs the horizontal edges use.
             let one = stream_bit(msg, y as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
-            let ch = if one { '▬' } else { '◻' }; // horizontal bar = 1, square = 0
+            let ch = if one { '◼' } else { '◻' }; // solid square = 1, open square = 0
             p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
