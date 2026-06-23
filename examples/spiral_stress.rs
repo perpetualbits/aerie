@@ -2,12 +2,13 @@
 //
 // spiral_stress — a mullion stress + "wow" demo.
 //
-// The default scene is a REFLOW FIELD: one framed box whose border carries 4–8
-// gaps that travel *around the corners* (via `Field::perimeter`), holding a 2×2
-// drift of tiles. Each tile wraps a paragraph that re-flows as the tile breathes
-// (`text::wrap`), and every glyph is tinted by a Gray-Scott reaction-diffusion
-// colour field (`colorfield::Reaction`) sampled at the cell — three of mullion's
-// newer capabilities at once. Press `s` for the spiral swarm, `t` for the surf.
+// The default scene is a REFLOW FIELD: a recursive fractal of wandering windows.
+// Every box — at every level — is filled with a paragraph that re-flows as the
+// box breathes (`text::wrap`), coloured through the Field abstraction by a `Wave`
+// colour source (`colorfield::Wave`, `Field::rect`); carries 4–8 bookended
+// bitstream gaps that wander around its border and slide across its corners (via
+// `Field::perimeter`); and holds four smaller wandering windows of its own,
+// recursing 3–4 levels deep. Press `s` for the spiral swarm, `t` for the surf.
 //
 // The SWARM/single-spiral scene draws a stack of nested, empty rectangular frames
 // whose arrangement starts out like a Fibonacci / golden-rectangle spiral, then
@@ -54,7 +55,7 @@ use mullion::ease::{gaussian, smoothstep};
 use mullion::input::{KeyCode, KeyModifiers};
 use mullion::layout::{self, Constraint, Node, Orientation, Size, TileId};
 use mullion::style::{Color, Modifier, Style};
-use mullion::colorfield::{Palette, Reaction};
+use mullion::colorfield::{Palette, Wave};
 use mullion::field::Field;
 use mullion::text::{wrap, BaseDirection};
 use mullion::{poll_event, Buffer, Rect, Terminal};
@@ -218,9 +219,6 @@ struct Demo {
     telemetry: Vec<u8>,
     /// Surf-mode tile packing: free-floating, shared-wall, or stacked.
     overlap: Overlap,
-    /// Gray-Scott reaction-diffusion field that colours the reflow tiles' text.
-    /// Rebuilt when the box interior changes size; stepped each unpaused frame.
-    reaction: Option<Reaction>,
 }
 
 impl Demo {
@@ -238,7 +236,6 @@ impl Demo {
             frames: 0,
             telemetry: Vec::new(),
             overlap: Overlap::Border,
-            reaction: None,
         }
     }
 
@@ -746,101 +743,173 @@ impl Demo {
         text_port(p, mid, y, &text, x0, x1, st);
     }
 
-    /// The **reflow field** scene (replaces the single spiral). One framed box
-    /// whose border carries 4–8 gaps that travel *around the corners*, holding a
-    /// drift of tiles. Each tile wraps a paragraph that re-flows as the tile
-    /// breathes, and every glyph is tinted by a Gray-Scott reaction-diffusion
-    /// field sampled at the cell — three new mullion capabilities at once:
-    /// [`Field::perimeter`], per-tile [`wrap`], and [`Reaction`].
-    fn draw_reflow(&mut self, p: &mut Painter, area: Rect) {
+    /// The **reflow field** scene (replaces the single spiral): a recursive
+    /// fractal of wandering windows. Every box — at every level — is filled with
+    /// text coloured through the Field abstraction by a [`Wave`] colour source,
+    /// carries 4–8 bookended bitstream gaps that wander around its border and
+    /// across its corners, and holds four smaller wandering windows of its own,
+    /// recursing 3–4 levels deep (as far as the box size allows).
+    fn draw_reflow(&self, p: &mut Painter, area: Rect) {
         let t = self.t;
+        // One coherent wave field underlies the whole screen; every box samples
+        // it at the cell's absolute position, so the colour flows across the
+        // nested windows rather than restarting in each. "Wave" colour source.
+        let wave = Wave::flag();
         let (x0, y0) = (area.x as i32, area.y as i32);
         let (x1, y1) = (area.right() as i32 - 1, area.bottom() as i32 - 1);
-        if x1 - x0 < 6 || y1 - y0 < 4 {
-            return;
-        }
-        let tele = self.telemetry.clone();
+        self.draw_window(p, x0, y0, x1, y1, 0, t, &wave, area, 1);
 
-        // Outer frame: full perimeter (corners + clean side bars). The gaps are
-        // punched on top afterwards so they can slide across the corners.
-        p.put(x0, y0, '╭', loop_color(x0, y0, x0, y0, x1, y1, t, 0));
-        p.put(x1, y0, '╮', loop_color(x1, y0, x0, y0, x1, y1, t, 0));
-        p.put(x0, y1, '╰', loop_color(x0, y1, x0, y0, x1, y1, t, 0));
-        p.put(x1, y1, '╯', loop_color(x1, y1, x0, y0, x1, y1, t, 0));
-        h_edge(p, y0, x0, y0, x1, y1, &[], t, 0, 0, &tele);
-        h_edge(p, y1, x0, y0, x1, y1, &[], t, 0, 0, &tele);
-        v_edge(p, x0, x0, y0, x1, y1, &[], t, 0, 0, &tele);
-        v_edge(p, x1, x0, y0, x1, y1, &[], t, 0, 0, &tele);
-
-        // Reaction-diffusion colour field over the interior; advance it while live.
+        // A slim HUD footer one row inside the bottom edge, over everything.
         let inner = Rect::new(
             area.x + 1,
             area.y + 1,
             area.width.saturating_sub(2),
             area.height.saturating_sub(2),
         );
-        self.ensure_reaction(inner);
-        if !self.paused {
-            if let Some(r) = self.reaction.as_mut() {
-                for _ in 0..12 {
-                    r.step(Reaction::MAZE.0, Reaction::MAZE.1);
-                }
-            }
-        }
-
-        // Gaps travelling around the perimeter, crossing the corners.
-        self.draw_perimeter_gaps(p, area, t, &tele);
-
-        // Tiles with reflowed, reaction-coloured text.
-        self.draw_reflow_tiles(p, inner, t);
-
-        // A slim HUD footer one row inside the bottom edge, so the border (and
-        // its corner-crossing gaps) stays unobscured.
         self.draw_reflow_hud(p, area, inner);
     }
 
-    /// (Re)build the reaction-diffusion field to match the box interior, seeding
-    /// and pre-blooming it so a pattern is already present on the first frame.
-    fn ensure_reaction(&mut self, inner: Rect) {
-        let (w, h) = (inner.width.max(1), inner.height.max(1));
-        let stale = match &self.reaction {
-            Some(r) => r.width() != w || r.height() != h,
-            None => true,
-        };
-        if stale {
-            let seed = 0x00C0_FFEE_u64 ^ ((w as u64) << 20) ^ ((h as u64) << 4);
-            let mut r = Reaction::seeded(w, h, seed);
-            // Pre-bloom so the labyrinth has spread across the dish on frame one.
-            for _ in 0..900 {
-                r.step(Reaction::MAZE.0, Reaction::MAZE.1);
+    /// Draw one window of the reflow fractal, then recurse into four wandering
+    /// children. `depth` is the nesting level (0 = root); `seed` distinguishes
+    /// sibling boxes so their gaps and text differ. `area` is the whole screen,
+    /// used to sample the global wave field.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_window(
+        &self,
+        p: &mut Painter,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        depth: usize,
+        t: f32,
+        wave: &Wave,
+        area: Rect,
+        seed: u64,
+    ) {
+        if x1 - x0 < 4 || y1 - y0 < 3 {
+            return;
+        }
+        let lvl = depth + 1;
+
+        // Frame: corners + clean side bars (gaps punched on top afterwards).
+        p.put(x0, y0, '╭', loop_color(x0, y0, x0, y0, x1, y1, t, lvl));
+        p.put(x1, y0, '╮', loop_color(x1, y0, x0, y0, x1, y1, t, lvl));
+        p.put(x0, y1, '╰', loop_color(x0, y1, x0, y0, x1, y1, t, lvl));
+        p.put(x1, y1, '╯', loop_color(x1, y1, x0, y0, x1, y1, t, lvl));
+        h_edge(p, y0, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+        h_edge(p, y1, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+        v_edge(p, x0, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+        v_edge(p, x1, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+
+        // Fill the interior with wave-coloured text (via the Field abstraction).
+        let interior = Rect::new(
+            (x0 + 1) as u16,
+            (y0 + 1) as u16,
+            (x1 - x0 - 1).max(0) as u16,
+            (y1 - y0 - 1).max(0) as u16,
+        );
+        self.fill_text(p, interior, area, t, wave, depth, seed);
+
+        // Bookended bitstream gaps wandering around this box's border.
+        self.draw_box_gaps(p, x0, y0, x1, y1, lvl, t, seed);
+
+        // Recurse: four wandering windows in a drifting 2×2 grid, as deep as the
+        // box size allows (≈3–4 levels on a normal terminal).
+        const MAX_DEPTH: usize = 4;
+        let (iw, ih) = (x1 - x0 - 1, y1 - y0 - 1);
+        let (cw, ch) = (iw / 2, ih / 2);
+        if depth + 1 <= MAX_DEPTH && cw >= 6 && ch >= 5 {
+            for i in 0..4u64 {
+                let fi = i as f32;
+                let (gx, gy) = ((i % 2) as i32, (i / 2) as i32);
+                let cell_x0 = x0 + 1 + gx * cw;
+                let cell_y0 = y0 + 1 + gy * ch;
+                let ds = depth as f32 + seed as f32 * 0.13;
+                let fw = 0.80 + 0.15 * (t * 0.31 + fi + ds).sin();
+                let fh = 0.78 + 0.18 * (t * 0.27 + fi * 1.3 + ds).cos();
+                // clamp upper bounds are ≥ lower bounds thanks to the cw/ch gate.
+                let tw = (cw as f32 * fw).round().clamp(5.0, (cw - 1) as f32) as i32;
+                let th = (ch as f32 * fh).round().clamp(4.0, (ch - 1) as f32) as i32;
+                let fx = 0.5 + 0.5 * (t * 0.23 + fi * 1.7 + ds).sin();
+                let fy = 0.5 + 0.5 * (t * 0.19 + fi * 2.3 + ds).cos();
+                let cx0 = cell_x0 + ((cw - tw).max(0) as f32 * fx).round() as i32;
+                let cy0 = cell_y0 + ((ch - th).max(0) as f32 * fy).round() as i32;
+                self.draw_window(
+                    p,
+                    cx0,
+                    cy0,
+                    cx0 + tw - 1,
+                    cy0 + th - 1,
+                    depth + 1,
+                    t,
+                    wave,
+                    area,
+                    seed.wrapping_mul(4).wrapping_add(i + 1),
+                );
             }
-            self.reaction = Some(r);
         }
     }
 
-    /// Punch 4–8 gaps that travel around the border perimeter. Four *sources*
-    /// each drift around the loop, pulse in width, and split into a diverging
-    /// pair before merging back — so the live gap count breathes between 4 (all
-    /// merged) and 8 (all split). Because the perimeter is one continuous strip
-    /// ([`Field::perimeter`]), a gap window slides across a corner without a
-    /// seam; each open cell reveals the scrolling telemetry bitstream.
-    fn draw_perimeter_gaps(&self, p: &mut Painter, area: Rect, t: f32, msg: &[u8]) {
-        let field = Field::perimeter(area);
-        let plen = field.width() as i32;
-        if plen < 8 {
+    /// Fill `interior` with a wrapped paragraph, colouring each glyph by the
+    /// global [`Wave`] field at its absolute position — rendered through a
+    /// [`Field::rect`] so the colour comes "via the Field abstraction".
+    fn fill_text(
+        &self,
+        p: &mut Painter,
+        interior: Rect,
+        area: Rect,
+        t: f32,
+        wave: &Wave,
+        level: usize,
+        seed: u64,
+    ) {
+        if interior.width == 0 || interior.height == 0 {
             return;
         }
+        let idx = (level.wrapping_add(seed as usize)) % PASSAGES.len();
+        let wrapped = wrap(PASSAGES[idx], interior.width, BaseDirection::Ltr);
+        let lines = wrapped.lines();
+        let field = Field::rect(interior);
+        let (aw, ah) = (area.width.max(1) as f32, area.height.max(1) as f32);
+        let mut count = 0usize;
+        field.paint(p.buf, |col, row| {
+            let cell = lines.get(row as usize)?.cells.get(col as usize)?;
+            let x = interior.x as f32 + col as f32;
+            let y = interior.y as f32 + row as f32;
+            let val = wave.value(x / aw, y / ah, t);
+            count += 1;
+            Some((cell.symbol.clone(), Style::default().fg(Palette::Rainbow.color(val))))
+        });
+        p.cells += count;
+    }
+
+    /// Punch 4–8 **bookended** gaps that wander around this box's border and
+    /// cross its corners. Four sources each drift, pulse in width, and split
+    /// into a diverging pair before merging, so the live gap count breathes
+    /// between 4 (all merged) and 8 (all split). The border is one continuous
+    /// strip ([`Field::perimeter`]), so a window slides across a corner without
+    /// a seam; each opening is capped by `┤├` / `┴┬` bookends and reveals the
+    /// scrolling telemetry bitstream between them.
+    fn draw_box_gaps(&self, p: &mut Painter, x0: i32, y0: i32, x1: i32, y1: i32, level: usize, t: f32, seed: u64) {
+        let r = Rect::new(x0 as u16, y0 as u16, (x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16);
+        let field = Field::perimeter(r);
+        let plen = field.width() as i32;
+        if plen < 12 {
+            return;
+        }
+        let msg = &self.telemetry;
+        let sd = seed as f32;
         const SOURCES: usize = 4;
         for s in 0..SOURCES {
-            let fs = s as f32;
-            let dir = if s % 2 == 0 { 1.0_f32 } else { -1.0 };
-            // Centre drifts around the loop; width pulses; split factor breathes.
-            let centre = ((fs / SOURCES as f32) + 0.04 * t * dir + 0.03 * (t * 0.3 + fs).sin())
+            let fs = s as f32 + sd * 0.37;
+            let dir = if (s + seed as usize) % 2 == 0 { 1.0_f32 } else { -1.0 };
+            let centre = ((s as f32 / SOURCES as f32) + 0.04 * t * dir + 0.03 * (t * 0.3 + fs).sin() + sd * 0.13)
                 .rem_euclid(1.0)
                 * plen as f32;
-            let hw = plen as f32 * (0.015 + 0.02 * ((t * 0.7 + fs * 1.7).sin() * 0.5 + 0.5));
+            let hw = plen as f32 * (0.02 + 0.025 * ((t * 0.7 + fs * 1.7).sin() * 0.5 + 0.5));
             let split = (t * 0.5 + fs * 2.1).sin() * 0.5 + 0.5;
-            let sep = plen as f32 * 0.05 * split;
+            let sep = plen as f32 * 0.06 * split;
             let centres: [f32; 2] = if split < 0.25 {
                 [centre, f32::NAN]
             } else {
@@ -853,15 +922,19 @@ impl Demo {
                 if c.is_nan() {
                     continue;
                 }
-                let band = s * 3 + gi + 1;
                 let a = (c - hw).floor() as i32;
                 let b = (c + hw).ceil() as i32;
+                if b - a < 2 {
+                    continue; // need room for two bookend caps
+                }
+                let band = (seed as usize).wrapping_mul(7).wrapping_add(s * 3 + gi + 1);
+                self.put_cap(p, &field, plen, a, a - 1, x0, y0, x1, y1, level, t);
+                self.put_cap(p, &field, plen, b, b + 1, x0, y0, x1, y1, level, t);
                 let span = (b - a).max(1) as f32;
-                for k in a..=b {
+                for k in a + 1..b {
                     let kk = k.rem_euclid(plen);
                     if let Some((x, y)) = field.cell(kk as u16, 0) {
-                        let one =
-                            stream_bit(msg, kk as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
+                        let one = stream_bit(msg, kk as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
                         let ch = if one { '▪' } else { '▫' };
                         let pos = (k - a) as f32 / span;
                         p.put(x as i32, y as i32, ch, stream_color(pos, t, band, dir, one));
@@ -871,68 +944,25 @@ impl Demo {
         }
     }
 
-    /// Lay out a drift of tiles inside `inner`, each a small framed box whose
-    /// paragraph wraps to its current interior width — so the text re-flows as
-    /// the tile breathes — with every glyph tinted by the reaction-diffusion
-    /// field at that cell.
-    fn draw_reflow_tiles(&self, p: &mut Painter, inner: Rect, t: f32) {
-        if inner.width < 24 || inner.height < 12 {
-            return;
-        }
-        const N: usize = 4;
-        // A 2×2 grid of cells; each tile drifts and breathes *within* its own
-        // cell so the four stay legible instead of piling up. The bottom row of
-        // the interior is reserved for the HUD footer.
-        let usable_h = inner.height as i32 - 1;
-        let cw = inner.width as i32 / 2;
-        let ch = usable_h / 2;
-        for i in 0..N {
-            let fi = i as f32;
-            let (gx, gy) = ((i % 2) as i32, (i / 2) as i32);
-            let cell_x0 = inner.x as i32 + gx * cw;
-            let cell_y0 = inner.y as i32 + gy * ch;
-            // Size breathes inside the cell, leaving a 1-cell gutter so adjacent
-            // tiles don't share walls.
-            let fw = 0.78 + 0.16 * (t * 0.31 + fi).sin();
-            let fh = 0.74 + 0.20 * (t * 0.27 + fi * 1.3).cos();
-            let tw = (cw as f32 * fw).round().clamp(12.0, (cw - 1) as f32) as i32;
-            let th = (ch as f32 * fh).round().clamp(6.0, (ch - 1) as f32) as i32;
-            let fx = 0.5 + 0.5 * (t * 0.23 + fi * 1.7).sin();
-            let fy = 0.5 + 0.5 * (t * 0.19 + fi * 2.3).cos();
-            let slack_x = (cw - tw).max(0) as f32;
-            let slack_y = (ch - th).max(0) as f32;
-            let tx0 = cell_x0 + (fx * slack_x).round() as i32;
-            let ty0 = cell_y0 + (fy * slack_y).round() as i32;
-            let (tx1, ty1) = (tx0 + tw - 1, ty0 + th - 1);
-
-            // Tile frame (a distinct hue family per tile via the loop palette).
-            let lvl = i + 1;
-            p.put(tx0, ty0, '╭', loop_color(tx0, ty0, tx0, ty0, tx1, ty1, t, lvl));
-            p.put(tx1, ty0, '╮', loop_color(tx1, ty0, tx0, ty0, tx1, ty1, t, lvl));
-            p.put(tx0, ty1, '╰', loop_color(tx0, ty1, tx0, ty0, tx1, ty1, t, lvl));
-            p.put(tx1, ty1, '╯', loop_color(tx1, ty1, tx0, ty0, tx1, ty1, t, lvl));
-            h_edge(p, ty0, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
-            h_edge(p, ty1, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
-            v_edge(p, tx0, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
-            v_edge(p, tx1, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
-
-            // Reflow the paragraph into the tile interior and colour each cell.
-            let iw = (tw - 2).max(1) as u16;
-            let ih = (th - 2).max(1) as usize;
-            let wrapped = wrap(PASSAGES[i % PASSAGES.len()], iw, BaseDirection::Ltr);
-            for (li, line) in wrapped.lines().iter().take(ih).enumerate() {
-                let sy = ty0 + 1 + li as i32;
-                let mut sx = tx0 + 1;
-                for cell in &line.cells {
-                    let v = self
-                        .reaction
-                        .as_ref()
-                        .map(|r| r.at((sx - inner.x as i32) as u16, (sy - inner.y as i32) as u16))
-                        .unwrap_or(0.0);
-                    p.put_grapheme(sx, sy, &cell.symbol, Style::default().fg(Palette::Rainbow.color(v)));
-                    sx += 1;
-                }
-            }
+    /// Draw the bookend cap for a gap end at perimeter index `idx`, choosing the
+    /// connector glyph that joins the solid border at neighbour index `nidx`
+    /// (`┤`/`├` on a horizontal run, `┴`/`┬` on a vertical one) — so the cap is
+    /// correct even when the gap straddles a corner.
+    #[allow(clippy::too_many_arguments)]
+    fn put_cap(&self, p: &mut Painter, field: &Field, plen: i32, idx: i32, nidx: i32, x0: i32, y0: i32, x1: i32, y1: i32, level: usize, t: f32) {
+        let cell = field.cell(idx.rem_euclid(plen) as u16, 0);
+        let neigh = field.cell(nidx.rem_euclid(plen) as u16, 0);
+        if let (Some((x, y)), Some((nx, ny))) = (cell, neigh) {
+            let cap = if ny < y {
+                '┴'
+            } else if ny > y {
+                '┬'
+            } else if nx < x {
+                '┤'
+            } else {
+                '├'
+            };
+            p.put(x as i32, y as i32, cap, loop_color(x as i32, y as i32, x0, y0, x1, y1, t, level));
         }
     }
 
@@ -995,17 +1025,6 @@ impl<'a> Painter<'a> {
             self.put(cx, y, ch, st);
             cx += 1;
         }
-    }
-
-    /// Write a single grapheme cluster (a `VisualCell` symbol) at one cell.
-    fn put_grapheme(&mut self, x: i32, y: i32, g: &str, st: Style) {
-        let bx = self.b.x as i32;
-        let by = self.b.y as i32;
-        if x < bx || y < by || x >= bx + self.b.width as i32 || y >= by + self.b.height as i32 {
-            return;
-        }
-        self.buf.set_grapheme(x as u16, y as u16, g, st);
-        self.cells += 1;
     }
 }
 
