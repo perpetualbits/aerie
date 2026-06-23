@@ -50,6 +50,11 @@
 //        [ / ]             tighten / loosen the curl
 //        r                 reverse the curl direction
 //
+// Set SPIRAL_VIDEO=/path/to/clip to feed the braille video panels with real
+// footage: the demo spawns `ffmpeg … -f rawvideo -pix_fmt gray -` and plays its
+// frames. Without it (or if ffmpeg isn't found) the panels show a synthesised
+// channel. Requires `ffmpeg` on PATH.
+//
 // This example only depends on `mullion` and `crossterm`, both already in
 // aerie's dependency set; it does not touch the aerie binary.
 
@@ -65,7 +70,10 @@ use mullion::colorfield::{Palette, Wave};
 use mullion::field::Field;
 use mullion::text::{wrap, BaseDirection};
 use mullion::{poll_event, Buffer, Rect, Terminal};
-use std::io;
+use std::io::{self, Read};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Target frame budget. ~60 fps; the poll timeout caps how long we wait for
@@ -102,15 +110,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut backend = CrosstermBackend::new(io::stdout());
-    backend.apply_capabilities(&Capabilities::detect());
-    let mut terminal = Terminal::new(backend)?;
-    terminal.enter()?;
-
+    // Build the demo first — this may spawn the ffmpeg video source and print a
+    // fallback note — before we switch into the alternate screen.
     let mut state = Demo::new();
     if args.iter().any(|a| a == "--swarm") {
         state.mode = Mode::Swarm;
     }
+
+    let mut backend = CrosstermBackend::new(io::stdout());
+    backend.apply_capabilities(&Capabilities::detect());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.enter()?;
     let mut last = Instant::now();
 
     // Run the loop in a closure so a `?` early-exit still falls through to the
@@ -225,6 +235,8 @@ struct Demo {
     telemetry: Vec<u8>,
     /// Surf-mode tile packing: free-floating, shared-wall, or stacked.
     overlap: Overlap,
+    /// Source feeding the braille video panels (synthesised, or ffmpeg footage).
+    video: Box<dyn VideoSource>,
 }
 
 impl Demo {
@@ -242,6 +254,7 @@ impl Demo {
             frames: 0,
             telemetry: Vec::new(),
             overlap: Overlap::Border,
+            video: make_video_source(),
         }
     }
 
@@ -290,6 +303,9 @@ impl Demo {
 
         let spirals = match self.mode {
             Mode::Single => {
+                if !self.paused {
+                    self.video.tick(self.t);
+                }
                 self.draw_reflow(&mut p, area);
                 1
             }
@@ -820,7 +836,7 @@ impl Demo {
         );
         match window_kind(seed, depth) {
             WindowKind::Static => self.fill_static(p, interior, t),
-            WindowKind::Video => self.fill_video(p, interior, t, seed),
+            WindowKind::Video => self.fill_video(p, interior),
             WindowKind::Text => self.fill_text(p, interior, area, t, wave, depth, seed),
         }
 
@@ -933,28 +949,27 @@ impl Demo {
         p.cells += count;
     }
 
-    /// Fill `interior` with a **braille video panel** — a TV playing a channel.
-    ///
-    /// This is the video-to-characters pipe: a `W×H` luma frame buffer is
-    /// produced (here by [`synth_frame`]; in a real build you would instead
-    /// `io::stdin().read_exact(&mut frame)` on an `ffmpeg … -f rawvideo
-    /// -pix_fmt gray -` stream), then dithered to braille by
-    /// [`Field::render_braille`]. The frame is sized to the panel's sub-pixel
-    /// grid (2×4 per cell), so one source pixel maps to one braille dot.
-    fn fill_video(&self, p: &mut Painter, interior: Rect, t: f32, seed: u64) {
+    /// Fill `interior` with a **braille video panel** — a TV playing the current
+    /// channel. The shared [`VideoSource`] frame (a `W×H` luma buffer) is sampled
+    /// per braille sub-pixel and dithered by [`Field::render_braille`], so the
+    /// fixed-resolution frame is resampled to whatever size this window is. All
+    /// video windows show the same broadcast at their own scale.
+    fn fill_video(&self, p: &mut Painter, interior: Rect) {
         if interior.width == 0 || interior.height == 0 {
             return;
         }
-        let (sw, sh) = (interior.width as usize * 2, interior.height as usize * 4);
-        let mut frame = vec![0u8; sw * sh];
-        synth_frame(&mut frame, sw, sh, t, seed); // ← swap for an ffmpeg rawvideo read
+        let (fw, fh) = self.video.dims();
+        if fw == 0 || fh == 0 {
+            return;
+        }
+        let frame = self.video.frame();
         let field = Field::rect(interior);
         field.render_braille(
             p.buf,
             |u, v| {
-                let fx = ((u * sw as f32) as usize).min(sw - 1);
-                let fy = ((v * sh as f32) as usize).min(sh - 1);
-                frame[fy * sw + fx] as f32 / 255.0
+                let fx = ((u * fw as f32) as usize).min(fw - 1);
+                let fy = ((v * fh as f32) as usize).min(fh - 1);
+                frame[fy * fw + fx] as f32 / 255.0
             },
             // Cool CRT phosphor: brighter content glows whiter-blue.
             |mean| Style::default().fg(Color::from_hsv(195.0, 0.30, (0.20 + 0.80 * mean).clamp(0.0, 1.0))),
@@ -1052,8 +1067,8 @@ impl Demo {
         }
         let y = (inner.y + inner.height - 1) as i32;
         let full = format!(
-            " reflow · {:>3.0} fps · {} cells · {}x{}  │  s swarm  t surf  space pause  q quit ",
-            self.fps, self.last_cells, area.width, area.height
+            " reflow · {:>3.0} fps · {} cells · vid:{} · {}x{}  │  s swarm  t surf  space pause  q quit ",
+            self.fps, self.last_cells, self.video.label(), area.width, area.height
         );
         let w = inner.width as usize;
         let text: String = full.chars().take(w).collect();
@@ -1403,6 +1418,144 @@ fn synth_frame(buf: &mut [u8], w: usize, h: usize, t: f32, seed: u64) {
             buf[fy * w + fx] = (val * 255.0) as u8;
         }
     }
+}
+
+/// Frame resolution decoded for the video panels. Fixed and independent of any
+/// window's size — each panel resamples it to its own braille grid.
+const VIDEO_W: usize = 192;
+const VIDEO_H: usize = 108;
+
+/// A source of grayscale video frames for the braille panels. Yields the latest
+/// frame as a fixed-resolution `W×H` row-major luma buffer.
+trait VideoSource {
+    /// Frame dimensions (constant for the source's lifetime).
+    fn dims(&self) -> (usize, usize);
+    /// The latest frame, row-major 8-bit luma, `len() == w * h`.
+    fn frame(&self) -> &[u8];
+    /// Refresh the current frame: regenerate (synth) or pull the newest decoded
+    /// frame (ffmpeg). Called once per rendered frame. `t` is animation time.
+    fn tick(&mut self, t: f32);
+    /// Short label for the HUD (`synth` / `ffmpeg`).
+    fn label(&self) -> &'static str;
+}
+
+/// A synthesised channel — the moving test pattern from [`synth_frame`]. Stands
+/// in for real footage when no `SPIRAL_VIDEO` clip is configured.
+struct SynthSource {
+    w: usize,
+    h: usize,
+    frame: Vec<u8>,
+}
+
+impl SynthSource {
+    fn new(w: usize, h: usize) -> Self {
+        Self { w, h, frame: vec![0u8; w * h] }
+    }
+}
+
+impl VideoSource for SynthSource {
+    fn dims(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+    fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+    fn tick(&mut self, t: f32) {
+        synth_frame(&mut self.frame, self.w, self.h, t, 0);
+    }
+    fn label(&self) -> &'static str {
+        "synth"
+    }
+}
+
+/// Real footage: spawns `ffmpeg … -f rawvideo -pix_fmt gray -` once and a reader
+/// thread pumps decoded `W×H` luma frames into a shared buffer. [`tick`] snapshots
+/// the newest one. The child is killed on drop, which ends the reader thread.
+struct FfmpegSource {
+    w: usize,
+    h: usize,
+    frame: Vec<u8>,
+    shared: Arc<Mutex<Vec<u8>>>,
+    child: Child,
+}
+
+impl FfmpegSource {
+    fn new(path: &str, w: usize, h: usize) -> io::Result<Self> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-loglevel", "error",
+                "-re", // pace input at native frame rate
+                "-stream_loop", "-1", // loop the clip forever
+                "-i", path,
+                "-vf", &format!("scale={w}:{h}"),
+                "-pix_fmt", "gray",
+                "-f", "rawvideo",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let mut out = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("ffmpeg produced no stdout"))?;
+        let shared = Arc::new(Mutex::new(vec![0u8; w * h]));
+        let writer = Arc::clone(&shared);
+        let frame_len = w * h;
+        thread::spawn(move || {
+            let mut buf = vec![0u8; frame_len];
+            // Read whole frames until the pipe closes (EOF or the child is killed).
+            while out.read_exact(&mut buf).is_ok() {
+                if let Ok(mut g) = writer.lock() {
+                    g.copy_from_slice(&buf);
+                }
+            }
+        });
+
+        Ok(Self { w, h, frame: vec![0u8; w * h], shared, child })
+    }
+}
+
+impl Drop for FfmpegSource {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl VideoSource for FfmpegSource {
+    fn dims(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+    fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+    fn tick(&mut self, _t: f32) {
+        if let Ok(g) = self.shared.lock() {
+            self.frame.copy_from_slice(&g);
+        }
+    }
+    fn label(&self) -> &'static str {
+        "ffmpeg"
+    }
+}
+
+/// Pick the video source: an ffmpeg stream of `$SPIRAL_VIDEO` if that points at a
+/// playable clip, otherwise the synthesised channel. Falls back (with a note)
+/// rather than failing if ffmpeg can't be spawned.
+fn make_video_source() -> Box<dyn VideoSource> {
+    if let Ok(path) = std::env::var("SPIRAL_VIDEO") {
+        if !path.is_empty() {
+            match FfmpegSource::new(&path, VIDEO_W, VIDEO_H) {
+                Ok(src) => return Box::new(src),
+                Err(e) => {
+                    eprintln!("spiral_stress: could not start ffmpeg for SPIRAL_VIDEO ({e}); using synth");
+                }
+            }
+        }
+    }
+    Box::new(SynthSource::new(VIDEO_W, VIDEO_H))
 }
 
 /// Cells the bitstream scrolls past per second of animation time.
