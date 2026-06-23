@@ -2,11 +2,18 @@
 //
 // spiral_stress — a mullion stress + "wow" demo.
 //
-// It draws a stack of nested, empty rectangular frames whose arrangement
-// starts out like a Fibonacci / golden-rectangle spiral, then continuously
-// *uncurls* through a concentric state and *re-curls the other way* — the kind
-// of morphing you see in Electric Sheep fractals, but expressed purely in the
-// shape and placement of TUI boxes.
+// The default scene is a REFLOW FIELD: one framed box whose border carries 4–8
+// gaps that travel *around the corners* (via `Field::perimeter`), holding a 2×2
+// drift of tiles. Each tile wraps a paragraph that re-flows as the tile breathes
+// (`text::wrap`), and every glyph is tinted by a Gray-Scott reaction-diffusion
+// colour field (`colorfield::Reaction`) sampled at the cell — three of mullion's
+// newer capabilities at once. Press `s` for the spiral swarm, `t` for the surf.
+//
+// The SWARM/single-spiral scene draws a stack of nested, empty rectangular frames
+// whose arrangement starts out like a Fibonacci / golden-rectangle spiral, then
+// continuously *uncurls* through a concentric state and *re-curls the other way* —
+// the kind of morphing you see in Electric Sheep fractals, but expressed purely
+// in the shape and placement of TUI boxes.
 //
 // On top of that it demonstrates that the boxes are not static furniture: the
 // sides carry "openings" (gaps in the border) that slide, grow, shrink, and
@@ -30,7 +37,7 @@
 // Run:   cargo run --release --example spiral_stress [--swarm]
 // Keys:  q / Esc / Ctrl-C  quit
 //        space             pause / resume the animation
-//        s                 toggle single / swarm mode
+//        s                 toggle reflow field / swarm mode
 //        z                 toggle the animated zoom (swarm mode)
 //        + / -             more / fewer nested boxes (depth)
 //        [ / ]             tighten / loosen the curl
@@ -47,6 +54,9 @@ use mullion::ease::{gaussian, smoothstep};
 use mullion::input::{KeyCode, KeyModifiers};
 use mullion::layout::{self, Constraint, Node, Orientation, Size, TileId};
 use mullion::style::{Color, Modifier, Style};
+use mullion::colorfield::{Palette, Reaction};
+use mullion::field::Field;
+use mullion::text::{wrap, BaseDirection};
 use mullion::{poll_event, Buffer, Rect, Terminal};
 use std::io;
 use std::time::{Duration, Instant};
@@ -68,7 +78,7 @@ OPTIONS:
 KEYS (while running):
     q, Esc       Quit
     space        Pause / resume the animation
-    s            Toggle single spiral <-> swarm grid
+    s            Toggle reflow field <-> swarm grid
     t            Toggle the surf field (floating tiles riding a 2-D wave field)
     o            Surf tile overlap: cycle none / border / full
     z            Toggle the swarm auto-zoom
@@ -208,6 +218,9 @@ struct Demo {
     telemetry: Vec<u8>,
     /// Surf-mode tile packing: free-floating, shared-wall, or stacked.
     overlap: Overlap,
+    /// Gray-Scott reaction-diffusion field that colours the reflow tiles' text.
+    /// Rebuilt when the box interior changes size; stepped each unpaused frame.
+    reaction: Option<Reaction>,
 }
 
 impl Demo {
@@ -225,6 +238,7 @@ impl Demo {
             frames: 0,
             telemetry: Vec::new(),
             overlap: Overlap::Border,
+            reaction: None,
         }
     }
 
@@ -273,7 +287,7 @@ impl Demo {
 
         let spirals = match self.mode {
             Mode::Single => {
-                self.draw_spiral(&mut p, area, self.t, true);
+                self.draw_reflow(&mut p, area);
                 1
             }
             Mode::Swarm => self.render_swarm(&mut p, area),
@@ -731,6 +745,220 @@ impl Demo {
         let mid = x0 as f32 + w * (0.5 + 0.12 * (self.t * 0.4).sin());
         text_port(p, mid, y, &text, x0, x1, st);
     }
+
+    /// The **reflow field** scene (replaces the single spiral). One framed box
+    /// whose border carries 4–8 gaps that travel *around the corners*, holding a
+    /// drift of tiles. Each tile wraps a paragraph that re-flows as the tile
+    /// breathes, and every glyph is tinted by a Gray-Scott reaction-diffusion
+    /// field sampled at the cell — three new mullion capabilities at once:
+    /// [`Field::perimeter`], per-tile [`wrap`], and [`Reaction`].
+    fn draw_reflow(&mut self, p: &mut Painter, area: Rect) {
+        let t = self.t;
+        let (x0, y0) = (area.x as i32, area.y as i32);
+        let (x1, y1) = (area.right() as i32 - 1, area.bottom() as i32 - 1);
+        if x1 - x0 < 6 || y1 - y0 < 4 {
+            return;
+        }
+        let tele = self.telemetry.clone();
+
+        // Outer frame: full perimeter (corners + clean side bars). The gaps are
+        // punched on top afterwards so they can slide across the corners.
+        p.put(x0, y0, '╭', loop_color(x0, y0, x0, y0, x1, y1, t, 0));
+        p.put(x1, y0, '╮', loop_color(x1, y0, x0, y0, x1, y1, t, 0));
+        p.put(x0, y1, '╰', loop_color(x0, y1, x0, y0, x1, y1, t, 0));
+        p.put(x1, y1, '╯', loop_color(x1, y1, x0, y0, x1, y1, t, 0));
+        h_edge(p, y0, x0, y0, x1, y1, &[], t, 0, 0, &tele);
+        h_edge(p, y1, x0, y0, x1, y1, &[], t, 0, 0, &tele);
+        v_edge(p, x0, x0, y0, x1, y1, &[], t, 0, 0, &tele);
+        v_edge(p, x1, x0, y0, x1, y1, &[], t, 0, 0, &tele);
+
+        // Reaction-diffusion colour field over the interior; advance it while live.
+        let inner = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        self.ensure_reaction(inner);
+        if !self.paused {
+            if let Some(r) = self.reaction.as_mut() {
+                for _ in 0..12 {
+                    r.step(Reaction::MAZE.0, Reaction::MAZE.1);
+                }
+            }
+        }
+
+        // Gaps travelling around the perimeter, crossing the corners.
+        self.draw_perimeter_gaps(p, area, t, &tele);
+
+        // Tiles with reflowed, reaction-coloured text.
+        self.draw_reflow_tiles(p, inner, t);
+
+        // A slim HUD footer one row inside the bottom edge, so the border (and
+        // its corner-crossing gaps) stays unobscured.
+        self.draw_reflow_hud(p, area, inner);
+    }
+
+    /// (Re)build the reaction-diffusion field to match the box interior, seeding
+    /// and pre-blooming it so a pattern is already present on the first frame.
+    fn ensure_reaction(&mut self, inner: Rect) {
+        let (w, h) = (inner.width.max(1), inner.height.max(1));
+        let stale = match &self.reaction {
+            Some(r) => r.width() != w || r.height() != h,
+            None => true,
+        };
+        if stale {
+            let seed = 0x00C0_FFEE_u64 ^ ((w as u64) << 20) ^ ((h as u64) << 4);
+            let mut r = Reaction::seeded(w, h, seed);
+            // Pre-bloom so the labyrinth has spread across the dish on frame one.
+            for _ in 0..900 {
+                r.step(Reaction::MAZE.0, Reaction::MAZE.1);
+            }
+            self.reaction = Some(r);
+        }
+    }
+
+    /// Punch 4–8 gaps that travel around the border perimeter. Four *sources*
+    /// each drift around the loop, pulse in width, and split into a diverging
+    /// pair before merging back — so the live gap count breathes between 4 (all
+    /// merged) and 8 (all split). Because the perimeter is one continuous strip
+    /// ([`Field::perimeter`]), a gap window slides across a corner without a
+    /// seam; each open cell reveals the scrolling telemetry bitstream.
+    fn draw_perimeter_gaps(&self, p: &mut Painter, area: Rect, t: f32, msg: &[u8]) {
+        let field = Field::perimeter(area);
+        let plen = field.width() as i32;
+        if plen < 8 {
+            return;
+        }
+        const SOURCES: usize = 4;
+        for s in 0..SOURCES {
+            let fs = s as f32;
+            let dir = if s % 2 == 0 { 1.0_f32 } else { -1.0 };
+            // Centre drifts around the loop; width pulses; split factor breathes.
+            let centre = ((fs / SOURCES as f32) + 0.04 * t * dir + 0.03 * (t * 0.3 + fs).sin())
+                .rem_euclid(1.0)
+                * plen as f32;
+            let hw = plen as f32 * (0.015 + 0.02 * ((t * 0.7 + fs * 1.7).sin() * 0.5 + 0.5));
+            let split = (t * 0.5 + fs * 2.1).sin() * 0.5 + 0.5;
+            let sep = plen as f32 * 0.05 * split;
+            let centres: [f32; 2] = if split < 0.25 {
+                [centre, f32::NAN]
+            } else {
+                [
+                    (centre - sep).rem_euclid(plen as f32),
+                    (centre + sep).rem_euclid(plen as f32),
+                ]
+            };
+            for (gi, &c) in centres.iter().enumerate() {
+                if c.is_nan() {
+                    continue;
+                }
+                let band = s * 3 + gi + 1;
+                let a = (c - hw).floor() as i32;
+                let b = (c + hw).ceil() as i32;
+                let span = (b - a).max(1) as f32;
+                for k in a..=b {
+                    let kk = k.rem_euclid(plen);
+                    if let Some((x, y)) = field.cell(kk as u16, 0) {
+                        let one =
+                            stream_bit(msg, kk as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
+                        let ch = if one { '▪' } else { '▫' };
+                        let pos = (k - a) as f32 / span;
+                        p.put(x as i32, y as i32, ch, stream_color(pos, t, band, dir, one));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lay out a drift of tiles inside `inner`, each a small framed box whose
+    /// paragraph wraps to its current interior width — so the text re-flows as
+    /// the tile breathes — with every glyph tinted by the reaction-diffusion
+    /// field at that cell.
+    fn draw_reflow_tiles(&self, p: &mut Painter, inner: Rect, t: f32) {
+        if inner.width < 24 || inner.height < 12 {
+            return;
+        }
+        const N: usize = 4;
+        // A 2×2 grid of cells; each tile drifts and breathes *within* its own
+        // cell so the four stay legible instead of piling up. The bottom row of
+        // the interior is reserved for the HUD footer.
+        let usable_h = inner.height as i32 - 1;
+        let cw = inner.width as i32 / 2;
+        let ch = usable_h / 2;
+        for i in 0..N {
+            let fi = i as f32;
+            let (gx, gy) = ((i % 2) as i32, (i / 2) as i32);
+            let cell_x0 = inner.x as i32 + gx * cw;
+            let cell_y0 = inner.y as i32 + gy * ch;
+            // Size breathes inside the cell, leaving a 1-cell gutter so adjacent
+            // tiles don't share walls.
+            let fw = 0.78 + 0.16 * (t * 0.31 + fi).sin();
+            let fh = 0.74 + 0.20 * (t * 0.27 + fi * 1.3).cos();
+            let tw = (cw as f32 * fw).round().clamp(12.0, (cw - 1) as f32) as i32;
+            let th = (ch as f32 * fh).round().clamp(6.0, (ch - 1) as f32) as i32;
+            let fx = 0.5 + 0.5 * (t * 0.23 + fi * 1.7).sin();
+            let fy = 0.5 + 0.5 * (t * 0.19 + fi * 2.3).cos();
+            let slack_x = (cw - tw).max(0) as f32;
+            let slack_y = (ch - th).max(0) as f32;
+            let tx0 = cell_x0 + (fx * slack_x).round() as i32;
+            let ty0 = cell_y0 + (fy * slack_y).round() as i32;
+            let (tx1, ty1) = (tx0 + tw - 1, ty0 + th - 1);
+
+            // Tile frame (a distinct hue family per tile via the loop palette).
+            let lvl = i + 1;
+            p.put(tx0, ty0, '╭', loop_color(tx0, ty0, tx0, ty0, tx1, ty1, t, lvl));
+            p.put(tx1, ty0, '╮', loop_color(tx1, ty0, tx0, ty0, tx1, ty1, t, lvl));
+            p.put(tx0, ty1, '╰', loop_color(tx0, ty1, tx0, ty0, tx1, ty1, t, lvl));
+            p.put(tx1, ty1, '╯', loop_color(tx1, ty1, tx0, ty0, tx1, ty1, t, lvl));
+            h_edge(p, ty0, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
+            h_edge(p, ty1, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
+            v_edge(p, tx0, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
+            v_edge(p, tx1, tx0, ty0, tx1, ty1, &[], t, 0, lvl, &[]);
+
+            // Reflow the paragraph into the tile interior and colour each cell.
+            let iw = (tw - 2).max(1) as u16;
+            let ih = (th - 2).max(1) as usize;
+            let wrapped = wrap(PASSAGES[i % PASSAGES.len()], iw, BaseDirection::Ltr);
+            for (li, line) in wrapped.lines().iter().take(ih).enumerate() {
+                let sy = ty0 + 1 + li as i32;
+                let mut sx = tx0 + 1;
+                for cell in &line.cells {
+                    let v = self
+                        .reaction
+                        .as_ref()
+                        .map(|r| r.at((sx - inner.x as i32) as u16, (sy - inner.y as i32) as u16))
+                        .unwrap_or(0.0);
+                    p.put_grapheme(sx, sy, &cell.symbol, Style::default().fg(Palette::Rainbow.color(v)));
+                    sx += 1;
+                }
+            }
+        }
+    }
+
+    /// A compact stress HUD drawn one row inside the bottom edge (so the border
+    /// and its travelling gaps stay clear), spanning the interior width.
+    fn draw_reflow_hud(&self, p: &mut Painter, area: Rect, inner: Rect) {
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+        let y = (inner.y + inner.height - 1) as i32;
+        let full = format!(
+            " reflow · {:>3.0} fps · {} cells · {}x{}  │  s swarm  t surf  space pause  q quit ",
+            self.fps, self.last_cells, area.width, area.height
+        );
+        let w = inner.width as usize;
+        let text: String = full.chars().take(w).collect();
+        let mut padded = text.clone();
+        for _ in padded.chars().count()..w {
+            padded.push(' ');
+        }
+        let st = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(120, 200, 255))
+            .add_modifier(Modifier::BOLD);
+        p.put_str(inner.x as i32, y, &padded, st);
+    }
 }
 
 // --- drawing helpers --------------------------------------------------------
@@ -767,6 +995,17 @@ impl<'a> Painter<'a> {
             self.put(cx, y, ch, st);
             cx += 1;
         }
+    }
+
+    /// Write a single grapheme cluster (a `VisualCell` symbol) at one cell.
+    fn put_grapheme(&mut self, x: i32, y: i32, g: &str, st: Style) {
+        let bx = self.b.x as i32;
+        let by = self.b.y as i32;
+        if x < bx || y < by || x >= bx + self.b.width as i32 || y >= by + self.b.height as i32 {
+            return;
+        }
+        self.buf.set_grapheme(x as u16, y as u16, g, st);
+        self.cells += 1;
     }
 }
 
@@ -990,6 +1229,15 @@ fn loop_color(x: i32, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32, t: f32, le
     let val = (base_val + val_add).clamp(0.1, 1.0);
     Style::default().fg(Color::from_hsv(hue, 0.85, val))
 }
+
+/// Paragraphs flowed inside the reflow-scene tiles. Each tile wraps one of
+/// these to its current interior width and re-wraps it as the tile breathes.
+const PASSAGES: [&str; 4] = [
+    "Mullion re-flows this paragraph inside a tile that breathes: as the box widens and narrows the words re-wrap every frame, and a Gray-Scott reaction-diffusion field tints each glyph by its local concentration.",
+    "Four to eight gaps drift around the border and cross the corners without a seam. They pulse, split into diverging pairs, and merge back together while the live telemetry bitstream scrolls through each opening.",
+    "The perimeter is one continuous strip, so an opening can slide off a side and turn the corner as a single moving window — the corner glyph itself dissolves into the stream and reforms once the gap has passed.",
+    "Colour here is not decoration but data: the same reaction that paints the text is a simulation running under it, feeding and killing concentration so spots divide, drift, and bloom across the wrapped lines.",
+];
 
 /// Cells the bitstream scrolls past per second of animation time.
 const BIT_SPEED: f32 = 5.0;
