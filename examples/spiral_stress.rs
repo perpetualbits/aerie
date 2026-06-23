@@ -868,7 +868,18 @@ impl Demo {
             return;
         }
         let idx = (level.wrapping_add(seed as usize)) % PASSAGES.len();
-        let wrapped = wrap(PASSAGES[idx], interior.width, BaseDirection::Ltr);
+        // Repeat the passage until it has enough characters to fill every row of
+        // the interior, so the tile's free space is packed with text rather than
+        // trailing off into blank rows.
+        let base = PASSAGES[idx];
+        let want = interior.width as usize * interior.height as usize + interior.width as usize;
+        let mut text = String::with_capacity(want.max(base.len()) + base.len());
+        text.push_str(base);
+        while text.len() < want {
+            text.push(' ');
+            text.push_str(base);
+        }
+        let wrapped = wrap(&text, interior.width, BaseDirection::Ltr);
         let lines = wrapped.lines();
         let field = Field::rect(interior);
         let (aw, ah) = (area.width.max(1) as f32, area.height.max(1) as f32);
