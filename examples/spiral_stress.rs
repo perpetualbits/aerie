@@ -3,12 +3,18 @@
 // spiral_stress — a mullion stress + "wow" demo.
 //
 // The default scene is a REFLOW FIELD: a recursive fractal of wandering windows.
-// Every box — at every level — is filled with a paragraph that re-flows as the
-// box breathes (`text::wrap`), coloured through the Field abstraction by a `Wave`
-// colour source (`colorfield::Wave`, `Field::rect`); carries 4–8 bookended
+// Every box — at every level — is filled (most show a paragraph that re-flows as
+// the box breathes, `text::wrap`, coloured through the Field abstraction by a
+// `Wave` colour source; some are little TVs showing braille static or a
+// synthesised braille video via `Field::render_braille`); carries 4–8 bookended
 // bitstream gaps that wander around its border and slide across its corners (via
 // `Field::perimeter`); and holds four smaller wandering windows of its own,
 // recursing 3–4 levels deep. Press `s` for the spiral swarm, `t` for the surf.
+//
+// The braille video panel doubles as a video-to-characters prototype: a W×H luma
+// frame buffer is filled (synthetically in `synth_frame`; swap in a `read_exact`
+// on an `ffmpeg … -f rawvideo -pix_fmt gray -` stream for real footage) and
+// dithered to braille — the same trick libcaca / mpv `--vo=caca` / chafa use.
 //
 // The SWARM/single-spiral scene draws a stack of nested, empty rectangular frames
 // whose arrangement starts out like a Fibonacci / golden-rectangle spiral, then
@@ -802,19 +808,20 @@ impl Demo {
         v_edge(p, x0, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
         v_edge(p, x1, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
 
-        // Fill the interior: most windows show wave-coloured text; some show a
-        // braille noise field instead (a TV tuned to static). Both go through
-        // the Field abstraction; the choice is stable per window.
+        // Fill the interior. Most windows show wave-coloured text; some are TVs —
+        // tuned to braille static, or playing a (synthesised) braille video.
+        // All three go through the Field abstraction; the kind is stable per
+        // window.
         let interior = Rect::new(
             (x0 + 1) as u16,
             (y0 + 1) as u16,
             (x1 - x0 - 1).max(0) as u16,
             (y1 - y0 - 1).max(0) as u16,
         );
-        if window_is_static(seed, depth) {
-            self.fill_static(p, interior, t);
-        } else {
-            self.fill_text(p, interior, area, t, wave, depth, seed);
+        match window_kind(seed, depth) {
+            WindowKind::Static => self.fill_static(p, interior, t),
+            WindowKind::Video => self.fill_video(p, interior, t, seed),
+            WindowKind::Text => self.fill_text(p, interior, area, t, wave, depth, seed),
         }
 
         // Bookended bitstream gaps wandering around this box's border.
@@ -924,6 +931,35 @@ impl Demo {
             Some((glyph.to_string(), Style::default().fg(Color::Rgb(g, g, g))))
         });
         p.cells += count;
+    }
+
+    /// Fill `interior` with a **braille video panel** — a TV playing a channel.
+    ///
+    /// This is the video-to-characters pipe: a `W×H` luma frame buffer is
+    /// produced (here by [`synth_frame`]; in a real build you would instead
+    /// `io::stdin().read_exact(&mut frame)` on an `ffmpeg … -f rawvideo
+    /// -pix_fmt gray -` stream), then dithered to braille by
+    /// [`Field::render_braille`]. The frame is sized to the panel's sub-pixel
+    /// grid (2×4 per cell), so one source pixel maps to one braille dot.
+    fn fill_video(&self, p: &mut Painter, interior: Rect, t: f32, seed: u64) {
+        if interior.width == 0 || interior.height == 0 {
+            return;
+        }
+        let (sw, sh) = (interior.width as usize * 2, interior.height as usize * 4);
+        let mut frame = vec![0u8; sw * sh];
+        synth_frame(&mut frame, sw, sh, t, seed); // ← swap for an ffmpeg rawvideo read
+        let field = Field::rect(interior);
+        field.render_braille(
+            p.buf,
+            |u, v| {
+                let fx = ((u * sw as f32) as usize).min(sw - 1);
+                let fy = ((v * sh as f32) as usize).min(sh - 1);
+                frame[fy * sw + fx] as f32 / 255.0
+            },
+            // Cool CRT phosphor: brighter content glows whiter-blue.
+            |mean| Style::default().fg(Color::from_hsv(195.0, 0.30, (0.20 + 0.80 * mean).clamp(0.0, 1.0))),
+        );
+        p.cells += interior.width as usize * interior.height as usize;
     }
 
     /// Punch 4–8 **bookended** gaps that wander around this box's border and
@@ -1315,11 +1351,58 @@ fn noise_byte(x: u32, y: u32, z: u64) -> u8 {
     (h & 0xFF) as u8
 }
 
-/// Whether a window shows braille static instead of text. A stable per-window
-/// hash (so a given box keeps its type across frames) leaves roughly one window
-/// in three tuned to static.
-fn window_is_static(seed: u64, depth: usize) -> bool {
-    noise_byte(seed as u32, (seed >> 32) as u32, depth as u64) % 3 == 0
+/// What a window's interior is filled with.
+enum WindowKind {
+    /// Wave-coloured flowing text.
+    Text,
+    /// A braille noise field (a TV tuned to static).
+    Static,
+    /// A braille video panel (a TV playing a synthesised channel).
+    Video,
+}
+
+/// Pick a window's content kind from a stable per-window hash (so a given box
+/// keeps its kind across frames): ~¼ static, ~¼ video, ~½ text.
+fn window_kind(seed: u64, depth: usize) -> WindowKind {
+    match noise_byte(seed as u32, (seed >> 32) as u32, depth as u64) % 4 {
+        0 => WindowKind::Static,
+        1 => WindowKind::Video,
+        _ => WindowKind::Text,
+    }
+}
+
+/// Synthesise one `w×h` 8-bit luma frame into `buf` — a stand-in for a decoded
+/// video frame (what `ffmpeg … -f rawvideo -pix_fmt gray -` would hand you, and
+/// what a real build would `read_exact` instead of generating).
+///
+/// The "channel" is a moving test pattern: a travelling plasma wash, a bright
+/// disc bouncing across the screen, and faint CRT scanlines — enough motion and
+/// structure to read clearly as footage once dithered to braille. `seed` phase-
+/// shifts everything so different video windows show different channels.
+fn synth_frame(buf: &mut [u8], w: usize, h: usize, t: f32, seed: u64) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let sd = seed as f32 * 0.7;
+    let aspect = w as f32 / h as f32;
+    // Bouncing disc centre (normalised), distinct per channel.
+    let bx = 0.5 + 0.38 * (t * 1.3 + sd).sin();
+    let by = 0.5 + 0.38 * (t * 1.1 + sd * 0.6).cos();
+    for fy in 0..h {
+        let v = (fy as f32 + 0.5) / h as f32;
+        // Faint scanlines: every other source row a touch dimmer.
+        let scan = if fy % 2 == 0 { 1.0 } else { 0.84 };
+        for fx in 0..w {
+            let u = (fx as f32 + 0.5) / w as f32;
+            // Travelling plasma background.
+            let bg = 0.5 + 0.5 * ((u * 7.0 + t * 1.2).sin() * (v * 5.0 - t * 0.8).cos());
+            // Bright bouncing disc.
+            let (dx, dy) = ((u - bx) * aspect, v - by);
+            let disc = (1.0 - (dx * dx + dy * dy).sqrt() / 0.16).clamp(0.0, 1.0);
+            let val = (bg * 0.45 + disc * 0.95).clamp(0.0, 1.0) * scan;
+            buf[fy * w + fx] = (val * 255.0) as u8;
+        }
+    }
 }
 
 /// Cells the bitstream scrolls past per second of animation time.
