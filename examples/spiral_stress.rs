@@ -802,14 +802,20 @@ impl Demo {
         v_edge(p, x0, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
         v_edge(p, x1, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
 
-        // Fill the interior with wave-coloured text (via the Field abstraction).
+        // Fill the interior: most windows show wave-coloured text; some show a
+        // braille noise field instead (a TV tuned to static). Both go through
+        // the Field abstraction; the choice is stable per window.
         let interior = Rect::new(
             (x0 + 1) as u16,
             (y0 + 1) as u16,
             (x1 - x0 - 1).max(0) as u16,
             (y1 - y0 - 1).max(0) as u16,
         );
-        self.fill_text(p, interior, area, t, wave, depth, seed);
+        if window_is_static(seed, depth) {
+            self.fill_static(p, interior, t);
+        } else {
+            self.fill_text(p, interior, area, t, wave, depth, seed);
+        }
 
         // Bookended bitstream gaps wandering around this box's border.
         self.draw_box_gaps(p, x0, y0, x1, y1, lvl, t, seed);
@@ -891,6 +897,31 @@ impl Demo {
             let val = wave.value(x / aw, y / ah, t);
             count += 1;
             Some((cell.symbol.clone(), Style::default().fg(Palette::Rainbow.color(val))))
+        });
+        p.cells += count;
+    }
+
+    /// Fill `interior` with **braille noise** — a TV tuned to static. Each cell
+    /// gets a random 2×4 dot mask (`U+2800 + byte`) and a random grey, both
+    /// reseeded every frame so the field hisses and crawls. Rendered through the
+    /// same [`Field::rect`] abstraction the text uses.
+    fn fill_static(&self, p: &mut Painter, interior: Rect, t: f32) {
+        if interior.width == 0 || interior.height == 0 {
+            return;
+        }
+        let field = Field::rect(interior);
+        // ~24 fps flicker: a fresh noise frame several times a second.
+        let frame = (t * 24.0) as u64;
+        let mut count = 0usize;
+        field.paint(p.buf, |col, row| {
+            let gx = interior.x as u32 + col as u32;
+            let gy = interior.y as u32 + row as u32;
+            let mask = noise_byte(gx, gy, frame);
+            let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or(' ');
+            // Independent grey so brightness flickers like real static.
+            let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // 90..217
+            count += 1;
+            Some((glyph.to_string(), Style::default().fg(Color::Rgb(g, g, g))))
         });
         p.cells += count;
     }
@@ -1268,6 +1299,28 @@ const PASSAGES: [&str; 4] = [
     "The perimeter is one continuous strip, so an opening can slide off a side and turn the corner as a single moving window — the corner glyph itself dissolves into the stream and reforms once the gap has passed.",
     "Colour here is not decoration but data: the same reaction that paints the text is a simulation running under it, feeding and killing concentration so spots divide, drift, and bloom across the wrapped lines.",
 ];
+
+/// A well-mixed pseudo-random byte from three integer coordinates — used to
+/// drive the braille static (a SplitMix64-style finalizer over a hash of the
+/// cell position and the frame number).
+fn noise_byte(x: u32, y: u32, z: u64) -> u8 {
+    let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (y as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+        ^ z.wrapping_mul(0x8537_5C0E_84A0_5C5D);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h & 0xFF) as u8
+}
+
+/// Whether a window shows braille static instead of text. A stable per-window
+/// hash (so a given box keeps its type across frames) leaves roughly one window
+/// in three tuned to static.
+fn window_is_static(seed: u64, depth: usize) -> bool {
+    noise_byte(seed as u32, (seed >> 32) as u32, depth as u64) % 3 == 0
+}
 
 /// Cells the bitstream scrolls past per second of animation time.
 const BIT_SPEED: f32 = 5.0;
