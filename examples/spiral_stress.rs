@@ -69,7 +69,7 @@ use mullion::style::{Color, Modifier, Style};
 use mullion::colorfield::{Palette, Wave};
 use mullion::field::Field;
 use mullion::text::{wrap, BaseDirection};
-use mullion::video::{Filter, Frame, Sampling, Video};
+use mullion::video::{Encoding, Filter, Frame, Sampling, Video};
 use mullion::{Buffer, EventReader, Rect, Terminal};
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
@@ -977,6 +977,10 @@ impl Demo {
         }
         let frame = Frame::from_luma(fw, fh, self.video.frame());
         Video::new()
+            // Luma/chroma braille: the dots carry the brightened luminance while the
+            // cell background fills with the (phosphor) hue, so dark areas glow dim blue
+            // instead of black — a brighter, fuller picture than plain braille.
+            .encoding(Encoding::LumaChroma)
             // These panels are small and fast — nearest resampling is ~2× cheaper and
             // the braille dither hides the difference.
             .sampling(Sampling::Nearest)
