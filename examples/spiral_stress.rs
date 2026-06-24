@@ -2,11 +2,25 @@
 //
 // spiral_stress — a mullion stress + "wow" demo.
 //
-// It draws a stack of nested, empty rectangular frames whose arrangement
-// starts out like a Fibonacci / golden-rectangle spiral, then continuously
-// *uncurls* through a concentric state and *re-curls the other way* — the kind
-// of morphing you see in Electric Sheep fractals, but expressed purely in the
-// shape and placement of TUI boxes.
+// The default scene is a REFLOW FIELD: a recursive fractal of wandering windows.
+// Every box — at every level — is filled (most show a paragraph that re-flows as
+// the box breathes, `text::wrap`, coloured through the Field abstraction by a
+// `Wave` colour source; some are little TVs showing braille static or a
+// synthesised braille video via mullion's `Video` widget); carries 4–8 bookended
+// bitstream gaps that wander around its border and slide across its corners (via
+// `Field::perimeter`); and holds four smaller wandering windows of its own,
+// recursing 3–4 levels deep. Press `s` for the spiral swarm, `t` for the surf.
+//
+// The braille video panel doubles as a video-to-characters prototype: a W×H luma
+// frame buffer is filled (synthetically in `synth_frame`; or from an `ffmpeg …
+// -f rawvideo -pix_fmt gray -` stream for real footage) and reproduced by the
+// `Video` widget — the same trick libcaca / mpv `--vo=caca` / chafa use.
+//
+// The SWARM/single-spiral scene draws a stack of nested, empty rectangular frames
+// whose arrangement starts out like a Fibonacci / golden-rectangle spiral, then
+// continuously *uncurls* through a concentric state and *re-curls the other way* —
+// the kind of morphing you see in Electric Sheep fractals, but expressed purely
+// in the shape and placement of TUI boxes.
 //
 // On top of that it demonstrates that the boxes are not static furniture: the
 // sides carry "openings" (gaps in the border) that slide, grow, shrink, and
@@ -30,11 +44,16 @@
 // Run:   cargo run --release --example spiral_stress [--swarm]
 // Keys:  q / Esc / Ctrl-C  quit
 //        space             pause / resume the animation
-//        s                 toggle single / swarm mode
+//        s                 toggle reflow field / swarm mode
 //        z                 toggle the animated zoom (swarm mode)
 //        + / -             more / fewer nested boxes (depth)
 //        [ / ]             tighten / loosen the curl
 //        r                 reverse the curl direction
+//
+// Set SPIRAL_VIDEO=/path/to/clip to feed the braille video panels with real
+// footage: the demo spawns `ffmpeg … -f rawvideo -pix_fmt gray -` and plays its
+// frames. Without it (or if ffmpeg isn't found) the panels show a synthesised
+// channel. Requires `ffmpeg` on PATH.
 //
 // This example only depends on `mullion` and `crossterm`, both already in
 // aerie's dependency set; it does not touch the aerie binary.
@@ -47,8 +66,15 @@ use mullion::ease::{gaussian, smoothstep};
 use mullion::input::{KeyCode, KeyModifiers};
 use mullion::layout::{self, Constraint, Node, Orientation, Size, TileId};
 use mullion::style::{Color, Modifier, Style};
-use mullion::{poll_event, Buffer, Rect, Terminal};
-use std::io;
+use mullion::colorfield::{Palette, Wave};
+use mullion::field::Field;
+use mullion::text::{wrap, BaseDirection};
+use mullion::video::{Filter, Frame, Video};
+use mullion::{Buffer, EventReader, Rect, Terminal};
+use std::io::{self, Read};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Target frame budget. ~60 fps; the poll timeout caps how long we wait for
@@ -68,7 +94,7 @@ OPTIONS:
 KEYS (while running):
     q, Esc       Quit
     space        Pause / resume the animation
-    s            Toggle single spiral <-> swarm grid
+    s            Toggle reflow field <-> swarm grid
     t            Toggle the surf field (floating tiles riding a 2-D wave field)
     o            Surf tile overlap: cycle none / border / full
     z            Toggle the swarm auto-zoom
@@ -85,58 +111,71 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut backend = CrosstermBackend::new(io::stdout());
-    backend.apply_capabilities(&Capabilities::detect());
-    let mut terminal = Terminal::new(backend)?;
-    terminal.enter()?;
-
+    // Build the demo first — this may spawn the ffmpeg video source and print a
+    // fallback note — before we switch into the alternate screen.
     let mut state = Demo::new();
     if args.iter().any(|a| a == "--swarm") {
         state.mode = Mode::Swarm;
     }
+
+    let mut backend = CrosstermBackend::new(io::stdout());
+    backend.apply_capabilities(&Capabilities::detect());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.enter()?;
+    // A background reader captures input the instant it arrives, so a heavy frame
+    // never delays a keypress; the loop drains every queued event each frame, so a
+    // burst (or mouse motion) never backs up behind the render.
+    let input = EventReader::new();
     let mut last = Instant::now();
 
     // Run the loop in a closure so a `?` early-exit still falls through to the
     // `terminal.leave()` below, restoring the user's terminal. Inlining here
     // also avoids having to name mullion's `Terminal`/backend generic types.
     let result: Result<()> = (|| {
-        loop {
-            let now = Instant::now();
-            let dt = now.duration_since(last).as_secs_f32().min(0.1);
-            last = now;
-            state.advance(dt);
+        'frames: loop {
+            let frame_start = Instant::now();
+            let dt = frame_start.duration_since(last).as_secs_f32().min(0.1);
+            last = frame_start;
 
-            terminal.draw(|buf| state.render(buf))?;
-
-            if let Some(Event::Key(key)) = poll_event(FRAME)? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char(' ') => state.paused = !state.paused,
-                    KeyCode::Char('s') => {
-                        state.mode = match state.mode {
-                            Mode::Single => Mode::Swarm,
-                            Mode::Swarm | Mode::Tree => Mode::Single,
+            // Handle all input first so a keypress takes effect this very frame.
+            for ev in input.drain() {
+                if let Event::Key(key) = ev {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break 'frames,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break 'frames,
+                        KeyCode::Char(' ') => state.paused = !state.paused,
+                        KeyCode::Char('s') => {
+                            state.mode = match state.mode {
+                                Mode::Single => Mode::Swarm,
+                                Mode::Swarm | Mode::Tree => Mode::Single,
+                            }
                         }
-                    }
-                    KeyCode::Char('t') => {
-                        state.mode = match state.mode {
-                            Mode::Tree => Mode::Single,
-                            _ => Mode::Tree,
+                        KeyCode::Char('t') => {
+                            state.mode = match state.mode {
+                                Mode::Tree => Mode::Single,
+                                _ => Mode::Tree,
+                            }
                         }
+                        KeyCode::Char('o') => state.overlap = state.overlap.next(),
+                        KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
+                        KeyCode::Char('+') | KeyCode::Char('=') => state.depth = (state.depth + 1).min(40),
+                        KeyCode::Char('-') | KeyCode::Char('_') => {
+                            state.depth = state.depth.saturating_sub(1).max(2)
+                        }
+                        KeyCode::Char('[') => state.curl = (state.curl - 0.1).max(0.0),
+                        KeyCode::Char(']') => state.curl = (state.curl + 0.1).min(2.5),
+                        KeyCode::Char('r') => state.dir = -state.dir,
+                        _ => {}
                     }
-                    KeyCode::Char('o') => state.overlap = state.overlap.next(),
-                    KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
-                    KeyCode::Char('+') | KeyCode::Char('=') => state.depth = (state.depth + 1).min(40),
-                    KeyCode::Char('-') | KeyCode::Char('_') => {
-                        state.depth = state.depth.saturating_sub(1).max(2)
-                    }
-                    KeyCode::Char('[') => state.curl = (state.curl - 0.1).max(0.0),
-                    KeyCode::Char(']') => state.curl = (state.curl + 0.1).min(2.5),
-                    KeyCode::Char('r') => state.dir = -state.dir,
-                    _ => {}
                 }
             }
+
+            state.advance(dt);
+            terminal.draw(|buf| state.render(buf))?;
+
+            // `drain` does not block (the old `poll_event(FRAME)` did), so pace the
+            // frame ourselves — sleeping off whatever is left of the budget.
+            std::thread::sleep(FRAME.saturating_sub(frame_start.elapsed()));
         }
         Ok(())
     })();
@@ -208,6 +247,8 @@ struct Demo {
     telemetry: Vec<u8>,
     /// Surf-mode tile packing: free-floating, shared-wall, or stacked.
     overlap: Overlap,
+    /// Source feeding the braille video panels (synthesised, or ffmpeg footage).
+    video: Box<dyn VideoSource>,
 }
 
 impl Demo {
@@ -225,6 +266,7 @@ impl Demo {
             frames: 0,
             telemetry: Vec::new(),
             overlap: Overlap::Border,
+            video: make_video_source(),
         }
     }
 
@@ -273,7 +315,10 @@ impl Demo {
 
         let spirals = match self.mode {
             Mode::Single => {
-                self.draw_spiral(&mut p, area, self.t, true);
+                if !self.paused {
+                    self.video.tick(self.t);
+                }
+                self.draw_reflow(&mut p, area);
                 1
             }
             Mode::Swarm => self.render_swarm(&mut p, area),
@@ -731,6 +776,318 @@ impl Demo {
         let mid = x0 as f32 + w * (0.5 + 0.12 * (self.t * 0.4).sin());
         text_port(p, mid, y, &text, x0, x1, st);
     }
+
+    /// The **reflow field** scene (replaces the single spiral): a recursive
+    /// fractal of wandering windows. Every box — at every level — is filled with
+    /// text coloured through the Field abstraction by a [`Wave`] colour source,
+    /// carries 4–8 bookended bitstream gaps that wander around its border and
+    /// across its corners, and holds four smaller wandering windows of its own,
+    /// recursing 3–4 levels deep (as far as the box size allows).
+    fn draw_reflow(&self, p: &mut Painter, area: Rect) {
+        let t = self.t;
+        // One coherent wave field underlies the whole screen; every box samples
+        // it at the cell's absolute position, so the colour flows across the
+        // nested windows rather than restarting in each. "Wave" colour source.
+        let wave = Wave::flag();
+        let (x0, y0) = (area.x as i32, area.y as i32);
+        let (x1, y1) = (area.right() as i32 - 1, area.bottom() as i32 - 1);
+        self.draw_window(p, x0, y0, x1, y1, 0, t, &wave, area, 1);
+
+        // A slim HUD footer one row inside the bottom edge, over everything.
+        let inner = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        self.draw_reflow_hud(p, area, inner);
+    }
+
+    /// Draw one window of the reflow fractal, then recurse into four wandering
+    /// children. `depth` is the nesting level (0 = root); `seed` distinguishes
+    /// sibling boxes so their gaps and text differ. `area` is the whole screen,
+    /// used to sample the global wave field.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_window(
+        &self,
+        p: &mut Painter,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        depth: usize,
+        t: f32,
+        wave: &Wave,
+        area: Rect,
+        seed: u64,
+    ) {
+        if x1 - x0 < 4 || y1 - y0 < 3 {
+            return;
+        }
+        let lvl = depth + 1;
+
+        // Frame: corners + clean side bars (gaps punched on top afterwards).
+        p.put(x0, y0, '╭', loop_color(x0, y0, x0, y0, x1, y1, t, lvl));
+        p.put(x1, y0, '╮', loop_color(x1, y0, x0, y0, x1, y1, t, lvl));
+        p.put(x0, y1, '╰', loop_color(x0, y1, x0, y0, x1, y1, t, lvl));
+        p.put(x1, y1, '╯', loop_color(x1, y1, x0, y0, x1, y1, t, lvl));
+        h_edge(p, y0, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+        h_edge(p, y1, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+        v_edge(p, x0, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+        v_edge(p, x1, x0, y0, x1, y1, &[], t, 0, lvl, &[]);
+
+        // Fill the interior. Most windows show wave-coloured text; some are TVs —
+        // tuned to braille static, or playing a (synthesised) braille video.
+        // All three go through the Field abstraction; the kind is stable per
+        // window.
+        let interior = Rect::new(
+            (x0 + 1) as u16,
+            (y0 + 1) as u16,
+            (x1 - x0 - 1).max(0) as u16,
+            (y1 - y0 - 1).max(0) as u16,
+        );
+        match window_kind(seed, depth) {
+            WindowKind::Static => self.fill_static(p, interior, t),
+            WindowKind::Video => self.fill_video(p, interior),
+            WindowKind::Text => self.fill_text(p, interior, area, t, wave, depth, seed),
+        }
+
+        // Bookended bitstream gaps wandering around this box's border.
+        self.draw_box_gaps(p, x0, y0, x1, y1, lvl, t, seed);
+
+        // Recurse: four wandering windows in a drifting 2×2 grid, as deep as the
+        // box size allows (≈3–4 levels on a normal terminal).
+        const MAX_DEPTH: usize = 4;
+        let (iw, ih) = (x1 - x0 - 1, y1 - y0 - 1);
+        let (cw, ch) = (iw / 2, ih / 2);
+        if depth + 1 <= MAX_DEPTH && cw >= 6 && ch >= 5 {
+            for i in 0..4u64 {
+                let fi = i as f32;
+                let (gx, gy) = ((i % 2) as i32, (i / 2) as i32);
+                let cell_x0 = x0 + 1 + gx * cw;
+                let cell_y0 = y0 + 1 + gy * ch;
+                let ds = depth as f32 + seed as f32 * 0.13;
+                let fw = 0.80 + 0.15 * (t * 0.31 + fi + ds).sin();
+                let fh = 0.78 + 0.18 * (t * 0.27 + fi * 1.3 + ds).cos();
+                // clamp upper bounds are ≥ lower bounds thanks to the cw/ch gate.
+                let tw = (cw as f32 * fw).round().clamp(5.0, (cw - 1) as f32) as i32;
+                let th = (ch as f32 * fh).round().clamp(4.0, (ch - 1) as f32) as i32;
+                let fx = 0.5 + 0.5 * (t * 0.23 + fi * 1.7 + ds).sin();
+                let fy = 0.5 + 0.5 * (t * 0.19 + fi * 2.3 + ds).cos();
+                let cx0 = cell_x0 + ((cw - tw).max(0) as f32 * fx).round() as i32;
+                let cy0 = cell_y0 + ((ch - th).max(0) as f32 * fy).round() as i32;
+                self.draw_window(
+                    p,
+                    cx0,
+                    cy0,
+                    cx0 + tw - 1,
+                    cy0 + th - 1,
+                    depth + 1,
+                    t,
+                    wave,
+                    area,
+                    seed.wrapping_mul(4).wrapping_add(i + 1),
+                );
+            }
+        }
+    }
+
+    /// Fill `interior` with a wrapped paragraph, colouring each glyph by the
+    /// global [`Wave`] field at its absolute position — rendered through a
+    /// [`Field::rect`] so the colour comes "via the Field abstraction".
+    fn fill_text(
+        &self,
+        p: &mut Painter,
+        interior: Rect,
+        area: Rect,
+        t: f32,
+        wave: &Wave,
+        level: usize,
+        seed: u64,
+    ) {
+        if interior.width == 0 || interior.height == 0 {
+            return;
+        }
+        let idx = (level.wrapping_add(seed as usize)) % PASSAGES.len();
+        // Repeat the passage until it has enough characters to fill every row of
+        // the interior, so the tile's free space is packed with text rather than
+        // trailing off into blank rows.
+        let base = PASSAGES[idx];
+        let want = interior.width as usize * interior.height as usize + interior.width as usize;
+        let mut text = String::with_capacity(want.max(base.len()) + base.len());
+        text.push_str(base);
+        while text.len() < want {
+            text.push(' ');
+            text.push_str(base);
+        }
+        let wrapped = wrap(&text, interior.width, BaseDirection::Ltr);
+        let lines = wrapped.lines();
+        let field = Field::rect(interior);
+        let (aw, ah) = (area.width.max(1) as f32, area.height.max(1) as f32);
+        let mut count = 0usize;
+        field.paint(p.buf, |col, row| {
+            let cell = lines.get(row as usize)?.cells.get(col as usize)?;
+            let x = interior.x as f32 + col as f32;
+            let y = interior.y as f32 + row as f32;
+            let val = wave.value(x / aw, y / ah, t);
+            count += 1;
+            Some((cell.symbol.clone(), Style::default().fg(Palette::Rainbow.color(val))))
+        });
+        p.cells += count;
+    }
+
+    /// Fill `interior` with **braille noise** — a TV tuned to static. Each cell
+    /// gets a random 2×4 dot mask (`U+2800 + byte`) and a random grey, both
+    /// reseeded every frame so the field hisses and crawls. Rendered through the
+    /// same [`Field::rect`] abstraction the text uses.
+    fn fill_static(&self, p: &mut Painter, interior: Rect, t: f32) {
+        if interior.width == 0 || interior.height == 0 {
+            return;
+        }
+        let field = Field::rect(interior);
+        // ~24 fps flicker: a fresh noise frame several times a second.
+        let frame = (t * 24.0) as u64;
+        let mut count = 0usize;
+        field.paint(p.buf, |col, row| {
+            let gx = interior.x as u32 + col as u32;
+            let gy = interior.y as u32 + row as u32;
+            let mask = noise_byte(gx, gy, frame);
+            let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or(' ');
+            // Independent grey so brightness flickers like real static.
+            let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // 90..217
+            count += 1;
+            Some((glyph.to_string(), Style::default().fg(Color::Rgb(g, g, g))))
+        });
+        p.cells += count;
+    }
+
+    /// Fill `interior` with a **braille video panel** — a TV playing the current
+    /// channel through mullion's [`Video`] widget. The shared [`VideoSource`] frame (a
+    /// `W×H` luma buffer) is wrapped as a [`Frame`] and reproduced faithfully in
+    /// braille, resampled to whatever size this window is (so every video window shows
+    /// the same broadcast at its own scale). The CRT look — a cool phosphor tint and
+    /// scanlines — rides on top as opt-in [`Filter`]s.
+    fn fill_video(&self, p: &mut Painter, interior: Rect) {
+        if interior.width == 0 || interior.height == 0 {
+            return;
+        }
+        let (fw, fh) = self.video.dims();
+        if fw == 0 || fh == 0 {
+            return;
+        }
+        let frame = Frame::from_luma(fw, fh, self.video.frame());
+        Video::new()
+            .filter(Filter::Phosphor { hue: 195.0, sat: 0.30 })
+            .filter(Filter::Scanlines(0.25))
+            .render_frame(p.buf, interior, &frame);
+        p.cells += interior.width as usize * interior.height as usize;
+    }
+
+    /// Punch 4–8 **bookended** gaps that wander around this box's border and
+    /// cross its corners. Four sources each drift, pulse in width, and split
+    /// into a diverging pair before merging, so the live gap count breathes
+    /// between 4 (all merged) and 8 (all split). The border is one continuous
+    /// strip ([`Field::perimeter`]), so a window slides across a corner without
+    /// a seam; each opening is capped by `┤├` / `┴┬` bookends and reveals the
+    /// scrolling telemetry bitstream between them.
+    fn draw_box_gaps(&self, p: &mut Painter, x0: i32, y0: i32, x1: i32, y1: i32, level: usize, t: f32, seed: u64) {
+        let r = Rect::new(x0 as u16, y0 as u16, (x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16);
+        let field = Field::perimeter(r);
+        let plen = field.width() as i32;
+        if plen < 12 {
+            return;
+        }
+        let msg = &self.telemetry;
+        let sd = seed as f32;
+        const SOURCES: usize = 4;
+        for s in 0..SOURCES {
+            let fs = s as f32 + sd * 0.37;
+            let dir = if (s + seed as usize) % 2 == 0 { 1.0_f32 } else { -1.0 };
+            let centre = ((s as f32 / SOURCES as f32) + 0.04 * t * dir + 0.03 * (t * 0.3 + fs).sin() + sd * 0.13)
+                .rem_euclid(1.0)
+                * plen as f32;
+            let hw = plen as f32 * (0.02 + 0.025 * ((t * 0.7 + fs * 1.7).sin() * 0.5 + 0.5));
+            let split = (t * 0.5 + fs * 2.1).sin() * 0.5 + 0.5;
+            let sep = plen as f32 * 0.06 * split;
+            let centres: [f32; 2] = if split < 0.25 {
+                [centre, f32::NAN]
+            } else {
+                [
+                    (centre - sep).rem_euclid(plen as f32),
+                    (centre + sep).rem_euclid(plen as f32),
+                ]
+            };
+            for (gi, &c) in centres.iter().enumerate() {
+                if c.is_nan() {
+                    continue;
+                }
+                let a = (c - hw).floor() as i32;
+                let b = (c + hw).ceil() as i32;
+                if b - a < 2 {
+                    continue; // need room for two bookend caps
+                }
+                let band = (seed as usize).wrapping_mul(7).wrapping_add(s * 3 + gi + 1);
+                self.put_cap(p, &field, plen, a, a - 1, x0, y0, x1, y1, level, t);
+                self.put_cap(p, &field, plen, b, b + 1, x0, y0, x1, y1, level, t);
+                let span = (b - a).max(1) as f32;
+                for k in a + 1..b {
+                    let kk = k.rem_euclid(plen);
+                    if let Some((x, y)) = field.cell(kk as u16, 0) {
+                        let one = stream_bit(msg, kk as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
+                        let ch = if one { '▪' } else { '▫' };
+                        let pos = (k - a) as f32 / span;
+                        p.put(x as i32, y as i32, ch, stream_color(pos, t, band, dir, one));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw the bookend cap for a gap end at perimeter index `idx`, choosing the
+    /// connector glyph that joins the solid border at neighbour index `nidx`
+    /// (`┤`/`├` on a horizontal run, `┴`/`┬` on a vertical one) — so the cap is
+    /// correct even when the gap straddles a corner.
+    #[allow(clippy::too_many_arguments)]
+    fn put_cap(&self, p: &mut Painter, field: &Field, plen: i32, idx: i32, nidx: i32, x0: i32, y0: i32, x1: i32, y1: i32, level: usize, t: f32) {
+        let cell = field.cell(idx.rem_euclid(plen) as u16, 0);
+        let neigh = field.cell(nidx.rem_euclid(plen) as u16, 0);
+        if let (Some((x, y)), Some((nx, ny))) = (cell, neigh) {
+            let cap = if ny < y {
+                '┴'
+            } else if ny > y {
+                '┬'
+            } else if nx < x {
+                '┤'
+            } else {
+                '├'
+            };
+            p.put(x as i32, y as i32, cap, loop_color(x as i32, y as i32, x0, y0, x1, y1, t, level));
+        }
+    }
+
+    /// A compact stress HUD drawn one row inside the bottom edge (so the border
+    /// and its travelling gaps stay clear), spanning the interior width.
+    fn draw_reflow_hud(&self, p: &mut Painter, area: Rect, inner: Rect) {
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+        let y = (inner.y + inner.height - 1) as i32;
+        let full = format!(
+            " reflow · {:>3.0} fps · {} cells · vid:{} · {}x{}  │  s swarm  t surf  space pause  q quit ",
+            self.fps, self.last_cells, self.video.label(), area.width, area.height
+        );
+        let w = inner.width as usize;
+        let text: String = full.chars().take(w).collect();
+        let mut padded = text.clone();
+        for _ in padded.chars().count()..w {
+            padded.push(' ');
+        }
+        let st = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(120, 200, 255))
+            .add_modifier(Modifier::BOLD);
+        p.put_str(inner.x as i32, y, &padded, st);
+    }
 }
 
 // --- drawing helpers --------------------------------------------------------
@@ -792,7 +1149,7 @@ fn h_edge(p: &mut Painter, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
             // Pin the bit to the absolute column so the gap is a window sliding
             // over a fixed broadcast; `band` offsets each band into the stream.
             let one = stream_bit(msg, x as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
-            let ch = if one { '▮' } else { '◻' }; // vertical bar = 1, square = 0
+            let ch = if one { '▪' } else { '▫' }; // solid square = 1, open square = 0
             p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
@@ -818,10 +1175,10 @@ fn v_edge(p: &mut Painter, x: i32, bx0: i32, by0: i32, bx1: i32, by1: i32,
         let span = (cb - ca + 1).max(1) as f32;
         for y in ca..=cb {
             let pos = (y - ca) as f32 / span;
-            // Same broadcast, read top-to-bottom; horizontal bar reads as 1
-            // along a vertical edge the way a vertical bar does on a row.
+            // Same broadcast, read top-to-bottom; solid square reads as 1,
+            // open square as 0 — the same bit glyphs the horizontal edges use.
             let one = stream_bit(msg, y as f32 - t * dir * BIT_SPEED + band as f32 * 11.0);
-            let ch = if one { '▬' } else { '◻' }; // horizontal bar = 1, square = 0
+            let ch = if one { '▪' } else { '▫' }; // solid square = 1, open square = 0
             p.put(x, y, ch, stream_color(pos, t, band, dir, one));
         }
         if cb > ca {
@@ -989,6 +1346,222 @@ fn loop_color(x: i32, y: i32, bx0: i32, by0: i32, bx1: i32, by1: i32, t: f32, le
     let hue = base_hue + hue_add;
     let val = (base_val + val_add).clamp(0.1, 1.0);
     Style::default().fg(Color::from_hsv(hue, 0.85, val))
+}
+
+/// Paragraphs flowed inside the reflow-scene tiles. Each tile wraps one of
+/// these to its current interior width and re-wraps it as the tile breathes.
+const PASSAGES: [&str; 4] = [
+    "Mullion re-flows this paragraph inside a tile that breathes: as the box widens and narrows the words re-wrap every frame, and a Gray-Scott reaction-diffusion field tints each glyph by its local concentration.",
+    "Four to eight gaps drift around the border and cross the corners without a seam. They pulse, split into diverging pairs, and merge back together while the live telemetry bitstream scrolls through each opening.",
+    "The perimeter is one continuous strip, so an opening can slide off a side and turn the corner as a single moving window — the corner glyph itself dissolves into the stream and reforms once the gap has passed.",
+    "Colour here is not decoration but data: the same reaction that paints the text is a simulation running under it, feeding and killing concentration so spots divide, drift, and bloom across the wrapped lines.",
+];
+
+/// A well-mixed pseudo-random byte from three integer coordinates — used to
+/// drive the braille static (a SplitMix64-style finalizer over a hash of the
+/// cell position and the frame number).
+fn noise_byte(x: u32, y: u32, z: u64) -> u8 {
+    let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (y as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+        ^ z.wrapping_mul(0x8537_5C0E_84A0_5C5D);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h & 0xFF) as u8
+}
+
+/// What a window's interior is filled with.
+enum WindowKind {
+    /// Wave-coloured flowing text.
+    Text,
+    /// A braille noise field (a TV tuned to static).
+    Static,
+    /// A braille video panel (a TV playing a synthesised channel).
+    Video,
+}
+
+/// Pick a window's content kind from a stable per-window hash (so a given box
+/// keeps its kind across frames): ~¼ static, ~¼ video, ~½ text.
+fn window_kind(seed: u64, depth: usize) -> WindowKind {
+    match noise_byte(seed as u32, (seed >> 32) as u32, depth as u64) % 4 {
+        0 => WindowKind::Static,
+        1 => WindowKind::Video,
+        _ => WindowKind::Text,
+    }
+}
+
+/// Synthesise one `w×h` 8-bit luma frame into `buf` — a stand-in for a decoded
+/// video frame (what `ffmpeg … -f rawvideo -pix_fmt gray -` would hand you, and
+/// what a real build would `read_exact` instead of generating).
+///
+/// The "channel" is a moving test pattern: a travelling plasma wash, a bright
+/// disc bouncing across the screen, and faint CRT scanlines — enough motion and
+/// structure to read clearly as footage once dithered to braille. `seed` phase-
+/// shifts everything so different video windows show different channels.
+fn synth_frame(buf: &mut [u8], w: usize, h: usize, t: f32, seed: u64) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let sd = seed as f32 * 0.7;
+    let aspect = w as f32 / h as f32;
+    // Bouncing disc centre (normalised), distinct per channel.
+    let bx = 0.5 + 0.38 * (t * 1.3 + sd).sin();
+    let by = 0.5 + 0.38 * (t * 1.1 + sd * 0.6).cos();
+    for fy in 0..h {
+        let v = (fy as f32 + 0.5) / h as f32;
+        // Faint scanlines: every other source row a touch dimmer.
+        let scan = if fy % 2 == 0 { 1.0 } else { 0.84 };
+        for fx in 0..w {
+            let u = (fx as f32 + 0.5) / w as f32;
+            // Travelling plasma background.
+            let bg = 0.5 + 0.5 * ((u * 7.0 + t * 1.2).sin() * (v * 5.0 - t * 0.8).cos());
+            // Bright bouncing disc.
+            let (dx, dy) = ((u - bx) * aspect, v - by);
+            let disc = (1.0 - (dx * dx + dy * dy).sqrt() / 0.16).clamp(0.0, 1.0);
+            let val = (bg * 0.45 + disc * 0.95).clamp(0.0, 1.0) * scan;
+            buf[fy * w + fx] = (val * 255.0) as u8;
+        }
+    }
+}
+
+/// Frame resolution decoded for the video panels. Fixed and independent of any
+/// window's size — each panel resamples it to its own braille grid.
+const VIDEO_W: usize = 192;
+const VIDEO_H: usize = 108;
+
+/// A source of grayscale video frames for the braille panels. Yields the latest
+/// frame as a fixed-resolution `W×H` row-major luma buffer.
+trait VideoSource {
+    /// Frame dimensions (constant for the source's lifetime).
+    fn dims(&self) -> (usize, usize);
+    /// The latest frame, row-major 8-bit luma, `len() == w * h`.
+    fn frame(&self) -> &[u8];
+    /// Refresh the current frame: regenerate (synth) or pull the newest decoded
+    /// frame (ffmpeg). Called once per rendered frame. `t` is animation time.
+    fn tick(&mut self, t: f32);
+    /// Short label for the HUD (`synth` / `ffmpeg`).
+    fn label(&self) -> &'static str;
+}
+
+/// A synthesised channel — the moving test pattern from [`synth_frame`]. Stands
+/// in for real footage when no `SPIRAL_VIDEO` clip is configured.
+struct SynthSource {
+    w: usize,
+    h: usize,
+    frame: Vec<u8>,
+}
+
+impl SynthSource {
+    fn new(w: usize, h: usize) -> Self {
+        Self { w, h, frame: vec![0u8; w * h] }
+    }
+}
+
+impl VideoSource for SynthSource {
+    fn dims(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+    fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+    fn tick(&mut self, t: f32) {
+        synth_frame(&mut self.frame, self.w, self.h, t, 0);
+    }
+    fn label(&self) -> &'static str {
+        "synth"
+    }
+}
+
+/// Real footage: spawns `ffmpeg … -f rawvideo -pix_fmt gray -` once and a reader
+/// thread pumps decoded `W×H` luma frames into a shared buffer. [`tick`] snapshots
+/// the newest one. The child is killed on drop, which ends the reader thread.
+struct FfmpegSource {
+    w: usize,
+    h: usize,
+    frame: Vec<u8>,
+    shared: Arc<Mutex<Vec<u8>>>,
+    child: Child,
+}
+
+impl FfmpegSource {
+    fn new(path: &str, w: usize, h: usize) -> io::Result<Self> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-loglevel", "error",
+                "-re", // pace input at native frame rate
+                "-stream_loop", "-1", // loop the clip forever
+                "-i", path,
+                "-vf", &format!("scale={w}:{h}"),
+                "-pix_fmt", "gray",
+                "-f", "rawvideo",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let mut out = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("ffmpeg produced no stdout"))?;
+        let shared = Arc::new(Mutex::new(vec![0u8; w * h]));
+        let writer = Arc::clone(&shared);
+        let frame_len = w * h;
+        thread::spawn(move || {
+            let mut buf = vec![0u8; frame_len];
+            // Read whole frames until the pipe closes (EOF or the child is killed).
+            while out.read_exact(&mut buf).is_ok() {
+                if let Ok(mut g) = writer.lock() {
+                    g.copy_from_slice(&buf);
+                }
+            }
+        });
+
+        Ok(Self { w, h, frame: vec![0u8; w * h], shared, child })
+    }
+}
+
+impl Drop for FfmpegSource {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl VideoSource for FfmpegSource {
+    fn dims(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+    fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+    fn tick(&mut self, _t: f32) {
+        if let Ok(g) = self.shared.lock() {
+            self.frame.copy_from_slice(&g);
+        }
+    }
+    fn label(&self) -> &'static str {
+        "ffmpeg"
+    }
+}
+
+/// Pick the video source: an ffmpeg stream of `$SPIRAL_VIDEO` if that points at a
+/// playable clip, otherwise the synthesised channel. Falls back (with a note)
+/// rather than failing if ffmpeg can't be spawned.
+fn make_video_source() -> Box<dyn VideoSource> {
+    if let Ok(path) = std::env::var("SPIRAL_VIDEO") {
+        if !path.is_empty() {
+            match FfmpegSource::new(&path, VIDEO_W, VIDEO_H) {
+                Ok(src) => return Box::new(src),
+                Err(e) => {
+                    eprintln!("spiral_stress: could not start ffmpeg for SPIRAL_VIDEO ({e}); using synth");
+                }
+            }
+        }
+    }
+    Box::new(SynthSource::new(VIDEO_W, VIDEO_H))
 }
 
 /// Cells the bitstream scrolls past per second of animation time.
