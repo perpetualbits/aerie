@@ -6,15 +6,15 @@
 // Every box — at every level — is filled (most show a paragraph that re-flows as
 // the box breathes, `text::wrap`, coloured through the Field abstraction by a
 // `Wave` colour source; some are little TVs showing braille static or a
-// synthesised braille video via `Field::render_braille`); carries 4–8 bookended
+// synthesised braille video via mullion's `Video` widget); carries 4–8 bookended
 // bitstream gaps that wander around its border and slide across its corners (via
 // `Field::perimeter`); and holds four smaller wandering windows of its own,
 // recursing 3–4 levels deep. Press `s` for the spiral swarm, `t` for the surf.
 //
 // The braille video panel doubles as a video-to-characters prototype: a W×H luma
-// frame buffer is filled (synthetically in `synth_frame`; swap in a `read_exact`
-// on an `ffmpeg … -f rawvideo -pix_fmt gray -` stream for real footage) and
-// dithered to braille — the same trick libcaca / mpv `--vo=caca` / chafa use.
+// frame buffer is filled (synthetically in `synth_frame`; or from an `ffmpeg …
+// -f rawvideo -pix_fmt gray -` stream for real footage) and reproduced by the
+// `Video` widget — the same trick libcaca / mpv `--vo=caca` / chafa use.
 //
 // The SWARM/single-spiral scene draws a stack of nested, empty rectangular frames
 // whose arrangement starts out like a Fibonacci / golden-rectangle spiral, then
@@ -69,6 +69,7 @@ use mullion::style::{Color, Modifier, Style};
 use mullion::colorfield::{Palette, Wave};
 use mullion::field::Field;
 use mullion::text::{wrap, BaseDirection};
+use mullion::video::{Filter, Frame, Video};
 use mullion::{poll_event, Buffer, Rect, Terminal};
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
@@ -950,10 +951,11 @@ impl Demo {
     }
 
     /// Fill `interior` with a **braille video panel** — a TV playing the current
-    /// channel. The shared [`VideoSource`] frame (a `W×H` luma buffer) is sampled
-    /// per braille sub-pixel and dithered by [`Field::render_braille`], so the
-    /// fixed-resolution frame is resampled to whatever size this window is. All
-    /// video windows show the same broadcast at their own scale.
+    /// channel through mullion's [`Video`] widget. The shared [`VideoSource`] frame (a
+    /// `W×H` luma buffer) is wrapped as a [`Frame`] and reproduced faithfully in
+    /// braille, resampled to whatever size this window is (so every video window shows
+    /// the same broadcast at its own scale). The CRT look — a cool phosphor tint and
+    /// scanlines — rides on top as opt-in [`Filter`]s.
     fn fill_video(&self, p: &mut Painter, interior: Rect) {
         if interior.width == 0 || interior.height == 0 {
             return;
@@ -962,18 +964,11 @@ impl Demo {
         if fw == 0 || fh == 0 {
             return;
         }
-        let frame = self.video.frame();
-        let field = Field::rect(interior);
-        field.render_braille(
-            p.buf,
-            |u, v| {
-                let fx = ((u * fw as f32) as usize).min(fw - 1);
-                let fy = ((v * fh as f32) as usize).min(fh - 1);
-                frame[fy * fw + fx] as f32 / 255.0
-            },
-            // Cool CRT phosphor: brighter content glows whiter-blue.
-            |mean| Style::default().fg(Color::from_hsv(195.0, 0.30, (0.20 + 0.80 * mean).clamp(0.0, 1.0))),
-        );
+        let frame = Frame::from_luma(fw, fh, self.video.frame());
+        Video::new()
+            .filter(Filter::Phosphor { hue: 195.0, sat: 0.30 })
+            .filter(Filter::Scanlines(0.25))
+            .render_frame(p.buf, interior, &frame);
         p.cells += interior.width as usize * interior.height as usize;
     }
 
