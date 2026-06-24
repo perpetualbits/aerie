@@ -944,21 +944,24 @@ impl Demo {
         if interior.width == 0 || interior.height == 0 {
             return;
         }
-        let field = Field::rect(interior);
-        // ~24 fps flicker: a fresh noise frame several times a second.
+        // ~24 fps flicker: a fresh noise frame several times a second. Write cells
+        // directly with `set_char` (no per-cell String allocation, unlike `paint`).
         let frame = (t * 24.0) as u64;
-        let mut count = 0usize;
-        field.paint(p.buf, |col, row| {
-            let gx = interior.x as u32 + col as u32;
-            let gy = interior.y as u32 + row as u32;
-            let mask = noise_byte(gx, gy, frame);
-            let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or(' ');
-            // Independent grey so brightness flickers like real static.
-            let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // 90..217
-            count += 1;
-            Some((glyph.to_string(), Style::default().fg(Color::Rgb(g, g, g))))
-        });
-        p.cells += count;
+        for row in interior.y..interior.bottom() {
+            for col in interior.x..interior.right() {
+                let (gx, gy) = (col as u32, row as u32);
+                // 8 random sub-pixel bits → a braille glyph.
+                let glyph = char::from_u32(0x2800 + noise_byte(gx, gy, frame) as u32).unwrap_or(' ');
+                // Luma/chroma, like the video panels: a flickering grey level with bright
+                // dots over a dim fill, so the gaps glow grey instead of pure black.
+                let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // cell grey 90..217
+                let fg = (g as u16 + (255 - g as u16) * 2 / 5) as u8; // dots ~40% toward white
+                let bg = g / 2; // dim grey fill
+                let style = Style::default().fg(Color::Rgb(fg, fg, fg)).bg(Color::Rgb(bg, bg, bg));
+                p.buf.set_char(col, row, glyph, style);
+            }
+        }
+        p.cells += interior.width as usize * interior.height as usize;
     }
 
     /// Fill `interior` with a **braille video panel** — a TV playing the current
