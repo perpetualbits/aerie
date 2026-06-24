@@ -69,7 +69,7 @@ use mullion::style::{Color, Modifier, Style};
 use mullion::colorfield::{Palette, Wave};
 use mullion::field::Field;
 use mullion::text::{wrap, BaseDirection};
-use mullion::video::{Filter, Frame, Sampling, Video};
+use mullion::video::{Encoding, Filter, Frame, Sampling, Video};
 use mullion::{Buffer, EventReader, Rect, Terminal};
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
@@ -944,21 +944,25 @@ impl Demo {
         if interior.width == 0 || interior.height == 0 {
             return;
         }
-        let field = Field::rect(interior);
-        // ~24 fps flicker: a fresh noise frame several times a second.
+        // ~24 fps flicker: a fresh noise frame several times a second. Write cells
+        // directly with `set_char` (no per-cell String allocation, unlike `paint`).
         let frame = (t * 24.0) as u64;
-        let mut count = 0usize;
-        field.paint(p.buf, |col, row| {
-            let gx = interior.x as u32 + col as u32;
-            let gy = interior.y as u32 + row as u32;
-            let mask = noise_byte(gx, gy, frame);
-            let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or(' ');
-            // Independent grey so brightness flickers like real static.
-            let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // 90..217
-            count += 1;
-            Some((glyph.to_string(), Style::default().fg(Color::Rgb(g, g, g))))
-        });
-        p.cells += count;
+        for row in interior.y..interior.bottom() {
+            for col in interior.x..interior.right() {
+                let (gx, gy) = (col as u32, row as u32);
+                // 8 random sub-pixel bits → a braille glyph.
+                let glyph = char::from_u32(0x2800 + noise_byte(gx, gy, frame) as u32).unwrap_or(' ');
+                // Luma in the dots (a flickering bright grey), chroma in the background
+                // — but static has no per-cell chroma, so the background is a single flat
+                // dim glow. A varying dark-grey background banded to ~8 shades once colour
+                // depth dropped; a flat one cannot band, and the dots carry all the snow.
+                let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // snow brightness 90..217
+                let fg = (g as u16 + (255 - g as u16) * 2 / 5) as u8; // bright dots
+                let style = Style::default().fg(Color::Rgb(fg, fg, fg)).bg(Color::Rgb(56, 56, 56));
+                p.buf.set_char(col, row, glyph, style);
+            }
+        }
+        p.cells += interior.width as usize * interior.height as usize;
     }
 
     /// Fill `interior` with a **braille video panel** — a TV playing the current
@@ -977,6 +981,10 @@ impl Demo {
         }
         let frame = Frame::from_luma(fw, fh, self.video.frame());
         Video::new()
+            // Luma/chroma braille: the dots carry the brightened luminance while the
+            // cell background fills with the (phosphor) hue, so dark areas glow dim blue
+            // instead of black — a brighter, fuller picture than plain braille.
+            .encoding(Encoding::LumaChroma)
             // These panels are small and fast — nearest resampling is ~2× cheaper and
             // the braille dither hides the difference.
             .sampling(Sampling::Nearest)
