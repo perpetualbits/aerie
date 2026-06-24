@@ -69,7 +69,7 @@ use mullion::style::{Color, Modifier, Style};
 use mullion::colorfield::{Palette, Wave};
 use mullion::field::Field;
 use mullion::text::{wrap, BaseDirection};
-use mullion::video::{Filter, Frame, Video};
+use mullion::video::{Filter, Frame, Sampling, Video};
 use mullion::{Buffer, EventReader, Rect, Terminal};
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
@@ -977,6 +977,9 @@ impl Demo {
         }
         let frame = Frame::from_luma(fw, fh, self.video.frame());
         Video::new()
+            // These panels are small and fast — nearest resampling is ~2× cheaper and
+            // the braille dither hides the difference.
+            .sampling(Sampling::Nearest)
             .filter(Filter::Phosphor { hue: 195.0, sat: 0.30 })
             .filter(Filter::Scanlines(0.25))
             .render_frame(p.buf, interior, &frame);
@@ -1383,11 +1386,15 @@ enum WindowKind {
 }
 
 /// Pick a window's content kind from a stable per-window hash (so a given box
-/// keeps its kind across frames): ~¼ static, ~¼ video, ~½ text.
+/// keeps its kind across frames). Bigger tiles (shallower `depth`) lean toward video
+/// panels — ~¼ static, ~½ video, ~¼ text at depth ≤ 1; ~¼ static, ~¼ video, ~½ text
+/// deeper down.
 fn window_kind(seed: u64, depth: usize) -> WindowKind {
-    match noise_byte(seed as u32, (seed >> 32) as u32, depth as u64) % 4 {
+    let pick = noise_byte(seed as u32, (seed >> 32) as u32, depth as u64) % 4;
+    let video_slots: u8 = if depth <= 1 { 2 } else { 1 };
+    match pick {
         0 => WindowKind::Static,
-        1 => WindowKind::Video,
+        p if p <= video_slots => WindowKind::Video,
         _ => WindowKind::Text,
     }
 }
