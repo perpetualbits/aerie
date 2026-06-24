@@ -70,7 +70,7 @@ use mullion::colorfield::{Palette, Wave};
 use mullion::field::Field;
 use mullion::text::{wrap, BaseDirection};
 use mullion::video::{Filter, Frame, Video};
-use mullion::{poll_event, Buffer, Rect, Terminal};
+use mullion::{Buffer, EventReader, Rect, Terminal};
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -122,49 +122,60 @@ fn main() -> Result<()> {
     backend.apply_capabilities(&Capabilities::detect());
     let mut terminal = Terminal::new(backend)?;
     terminal.enter()?;
+    // A background reader captures input the instant it arrives, so a heavy frame
+    // never delays a keypress; the loop drains every queued event each frame, so a
+    // burst (or mouse motion) never backs up behind the render.
+    let input = EventReader::new();
     let mut last = Instant::now();
 
     // Run the loop in a closure so a `?` early-exit still falls through to the
     // `terminal.leave()` below, restoring the user's terminal. Inlining here
     // also avoids having to name mullion's `Terminal`/backend generic types.
     let result: Result<()> = (|| {
-        loop {
-            let now = Instant::now();
-            let dt = now.duration_since(last).as_secs_f32().min(0.1);
-            last = now;
-            state.advance(dt);
+        'frames: loop {
+            let frame_start = Instant::now();
+            let dt = frame_start.duration_since(last).as_secs_f32().min(0.1);
+            last = frame_start;
 
-            terminal.draw(|buf| state.render(buf))?;
-
-            if let Some(Event::Key(key)) = poll_event(FRAME)? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char(' ') => state.paused = !state.paused,
-                    KeyCode::Char('s') => {
-                        state.mode = match state.mode {
-                            Mode::Single => Mode::Swarm,
-                            Mode::Swarm | Mode::Tree => Mode::Single,
+            // Handle all input first so a keypress takes effect this very frame.
+            for ev in input.drain() {
+                if let Event::Key(key) = ev {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break 'frames,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break 'frames,
+                        KeyCode::Char(' ') => state.paused = !state.paused,
+                        KeyCode::Char('s') => {
+                            state.mode = match state.mode {
+                                Mode::Single => Mode::Swarm,
+                                Mode::Swarm | Mode::Tree => Mode::Single,
+                            }
                         }
-                    }
-                    KeyCode::Char('t') => {
-                        state.mode = match state.mode {
-                            Mode::Tree => Mode::Single,
-                            _ => Mode::Tree,
+                        KeyCode::Char('t') => {
+                            state.mode = match state.mode {
+                                Mode::Tree => Mode::Single,
+                                _ => Mode::Tree,
+                            }
                         }
+                        KeyCode::Char('o') => state.overlap = state.overlap.next(),
+                        KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
+                        KeyCode::Char('+') | KeyCode::Char('=') => state.depth = (state.depth + 1).min(40),
+                        KeyCode::Char('-') | KeyCode::Char('_') => {
+                            state.depth = state.depth.saturating_sub(1).max(2)
+                        }
+                        KeyCode::Char('[') => state.curl = (state.curl - 0.1).max(0.0),
+                        KeyCode::Char(']') => state.curl = (state.curl + 0.1).min(2.5),
+                        KeyCode::Char('r') => state.dir = -state.dir,
+                        _ => {}
                     }
-                    KeyCode::Char('o') => state.overlap = state.overlap.next(),
-                    KeyCode::Char('z') => state.zoom_on = !state.zoom_on,
-                    KeyCode::Char('+') | KeyCode::Char('=') => state.depth = (state.depth + 1).min(40),
-                    KeyCode::Char('-') | KeyCode::Char('_') => {
-                        state.depth = state.depth.saturating_sub(1).max(2)
-                    }
-                    KeyCode::Char('[') => state.curl = (state.curl - 0.1).max(0.0),
-                    KeyCode::Char(']') => state.curl = (state.curl + 0.1).min(2.5),
-                    KeyCode::Char('r') => state.dir = -state.dir,
-                    _ => {}
                 }
             }
+
+            state.advance(dt);
+            terminal.draw(|buf| state.render(buf))?;
+
+            // `drain` does not block (the old `poll_event(FRAME)` did), so pace the
+            // frame ourselves — sleeping off whatever is left of the budget.
+            std::thread::sleep(FRAME.saturating_sub(frame_start.elapsed()));
         }
         Ok(())
     })();
