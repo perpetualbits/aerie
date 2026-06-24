@@ -952,12 +952,13 @@ impl Demo {
                 let (gx, gy) = (col as u32, row as u32);
                 // 8 random sub-pixel bits → a braille glyph.
                 let glyph = char::from_u32(0x2800 + noise_byte(gx, gy, frame) as u32).unwrap_or(' ');
-                // Luma/chroma, like the video panels: a flickering grey level with bright
-                // dots over a dim fill, so the gaps glow grey instead of pure black.
-                let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // cell grey 90..217
-                let fg = (g as u16 + (255 - g as u16) * 2 / 5) as u8; // dots ~40% toward white
-                let bg = g / 2; // dim grey fill
-                let style = Style::default().fg(Color::Rgb(fg, fg, fg)).bg(Color::Rgb(bg, bg, bg));
+                // Luma in the dots (a flickering bright grey), chroma in the background
+                // — but static has no per-cell chroma, so the background is a single flat
+                // dim glow. A varying dark-grey background banded to ~8 shades once colour
+                // depth dropped; a flat one cannot band, and the dots carry all the snow.
+                let g = 90 + (noise_byte(gx, gy, frame ^ 0x5151) >> 1); // snow brightness 90..217
+                let fg = (g as u16 + (255 - g as u16) * 2 / 5) as u8; // bright dots
+                let style = Style::default().fg(Color::Rgb(fg, fg, fg)).bg(Color::Rgb(56, 56, 56));
                 p.buf.set_char(col, row, glyph, style);
             }
         }
