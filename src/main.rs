@@ -1005,6 +1005,12 @@ pub struct AppState {
     pub scope_report: Option<diag::AttribReport>,
     /// Open capture-log writer when --scope-log is set; receives JSONL records.
     pub scope_log: Option<std::io::BufWriter<std::fs::File>>,
+    /// System-pressure probe (instrument #2): run-queue + PSI stall time. Catches
+    /// compositor/memory-bound freezes the CPU-wakeup probe can't see. Spawned
+    /// together with the latency probe.
+    pub pressure: Option<diag::PressureProbe>,
+    /// Most-periodic pressure channel and its cached analysis (recomputed at 1 Hz).
+    pub pressure_analysis: Option<(diag::PressureChannel, diag::Periodicity)>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1541,6 +1547,8 @@ impl AppState {
             scope_attrib_at: None,
             scope_report: None,
             scope_log: None,
+            pressure: None,
+            pressure_analysis: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
                 orientation: Orientation::Vertical,
@@ -2556,6 +2564,42 @@ fn json_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Pick the pressure channel that best explains a periodic stall: prefer one with
+/// a detected period (highest confidence); otherwise fall back to the most active
+/// channel (largest peak-above-mean) so the scope always shows something useful.
+fn best_pressure_channel(
+    samples: &[diag::PressureSample],
+) -> Option<(diag::PressureChannel, diag::Periodicity)> {
+    if samples.len() < 16 {
+        return None;
+    }
+    let mut scored: Vec<(f32, diag::PressureChannel, diag::Periodicity)> = Vec::new();
+    for ch in diag::PressureChannel::ALL {
+        let series = diag::pressure_channel_series(samples, ch);
+        let p = diag::analyze_periodicity(&series, diag::AnalysisConfig::default());
+        let mean = series.iter().map(|s| s.overshoot_ms).sum::<f32>() / series.len().max(1) as f32;
+        let max = series.iter().map(|s| s.overshoot_ms).fold(0.0f32, f32::max);
+        let activity = (max - mean).clamp(0.0, 999.0);
+        // A detected period (1000 + confidence) always outranks mere activity.
+        let key = if p.period_s.is_some() { 1000.0 + p.confidence } else { activity };
+        scored.push((key, ch, p));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().next().map(|(_, ch, p)| (ch, p))
+}
+
+/// Write the once-per-second pressure-periodicity record (instrument #2).
+fn log_pressure_summary(w: &mut impl Write, ch: diag::PressureChannel, p: &diag::Periodicity) {
+    let period = p.period_s.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let freq = p.freq_hz.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let _ = writeln!(
+        w,
+        "{{\"type\":\"pressure_summary\",\"ts\":{:.3},\"channel\":{},\
+         \"period_s\":{},\"freq_hz\":{},\"confidence\":{:.3}}}",
+        unix_secs(), json_str(ch.label()), period, freq, p.confidence
+    );
+}
+
 /// Analyze a captured --scope-log file offline and print a text report.
 ///
 /// Reconstructs the latency series from `sample` records, reruns the same
@@ -2567,6 +2611,8 @@ fn run_scope_analyze(path: &str) -> Result<()> {
 
     let mut samples: Vec<diag::Sample> = Vec::new();
     let mut first_ts: Option<f64> = None;
+    let mut pressure: Vec<diag::PressureSample> = Vec::new();
+    let mut first_pts: Option<f64> = None;
     // Tally how often each signal was the top suspect across summary windows.
     let mut suspect_tally: HashMap<String, usize> = HashMap::new();
     let mut last_summary: Option<serde_json::Value> = None;
@@ -2581,6 +2627,18 @@ fn run_scope_analyze(path: &str) -> Result<()> {
                 if let (Some(ts), Some(ms)) = (v["ts"].as_f64(), v["ms"].as_f64()) {
                     let f0 = *first_ts.get_or_insert(ts);
                     samples.push(diag::Sample { t: ts - f0, overshoot_ms: ms as f32 });
+                }
+            }
+            Some("pressure") => {
+                if let Some(ts) = v["ts"].as_f64() {
+                    let f0 = *first_pts.get_or_insert(ts);
+                    pressure.push(diag::PressureSample {
+                        t: ts - f0,
+                        run_q: v["run_q"].as_f64().unwrap_or(0.0) as f32,
+                        cpu_us_s: v["cpu_us_s"].as_f64().unwrap_or(0.0) as f32,
+                        mem_us_s: v["mem_us_s"].as_f64().unwrap_or(0.0) as f32,
+                        io_us_s: v["io_us_s"].as_f64().unwrap_or(0.0) as f32,
+                    });
                 }
             }
             Some("summary") => last_summary = Some(v),
@@ -2623,6 +2681,20 @@ fn run_scope_analyze(path: &str) -> Result<()> {
         let stalls = s["stalls"].as_u64().unwrap_or(0);
         println!("  no suspects were logged ({stalls} stall intervals in the last window)");
     }
+
+    // Instrument #2: pressure periodicity (the channel that catches compositor /
+    // memory-bound freezes the CPU-wakeup probe cannot see).
+    if pressure.len() >= 16 {
+        match best_pressure_channel(&pressure) {
+            Some((ch, p)) if p.period_s.is_some() => {
+                let strong = p.confidence > 0.4;
+                println!("  system pressure ({}): recurring ≈ every {:.2} s ({:.2} Hz), confidence {:.0}% ({})",
+                    ch.label(), p.period_s.unwrap(), p.freq_hz.unwrap_or(0.0),
+                    p.confidence * 100.0, if strong { "strong" } else { "weak / quasi-periodic" });
+            }
+            _ => println!("  system pressure: no clear period in run-queue / PSI channels"),
+        }
+    }
     Ok(())
 }
 
@@ -2651,6 +2723,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("cannot create scope log: {path}"))?;
         state.scope_log = Some(std::io::BufWriter::new(file));
         state.scope = Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+        state.pressure = Some(diag::PressureProbe::spawn(Duration::from_millis(20), 12_000));
     }
 
     // Do an initial refresh before entering the TUI so the first frame shows data.
@@ -2741,6 +2814,17 @@ fn main() -> Result<()> {
                         unix_secs(), ms);
                 }
             }
+            // Capture log: the latest pressure sample per tick (run-queue + PSI).
+            if let (Some(probe), true) = (state.pressure.as_ref(), state.scope_log.is_some()) {
+                if let Some(s) = probe.snapshot().last().copied() {
+                    if let Some(w) = state.scope_log.as_mut() {
+                        let _ = writeln!(w,
+                            "{{\"type\":\"pressure\",\"ts\":{:.3},\"run_q\":{:.2},\
+                             \"cpu_us_s\":{:.0},\"mem_us_s\":{:.0},\"io_us_s\":{:.0}}}",
+                            unix_secs(), s.run_q, s.cpu_us_s, s.mem_us_s, s.io_us_s);
+                    }
+                }
+            }
         }
 
         // Recompute the latency-scope periodicity analysis and attribution report
@@ -2759,12 +2843,20 @@ fn main() -> Result<()> {
                 let st = diag::stats(&samples, tick_ms);
                 let threshold = (st.mean_ms * 4.0).max(5.0);
                 let report = state.scope_attrib.rank(threshold);
+                // Instrument #2: find the most-periodic pressure channel.
+                let pressure_samples = state.pressure.as_ref().map(|p| p.snapshot());
+                let best_pressure = pressure_samples.as_ref().and_then(|ps| best_pressure_channel(ps));
+
                 if let Some(w) = state.scope_log.as_mut() {
                     log_scope_summary(w, &st, &analysis, &report);
+                    if let Some((ch, ref pp)) = best_pressure {
+                        log_pressure_summary(w, ch, pp);
+                    }
                     let _ = w.flush();
                 }
                 state.scope_analysis = Some(analysis);
                 state.scope_report = Some(report);
+                state.pressure_analysis = best_pressure;
                 state.last_scope_analysis = Some(Instant::now());
             }
         }
@@ -2881,6 +2973,8 @@ fn main() -> Result<()> {
                             if state.scope.is_none() {
                                 state.scope =
                                     Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+                                state.pressure = Some(diag::PressureProbe::spawn(
+                                    Duration::from_millis(20), 12_000));
                             }
                             state.view = AppView::Scope;
                         }

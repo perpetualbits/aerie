@@ -199,6 +199,157 @@ fn probe_loop(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, tick: Duration)
     }
 }
 
+// ── Pressure probe (instrument #2) ─────────────────────────────────────────
+
+/// One system-pressure sample: the signals that move when the machine stalls in
+/// ways a CPU-wakeup probe can't see (a compositor blocking on memory refault or
+/// GPU work, the run queue spiking). Rates are per wall-second over the tick.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PressureSample {
+    /// Seconds since the probe started.
+    pub t: f64,
+    /// Run-queue depth — `procs_running` from /proc/stat.
+    pub run_q: f32,
+    /// CPU PSI "some" stall, microseconds per second.
+    pub cpu_us_s: f32,
+    /// Memory PSI "some" stall, microseconds per second.
+    pub mem_us_s: f32,
+    /// I/O PSI "some" stall, microseconds per second.
+    pub io_us_s: f32,
+}
+
+/// Which channel of a [`PressureSample`] to analyse / display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PressureChannel {
+    RunQueue,
+    CpuStall,
+    MemStall,
+    IoStall,
+}
+
+impl PressureChannel {
+    pub const ALL: [PressureChannel; 4] = [
+        PressureChannel::RunQueue,
+        PressureChannel::CpuStall,
+        PressureChannel::MemStall,
+        PressureChannel::IoStall,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            PressureChannel::RunQueue => "run-queue",
+            PressureChannel::CpuStall => "CPU stall",
+            PressureChannel::MemStall => "memory stall",
+            PressureChannel::IoStall => "I/O stall",
+        }
+    }
+    pub fn unit(self) -> &'static str {
+        match self {
+            PressureChannel::RunQueue => "procs",
+            _ => "µs/s",
+        }
+    }
+    pub fn value(self, s: &PressureSample) -> f32 {
+        match self {
+            PressureChannel::RunQueue => s.run_q,
+            PressureChannel::CpuStall => s.cpu_us_s,
+            PressureChannel::MemStall => s.mem_us_s,
+            PressureChannel::IoStall => s.io_us_s,
+        }
+    }
+}
+
+struct PressureShared {
+    ring: VecDeque<PressureSample>,
+    capacity: usize,
+}
+
+/// Samples system-wide stall indicators on a dedicated thread. Companion to
+/// [`LatencyProbe`]: where that measures CPU scheduling latency, this measures the
+/// pressure signals whose periodicity reveals compositor/memory-bound freezes.
+pub struct PressureProbe {
+    shared: Arc<Mutex<PressureShared>>,
+    stop: Arc<AtomicBool>,
+    _handle: JoinHandle<()>,
+}
+
+impl PressureProbe {
+    /// Spawn the pressure-sampling thread. `tick` ~20 ms (50 Hz) resolves the
+    /// few-Hz rhythms typical of a thrash/refault stall cheaply.
+    pub fn spawn(tick: Duration, capacity: usize) -> Self {
+        let shared = Arc::new(Mutex::new(PressureShared {
+            ring: VecDeque::with_capacity(capacity.min(4096)),
+            capacity: capacity.max(1),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared_t = Arc::clone(&shared);
+        let stop_t = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("aerie-pressure-probe".into())
+            .spawn(move || pressure_loop(shared_t, stop_t, tick))
+            .expect("spawn pressure probe thread");
+        Self { shared, stop, _handle: handle }
+    }
+
+    pub fn snapshot(&self) -> Vec<PressureSample> {
+        let g = self.shared.lock().unwrap();
+        g.ring.iter().copied().collect()
+    }
+}
+
+impl Drop for PressureProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Map one channel of a pressure series into the generic [`Sample`] shape so the
+/// shared periodicity analyzer and stats can run on it unchanged.
+pub fn pressure_channel_series(samples: &[PressureSample], ch: PressureChannel) -> Vec<Sample> {
+    samples.iter().map(|s| Sample { t: s.t, overshoot_ms: ch.value(s) }).collect()
+}
+
+fn pressure_loop(shared: Arc<Mutex<PressureShared>>, stop: Arc<AtomicBool>, tick: Duration) {
+    let start = Instant::now();
+    let mut prev: Option<(u64, u64, u64, Instant)> = None; // psi cpu/mem/io totals + when
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(tick);
+        let now = Instant::now();
+        let run_q = read_procs_running();
+        let cpu = read_psi_some_total("/proc/pressure/cpu").unwrap_or(0);
+        let mem = read_psi_some_total("/proc/pressure/memory").unwrap_or(0);
+        let io = read_psi_some_total("/proc/pressure/io").unwrap_or(0);
+        if let Some((pc, pm, pi, pt)) = prev {
+            let dt = now.duration_since(pt).as_secs_f64().max(1e-4);
+            let rate = |c: u64, p: u64| (c.saturating_sub(p) as f64 / dt) as f32;
+            let sample = PressureSample {
+                t: now.duration_since(start).as_secs_f64(),
+                run_q: run_q as f32,
+                cpu_us_s: rate(cpu, pc),
+                mem_us_s: rate(mem, pm),
+                io_us_s: rate(io, pi),
+            };
+            let mut g = shared.lock().unwrap();
+            if g.ring.len() >= g.capacity {
+                g.ring.pop_front();
+            }
+            g.ring.push_back(sample);
+        }
+        prev = Some((cpu, mem, io, now));
+    }
+}
+
+/// Read `procs_running` (run-queue depth) from /proc/stat.
+fn read_procs_running() -> u64 {
+    if let Ok(stat) = std::fs::read_to_string("/proc/stat") {
+        for line in stat.lines() {
+            if let Some(rest) = line.strip_prefix("procs_running ") {
+                return rest.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
 /// Compute [`ProbeStats`] over a slice of samples (oldest → newest).
 ///
 /// `tick_ms` is carried through for display context. Percentile uses the
@@ -358,24 +509,25 @@ pub fn analyze_periodicity(samples: &[Sample], cfg: AnalysisConfig) -> Periodici
         .min(n / 3)
         .max(lag_min + 1);
     let mut corr = vec![0.0f64; lag_max + 1];
-    for lag in lag_min..=lag_max {
+    for (lag, slot) in corr.iter_mut().enumerate().take(lag_max + 1).skip(lag_min) {
         let mut acc = 0.0f64;
         for i in 0..(n - lag) {
             acc += grid[i] as f64 * grid[i + lag] as f64;
         }
-        corr[lag] = acc / energy; // normalised: r(0) == 1
+        *slot = acc / energy; // normalised: r(0) == 1
     }
     // Skip the *central lobe*. The autocorrelation always rises toward lag 0
     // because a stall spans several bins, so short-lag self-similarity is spike
     // *width*, not periodicity — reporting it (e.g. "every 0.25 s") is wrong. Start
     // searching past the first point where the correlation falls to zero.
-    let mut search_from = lag_min;
-    for lag in lag_min..lag_max {
-        if corr[lag] <= 0.0 {
-            search_from = lag;
-            break;
-        }
-    }
+    let search_from = corr
+        .iter()
+        .enumerate()
+        .take(lag_max)
+        .skip(lag_min)
+        .find(|(_, &r)| r <= 0.0)
+        .map(|(lag, _)| lag)
+        .unwrap_or(lag_min);
     // Strongest correlation beyond the central lobe is the candidate period (or a
     // harmonic of it). A spike train peaks at every multiple of the period with
     // near-equal height, so fold to the *smallest* lag that reaches most of that

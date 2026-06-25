@@ -1209,6 +1209,38 @@ fn fill_braille_plot(buf: &mut Buffer, area: Rect, heights: &[f32]) {
     );
 }
 
+/// Draw a bottom-anchored, severity-coloured braille trace of a time-series into
+/// `area`, normalised to `ceil`, with a top-left scale label and a "0" baseline.
+/// Shared by the latency trace and the system-pressure trace.
+fn draw_series_trace(
+    buf: &mut Buffer,
+    area: Rect,
+    samples: &[crate::diag::Sample],
+    ceil: f32,
+    top_label: &str,
+) {
+    if area.height == 0 || area.width == 0 || samples.len() < 2 {
+        return;
+    }
+    let faint = Style::default().fg(Color::Rgb(90, 90, 90));
+    let nb = area.width as usize * 2;
+    let t0 = samples[0].t;
+    let span = (samples[samples.len() - 1].t - t0).max(1e-9);
+    let c = ceil.max(1e-6);
+    let mut heights = vec![0.0f32; nb];
+    for s in samples {
+        let frac = ((s.t - t0) / span).clamp(0.0, 1.0);
+        let b = ((frac * nb as f64) as usize).min(nb - 1);
+        let h = (s.overshoot_ms / c).clamp(0.0, 1.0);
+        if h > heights[b] {
+            heights[b] = h;
+        }
+    }
+    fill_braille_plot(buf, area, &heights);
+    buf.set_string(area.x, area.y, top_label, faint);
+    buf.set_string(area.x, area.bottom().saturating_sub(1), "0 ┘", faint);
+}
+
 /// Render the latency scope: a live braille trace of the wakeup-jitter probe.
 ///
 /// The probe ([`crate::diag::LatencyProbe`]) measures how late each of its own
@@ -1323,63 +1355,54 @@ fn render_scope(buf: &mut Buffer, area: Rect, state: &AppState) {
         return;
     }
 
-    // ── Layout: latency trace on top, spectrum strip below (if tall enough) ─
+    // ── Layout: latency trace (top) + system-pressure trace (bottom) ──────
+    // The two instruments answer different questions: the CPU-wakeup trace shows
+    // scheduling jitter; the pressure trace shows run-queue / PSI stall, which
+    // catches compositor- and memory-bound freezes the wakeup probe is blind to.
     let body_top = area.y + 4;
     let body_h = area.height.saturating_sub(4);
     if body_h == 0 { return; }
-    // Reserve a 7-row spectrum block (1 label + 6 plot) only when there's room.
-    let (trace_h, spec_h) = if body_h >= 14 { (body_h - 7, 6u16) } else { (body_h, 0) };
 
-    // Latency trace: bucket samples across sub-pixel-x, max per bucket so a
-    // single-frame spike survives; normalise to the window peak.
-    let trace = Rect::new(area.x, body_top, area.width, trace_h);
-    let nb = trace.width as usize * 2;
-    let t0 = samples[0].t;
-    let span = (samples[samples.len() - 1].t - t0).max(1e-9);
-    let ceil = st.max_ms.max(1e-3);
-    let mut heights = vec![0.0f32; nb];
-    for s in &samples {
-        let frac = ((s.t - t0) / span).clamp(0.0, 1.0);
-        let b = ((frac * nb as f64) as usize).min(nb - 1);
-        let h = (s.overshoot_ms / ceil).clamp(0.0, 1.0);
-        if h > heights[b] { heights[b] = h; }
-    }
-    fill_braille_plot(buf, trace, &heights);
-    buf.set_string(trace.x, trace.y, &format!("{ceil:.1} ms ┐"), faint);
-    buf.set_string(trace.x, trace.bottom().saturating_sub(1), "0 ┘", faint);
+    let two = body_h >= 8 && state.pressure.is_some();
+    let lat_h = if two { (body_h - 1) / 2 } else { body_h };
 
-    // ── Spectrum strip ────────────────────────────────────────────────────
-    if spec_h > 0 {
-        let label_y = body_top + trace_h;
-        let spec = Rect::new(area.x, label_y + 1, area.width, spec_h);
-        if let Some(a) = state.scope_analysis.as_ref() {
-            if !a.spectrum.is_empty() {
-                // Spectral argmax → peak frequency (log-spaced band) for the label.
-                let bins = a.spectrum.len();
-                let (peak_k, _) = a.spectrum.iter().enumerate()
-                    .fold((0usize, 0.0f32), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
-                let frac = if bins > 1 { peak_k as f64 / (bins - 1) as f64 } else { 0.0 };
-                let peak_hz = a.freq_lo * (a.freq_hi / a.freq_lo).powf(frac);
+    let lat_ceil = st.max_ms.max(1e-3);
+    draw_series_trace(buf, Rect::new(area.x, body_top, area.width, lat_h),
+        &samples, lat_ceil, &format!("{lat_ceil:.1} ms ┐  wakeup latency"));
 
-                let mut x = buf.set_string(area.x, label_y, " spectrum  ", dim);
-                x = buf.set_string(x, label_y,
-                    &format!("{:.2}–{:.0} Hz (log)", a.freq_lo, a.freq_hi), faint);
-                x = buf.set_string(x, label_y, "   peak ", faint);
-                buf.set_string(x, label_y, &format!("{peak_hz:.2} Hz"),
-                    Style::default().fg(Color::Rgb(235, 120, 40)));
+    if two {
+        let head_y = body_top + lat_h;
+        let pres_rect = Rect::new(area.x, head_y + 1, area.width, body_h - lat_h - 1);
+        let ch = state.pressure_analysis.as_ref().map(|(c, _)| *c)
+            .unwrap_or(crate::diag::PressureChannel::MemStall);
 
-                // Resample the (log-spaced) spectrum onto the plot's sub-pixels,
-                // taking the max across each column's bin range to keep peaks.
-                let snb = spec.width as usize * 2;
-                let mut sheights = vec![0.0f32; snb];
-                for (j, h) in sheights.iter_mut().enumerate() {
-                    let lo = j * bins / snb;
-                    let hi = ((j + 1) * bins / snb).max(lo + 1).min(bins);
-                    *h = a.spectrum[lo..hi].iter().copied().fold(0.0f32, f32::max);
-                }
-                fill_braille_plot(buf, spec, &sheights);
+        // Pressure periodicity headline — the key contrast with the latency one.
+        match state.pressure_analysis.as_ref() {
+            Some((c, p)) if p.period_s.is_some() => {
+                let strong = p.confidence > 0.4;
+                let col = if strong { Color::Rgb(235, 120, 40) } else { Color::Rgb(190, 190, 70) };
+                let mut x = buf.set_string(area.x, head_y,
+                    &format!(" system pressure [{}]: recurring ≈ every ", c.label()), faint);
+                x = buf.set_string(x, head_y, &format!("{:.2} s", p.period_s.unwrap()),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD));
+                buf.set_string(x, head_y,
+                    &format!("  ({:.2} Hz)  ·  confidence {:.0}% ({})",
+                        p.freq_hz.unwrap_or(0.0), p.confidence * 100.0,
+                        if strong { "strong" } else { "weak / quasi-periodic" }), faint);
             }
+            Some((c, _)) => {
+                buf.set_string(area.x, head_y, &format!(
+                    " system pressure [{}]: no clear period (showing the most active channel)",
+                    c.label()), dim);
+            }
+            None => { buf.set_string(area.x, head_y, " system pressure: gathering…", dim); }
         }
+
+        let ps = state.pressure.as_ref().map(|p| p.snapshot()).unwrap_or_default();
+        let series = crate::diag::pressure_channel_series(&ps, ch);
+        let ceil = series.iter().map(|s| s.overshoot_ms).fold(0.0f32, f32::max).max(1e-6);
+        draw_series_trace(buf, pres_rect, &series, ceil,
+            &format!("{:.0} {} ┐  {}", ceil, ch.unit(), ch.label()));
     }
 }
 
@@ -1669,9 +1692,12 @@ fn manual_lines() -> Vec<String> {
         "  late its own timed wakeups are. That overshoot is the system scheduling".into(),
         "  jitter that makes every realtime UI (TUIs, video, audio) stutter at the".into(),
         "  same cadence — so it isolates a system-wide cause from a per-app one.".into(),
-        "  The view shows a live latency trace, a periodicity readout (the recurring".into(),
-        "  stall's period and a spectrum), and a ranked list of the system signals".into(),
-        "  (IRQ/softirq, I/O & memory pressure, power) that co-occur with the stalls.".into(),
+        "  Two stacked traces: wakeup latency (CPU scheduling jitter) and system".into(),
+        "  pressure (run-queue + PSI stall) — the latter catches compositor- and".into(),
+        "  memory-bound freezes that delay rendering without delaying CPU threads.".into(),
+        "  Each carries a periodicity readout (the recurring stall's period); a".into(),
+        "  ranked list names the system signals (IRQ/softirq, I/O & memory pressure,".into(),
+        "  power) that co-occur with the latency stalls.".into(),
         "".into(),
         "  --scope-log FILE      capture diagnostics to FILE (line-delimited JSON)".into(),
         "                        for the whole session, even without opening the view.".into(),

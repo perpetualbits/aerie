@@ -202,11 +202,15 @@ task, an IRQ storm, a CPU C-state/frequency transition, memory reclaim) apart
 from a per-app one. If TUIs, video playback, and audio all hitch at the same
 cadence, this is the instrument that finds it.
 
-The view shows three things:
+The view shows:
 
-- a **live latency trace** (green calm → red stall), with `now / mean / p99 / max`;
-- a **periodicity readout** — the recurring stall's period and frequency, with a
-  log-frequency power spectrum, via autocorrelation + a narrow-band DFT;
+- two **live traces** (green calm → red stall): **wakeup latency** (CPU scheduling
+  jitter) on top, **system pressure** (run-queue depth + PSI stall time) below.
+  The pressure trace is the one that catches compositor- and memory-bound freezes
+  — stalls that delay *rendering* without delaying a CPU thread, so the latency
+  probe alone is blind to them;
+- a **periodicity readout** per trace — the recurring stall's period and frequency,
+  via autocorrelation (central-lobe-skipping) + a narrow-band DFT;
 - a **ranked culprit list** — which system signals (IRQ/softirq, I/O & memory
   pressure, kernel CPU, power draw) are reliably elevated during the stalls
   versus calm periods.
