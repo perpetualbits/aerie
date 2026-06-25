@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
 use mullion::{Buffer, BorderGap, Rect, gaussian, render_rim, tree::id_from_key};
+use mullion::field::Field;
 use mullion::layout::TileId;
 use mullion::label::Align;
 use mullion::style::{Color, Modifier, Style};
@@ -47,6 +48,7 @@ pub fn render(buf: &mut Buffer, state: &mut AppState) {
         AppView::Threads { .. } => render_body(buf, body_rect, state),
         AppView::Manual => render_manual(buf, body_rect, state),
         AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
+        AppView::Scope => render_scope(buf, body_rect, state),
     }
 }
 
@@ -56,6 +58,7 @@ fn has_header_content(state: &AppState) -> bool {
         AppView::Groups => state.error.is_some() || state.proxmox_insecure,
         AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Manual => true,
         AppView::Threads { .. } => false, // thread info lives in the right pane
+        AppView::Scope => false,          // scope draws its own header rows in the body
     }
 }
 
@@ -92,7 +95,7 @@ fn render_header_content(buf: &mut Buffer, area: Rect, state: &AppState) {
             x = buf.set_string(x, area.y,
                 "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", dim);
         }
-        AppView::Threads { .. } => {}
+        AppView::Threads { .. } | AppView::Scope => {}
     }
     let _ = x;
 }
@@ -332,6 +335,7 @@ fn border_status(state: &AppState) -> String {
         }
         AppView::Manual => "manual".to_string(),
         AppView::Connecting { label } => format!("connecting to {label}"),
+        AppView::Scope => "latency scope · system wakeup jitter".to_string(),
         _ => {
             let parts = groups_status_parts(state);
             parts.join("  ·  ")
@@ -366,6 +370,8 @@ fn border_keys(state: &AppState) -> String {
             "[↑/↓] scroll  [m] close  [q] quit".to_string(),
         AppView::Connecting { .. } =>
             "[Esc] cancel  [q] quit".to_string(),
+        AppView::Scope =>
+            "[d] or [Esc] close  [q] quit".to_string(),
     }
 }
 
@@ -1166,6 +1172,217 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
     }
 }
 
+/// Map a normalised level `[0, 1]` to a green → yellow → red heat colour.
+/// Used to colour latency bars by height (low = calm green, high = alarming red).
+fn heat_color(level: f32) -> Color {
+    let l = level.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32, t: f32| (a + (b - a) * t) as u8;
+    if l < 0.5 {
+        let t = l * 2.0; // green → yellow
+        Color::Rgb(lerp(40.0, 220.0, t), lerp(200.0, 200.0, t), lerp(60.0, 40.0, t))
+    } else {
+        let t = (l - 0.5) * 2.0; // yellow → red
+        Color::Rgb(lerp(220.0, 235.0, t), lerp(200.0, 55.0, t), lerp(40.0, 40.0, t))
+    }
+}
+
+/// Fill `area` with a bottom-anchored braille plot from a pre-normalised
+/// `heights` array (`[0, 1]`, one entry per sub-pixel column, length = `2·width`).
+/// Each column is coloured by its height via [`heat_color`]. Shared by the
+/// latency trace and the spectrum plot.
+fn fill_braille_plot(buf: &mut Buffer, area: Rect, heights: &[f32]) {
+    if area.width == 0 || area.height == 0 || heights.is_empty() {
+        return;
+    }
+    let nb = heights.len();
+    let field = Field::rect(area);
+    field.render_braille_xy(
+        buf,
+        |u, v| {
+            let b = ((u * nb as f32) as usize).min(nb - 1);
+            if (1.0 - v) <= heights[b] { 1.0 } else { 0.0 }
+        },
+        |_mean, u, _v| {
+            let b = ((u * nb as f32) as usize).min(nb - 1);
+            Style::default().fg(heat_color(heights[b]))
+        },
+    );
+}
+
+/// Render the latency scope: a live braille trace of the wakeup-jitter probe.
+///
+/// The probe ([`crate::diag::LatencyProbe`]) measures how late each of its own
+/// timed wakeups is; that overshoot series is the system scheduling jitter that
+/// stutters every realtime UI on the machine. The trace fills from the bottom and
+/// is coloured by height (green calm → red stall); the readout row gives the
+/// honest magnitudes so a flat-but-tall-looking trace can be read as "all fine,
+/// peak 0.2 ms" rather than misread off the normalised shape.
+fn render_scope(buf: &mut Buffer, area: Rect, state: &AppState) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let faint = Style::default().fg(Color::Rgb(90, 90, 90));
+
+    let Some(probe) = state.scope.as_ref() else {
+        buf.set_string(area.x, area.y, "  starting latency probe…", dim);
+        return;
+    };
+    if area.height < 4 || area.width < 12 {
+        buf.set_string(area.x, area.y, " (resize)", dim);
+        return;
+    }
+
+    let samples = probe.snapshot();
+    let st = crate::diag::stats(&samples, probe.tick_ms());
+
+    // ── Header rows ───────────────────────────────────────────────────────
+    let hz = if st.tick_ms > 0.0 { 1000.0 / st.tick_ms } else { 0.0 };
+    let title = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let mut x = buf.set_string(area.x, area.y, " latency scope", title);
+    x = buf.set_string(x, area.y,
+        &format!("   tick {:.1} ms ({:.0} Hz)   window {:.0} s   n={}",
+            st.tick_ms, hz, st.window_s, st.count),
+        dim);
+    let _ = x;
+
+    // Readout row: honest magnitudes (max coloured by severity).
+    let max_style = Style::default()
+        .fg(if st.max_ms >= 10.0 { Color::Rgb(235, 60, 40) }
+            else if st.max_ms >= 3.0 { Color::Rgb(220, 200, 40) }
+            else { Color::Rgb(40, 200, 60) })
+        .add_modifier(Modifier::BOLD);
+    let mut x = buf.set_string(area.x, area.y + 1, " now ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.last_ms),
+        Style::default().fg(Color::Gray));
+    x = buf.set_string(x, area.y + 1, "   mean ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.mean_ms),
+        Style::default().fg(Color::Gray));
+    x = buf.set_string(x, area.y + 1, "   p99 ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.p99_ms),
+        Style::default().fg(Color::Gray));
+    x = buf.set_string(x, area.y + 1, "   max ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.max_ms), max_style);
+    let _ = x;
+
+    // ── Periodicity headline (row y+2) ────────────────────────────────────
+    let headline_y = area.y + 2;
+    match state.scope_analysis.as_ref() {
+        Some(a) if a.period_s.is_some() => {
+            let period = a.period_s.unwrap();
+            let f = a.freq_hz.unwrap_or(0.0);
+            let conf = (a.confidence * 100.0).round() as u32;
+            let strong = a.confidence > 0.4;
+            let verdict = if strong { "strong" } else { "weak / quasi-periodic" };
+            let col = if strong { Color::Rgb(235, 120, 40) } else { Color::Rgb(190, 190, 70) };
+            let mut x = buf.set_string(area.x, headline_y, " recurring stall ≈ every ", faint);
+            x = buf.set_string(x, headline_y, &format!("{period:.2} s"),
+                Style::default().fg(col).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, headline_y,
+                &format!("  ({f:.2} Hz)  ·  confidence {conf}% ({verdict})"), faint);
+            let _ = x;
+        }
+        Some(_) => {
+            buf.set_string(area.x, headline_y,
+                " no clear periodicity yet — keep the scope open while the stutter happens", dim);
+        }
+        None => {
+            buf.set_string(area.x, headline_y, " analysing…", dim);
+        }
+    }
+
+    // ── Attribution line (row y+3): what co-occurs with the stalls ────────
+    let attrib_y = area.y + 3;
+    match state.scope_report.as_ref() {
+        Some(r) if !r.suspects.is_empty() => {
+            let top = &r.suspects[0];
+            let mut x = buf.set_string(area.x, attrib_y, " likely cause: ", faint);
+            x = buf.set_string(x, attrib_y, top.name,
+                Style::default().fg(Color::Rgb(235, 120, 40)).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, attrib_y,
+                &format!(" ({:.0}{} during stalls vs {:.0} calm)", top.spike_mean, top.unit, top.base_mean),
+                Style::default().fg(Color::Gray));
+            x = buf.set_string(x, attrib_y, &format!("  ·  {}", top.hint), faint);
+            if r.suspects.len() > 1 {
+                let also: Vec<&str> = r.suspects[1..].iter().take(2).map(|s| s.name).collect();
+                buf.set_string(x, attrib_y, &format!("   also: {}", also.join(", ")), faint);
+            }
+        }
+        Some(r) if r.spike_count < 3 => {
+            buf.set_string(area.x, attrib_y,
+                &format!(" attribution: only {} stall(s) seen — waiting for more", r.spike_count), dim);
+        }
+        Some(_) => {
+            buf.set_string(area.x, attrib_y,
+                " attribution: no system signal clearly tracks the stalls", dim);
+        }
+        None => {
+            buf.set_string(area.x, attrib_y, " gathering attribution…", dim);
+        }
+    }
+
+    if samples.len() < 2 {
+        buf.set_string(area.x, area.y + 4, "  collecting latency samples…", dim);
+        return;
+    }
+
+    // ── Layout: latency trace on top, spectrum strip below (if tall enough) ─
+    let body_top = area.y + 4;
+    let body_h = area.height.saturating_sub(4);
+    if body_h == 0 { return; }
+    // Reserve a 7-row spectrum block (1 label + 6 plot) only when there's room.
+    let (trace_h, spec_h) = if body_h >= 14 { (body_h - 7, 6u16) } else { (body_h, 0) };
+
+    // Latency trace: bucket samples across sub-pixel-x, max per bucket so a
+    // single-frame spike survives; normalise to the window peak.
+    let trace = Rect::new(area.x, body_top, area.width, trace_h);
+    let nb = trace.width as usize * 2;
+    let t0 = samples[0].t;
+    let span = (samples[samples.len() - 1].t - t0).max(1e-9);
+    let ceil = st.max_ms.max(1e-3);
+    let mut heights = vec![0.0f32; nb];
+    for s in &samples {
+        let frac = ((s.t - t0) / span).clamp(0.0, 1.0);
+        let b = ((frac * nb as f64) as usize).min(nb - 1);
+        let h = (s.overshoot_ms / ceil).clamp(0.0, 1.0);
+        if h > heights[b] { heights[b] = h; }
+    }
+    fill_braille_plot(buf, trace, &heights);
+    buf.set_string(trace.x, trace.y, &format!("{ceil:.1} ms ┐"), faint);
+    buf.set_string(trace.x, trace.bottom().saturating_sub(1), "0 ┘", faint);
+
+    // ── Spectrum strip ────────────────────────────────────────────────────
+    if spec_h > 0 {
+        let label_y = body_top + trace_h;
+        let spec = Rect::new(area.x, label_y + 1, area.width, spec_h);
+        if let Some(a) = state.scope_analysis.as_ref() {
+            if !a.spectrum.is_empty() {
+                // Spectral argmax → peak frequency (log-spaced band) for the label.
+                let bins = a.spectrum.len();
+                let (peak_k, _) = a.spectrum.iter().enumerate()
+                    .fold((0usize, 0.0f32), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+                let frac = if bins > 1 { peak_k as f64 / (bins - 1) as f64 } else { 0.0 };
+                let peak_hz = a.freq_lo * (a.freq_hi / a.freq_lo).powf(frac);
+
+                let mut x = buf.set_string(area.x, label_y, " spectrum  ", dim);
+                x = buf.set_string(x, label_y,
+                    &format!("{:.2}–{:.0} Hz (log)", a.freq_lo, a.freq_hi), faint);
+                x = buf.set_string(x, label_y, "   peak ", faint);
+                buf.set_string(x, label_y, &format!("{peak_hz:.2} Hz"),
+                    Style::default().fg(Color::Rgb(235, 120, 40)));
+
+                // Resample the (log-spaced) spectrum onto the plot's sub-pixels,
+                // taking the max across each column's bin range to keep peaks.
+                let snb = spec.width as usize * 2;
+                let mut sheights = vec![0.0f32; snb];
+                for (j, h) in sheights.iter_mut().enumerate() {
+                    let lo = j * bins / snb;
+                    let hi = ((j + 1) * bins / snb).max(lo + 1).min(bins);
+                    *h = a.spectrum[lo..hi].iter().copied().fold(0.0f32, f32::max);
+                }
+                fill_braille_plot(buf, spec, &sheights);
+            }
+        }
+    }
+}
+
 /// Render the "Connecting to <label>…" splash shown while `connect_vm` is blocking.
 ///
 /// This is drawn synchronously with `terminal.draw()` before the SSH call starts,
@@ -1375,6 +1592,7 @@ fn manual_lines() -> Vec<String> {
         "NAVIGATION".into(),
         "  [↑] [↓]  or  [j] [k]    move cursor up / down through the group list".into(),
         "  [Enter]                  open thread heatmap for the selected group".into(),
+        "  [d]                      toggle the latency scope (diagnostics)".into(),
         "  [Esc]                    return from thread view or manual to group list".into(),
         "  [q]  [Ctrl-C]            quit".into(),
         "".into(),
@@ -1445,6 +1663,21 @@ fn manual_lines() -> Vec<String> {
         "  Fired when a group's load concentration drops below the alert threshold.".into(),
         "  Args: GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION".into(),
         "  Rate-limited to once per 60 seconds per group.".into(),
+        "".into(),
+        "LATENCY SCOPE (DIAGNOSTICS)".into(),
+        "  Press [d] to open a built-in cyclictest: a dedicated thread measures how".into(),
+        "  late its own timed wakeups are. That overshoot is the system scheduling".into(),
+        "  jitter that makes every realtime UI (TUIs, video, audio) stutter at the".into(),
+        "  same cadence — so it isolates a system-wide cause from a per-app one.".into(),
+        "  The view shows a live latency trace, a periodicity readout (the recurring".into(),
+        "  stall's period and a spectrum), and a ranked list of the system signals".into(),
+        "  (IRQ/softirq, I/O & memory pressure, power) that co-occur with the stalls.".into(),
+        "".into(),
+        "  --scope-log FILE      capture diagnostics to FILE (line-delimited JSON)".into(),
+        "                        for the whole session, even without opening the view.".into(),
+        "  --scope-analyze FILE  print an offline report from a captured log and exit.".into(),
+        "  Tip: run  aerie --scope-log run.jsonl  during a session that stutters (e.g.".into(),
+        "  a DAW), then  aerie --scope-analyze run.jsonl  to inspect it afterwards.".into(),
     ]
 }
 

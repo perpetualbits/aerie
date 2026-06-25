@@ -29,6 +29,9 @@ Press `m` for the full built-in manual, or `aerie -m | less` from the shell.
   metrics, drill into any pod with `kubectl exec`
 - **Replay / scrub** — `p` to pause, `←`/`→` to scrub through buffered history
   (default 4 minutes at 2 s interval)
+- **Latency scope** (`d`) — built-in cyclictest that finds *system-wide* scheduling
+  jitter, the recurring stall that stutters TUIs, video, and audio alike; periodicity
+  analysis + ranked culprit attribution, with optional capture log (`--scope-log`)
 - **Anomaly detection** — load-concentration alerts with optional shell hook
   (`--alert-cmd`)
 - **Built-in manual** — `m` in the TUI or `aerie -m` at the shell
@@ -108,6 +111,7 @@ aerie -m | less
 | `r` | Force immediate refresh |
 | `p` | Pause / resume (frozen display) |
 | `[` / `]` | Cycle GPU device (with `--enable-gpu`) |
+| `d` | Toggle latency scope (diagnostics) |
 | `Enter` | Drill into VM / host / pod |
 | `Esc` | Return to group list |
 | `m` | Toggle built-in manual |
@@ -147,6 +151,10 @@ GPU:
 History / Alerts:
       --history-depth <N>     Ring-buffer depth in snapshots (default: 120)
       --alert-cmd <CMD>       Shell command fired on anomaly detection
+
+Diagnostics:
+      --scope-log <FILE>      Capture latency-scope diagnostics to FILE (JSONL)
+      --scope-analyze <FILE>  Print an offline report from a capture log and exit
 ```
 
 ## GPU support
@@ -182,6 +190,37 @@ aerie --enable-remote --hosts web1,web2,db1
 
 Each host appears as a row; metrics are the busiest process group on that host.
 Press Enter to drill in. Use `--thin` for hosts without aerie installed.
+
+## Latency scope
+
+Press `d` for the latency scope — a built-in [cyclictest](https://wiki.linuxfoundation.org/realtime/documentation/howto/tools/cyclictest/start).
+A dedicated thread asks the OS to wake it on a fixed interval and records how
+*late* each wakeup actually is. That overshoot series is the system-wide
+scheduling jitter that makes realtime UIs stutter — and because it is measured
+independently of any application, it tells a *system* cause (a periodic kernel
+task, an IRQ storm, a CPU C-state/frequency transition, memory reclaim) apart
+from a per-app one. If TUIs, video playback, and audio all hitch at the same
+cadence, this is the instrument that finds it.
+
+The view shows three things:
+
+- a **live latency trace** (green calm → red stall), with `now / mean / p99 / max`;
+- a **periodicity readout** — the recurring stall's period and frequency, with a
+  log-frequency power spectrum, via autocorrelation + a narrow-band DFT;
+- a **ranked culprit list** — which system signals (IRQ/softirq, I/O & memory
+  pressure, kernel CPU, power draw) are reliably elevated during the stalls
+  versus calm periods.
+
+For intermittent stalls you can't sit and watch, capture a whole session and
+inspect it later:
+
+```bash
+# Record during a session that stutters (e.g. a DAW), even without opening the view:
+aerie --scope-log ~/jitter.jsonl
+
+# Afterwards, print an offline report (period, magnitudes, logged suspects):
+aerie --scope-analyze ~/jitter.jsonl
+```
 
 ## Anomaly alerts
 

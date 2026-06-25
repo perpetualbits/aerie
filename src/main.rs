@@ -14,6 +14,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+mod diag;
 mod local;
 mod proxmox;
 mod remote;
@@ -33,6 +34,7 @@ use mullion::{
 use std::{
     collections::HashMap,
     io,
+    io::Write,
     sync::{
         mpsc,
         Arc,
@@ -121,6 +123,20 @@ struct Cli {
     /// Print the built-in manual and exit
     #[arg(short = 'm', long)]
     manual: bool,
+
+    /// Stream latency-scope diagnostics to FILE as line-delimited JSON while aerie
+    /// runs. Spawns the wakeup-jitter probe at startup so a whole session is
+    /// captured even if you never open the scope view (press 'd'). Inspect later
+    /// with --scope-analyze. Ideal for catching intermittent stalls (e.g. during
+    /// a Bitwig session) you are not watching live.
+    #[arg(long)]
+    scope_log: Option<String>,
+
+    /// Analyze a previously captured --scope-log FILE offline and print a report
+    /// (period, magnitudes, dominant frequency, logged suspects), then exit.
+    /// Runs without a TUI and does not read /proc.
+    #[arg(long)]
+    scope_analyze: Option<String>,
 
     /// [EXPERIMENTAL] Monitor Kubernetes pods via kubectl exec.
     /// Accepts NAMESPACE or NAMESPACE/SELECTOR (label selector).
@@ -352,6 +368,9 @@ pub enum AppView {
     Connecting { label: String },
     /// Showing live process data from a remote VM over SSH.
     Remote { label: String },
+    /// Latency scope: the wakeup-jitter diagnostic (Instruments subsystem).
+    /// Full-body view driven by the `diag::LatencyProbe`; toggled with `d`.
+    Scope,
 }
 
 /// Grouping strategy for local /proc scanning.
@@ -968,6 +987,24 @@ pub struct AppState {
     /// When true, display uses EWMA-smoothed values instead of raw tick values.
     /// Useful at sub-second refresh rates where raw values are too noisy to read.
     pub smooth_display: bool,
+    // ── diagnostics (Instruments subsystem) ───────────────────────────────
+    /// Wakeup-latency probe. `None` until the scope view is first opened with
+    /// `d`; once spawned it keeps running so history accumulates across toggles.
+    pub scope: Option<diag::LatencyProbe>,
+    /// Cached periodicity analysis of the probe series, recomputed ~once/sec
+    /// while the scope view is open (the analysis is too heavy for every frame).
+    pub scope_analysis: Option<diag::Periodicity>,
+    /// When the periodicity analysis was last recomputed.
+    pub last_scope_analysis: Option<Instant>,
+    /// Spike attributor: correlates latency stalls with system-counter deltas.
+    /// Sampled every main-loop tick while the scope is open.
+    pub scope_attrib: diag::Attributor,
+    /// Wall-clock time of the last attributor sample (for the interval delta).
+    pub scope_attrib_at: Option<Instant>,
+    /// Cached ranked-suspect report, recomputed with the periodicity analysis.
+    pub scope_report: Option<diag::AttribReport>,
+    /// Open capture-log writer when --scope-log is set; receives JSONL records.
+    pub scope_log: Option<std::io::BufWriter<std::fs::File>>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1497,6 +1534,13 @@ impl AppState {
             theme: Theme::default(),
             ewma_vals: HashMap::new(),
             smooth_display: Duration::from_secs_f64(cli.interval) < Duration::from_millis(400),
+            scope: None,
+            scope_analysis: None,
+            last_scope_analysis: None,
+            scope_attrib: diag::Attributor::new(),
+            scope_attrib_at: None,
+            scope_report: None,
+            scope_log: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
                 orientation: Orientation::Vertical,
@@ -2225,7 +2269,8 @@ impl AppState {
             AppView::Groups
             | AppView::Manual
             | AppView::Connecting { .. }
-            | AppView::Remote { .. } => None,
+            | AppView::Remote { .. }
+            | AppView::Scope => None,
         };
         if let (Some(label), AppMode::Local) = (thread_label, &self.mode) {
             let pids = self
@@ -2468,6 +2513,119 @@ fn run_daemon(interval: Duration) -> Result<()> {
 }
 
 /// Entry point: parse CLI, enter daemon mode or run the TUI event loop.
+/// Seconds since the Unix epoch as an f64 (for capture-log timestamps).
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Write the once-per-second capture-log records: a `summary` line and one
+/// `suspect` line per ranked suspect, all JSONL.
+fn log_scope_summary(
+    w: &mut impl Write,
+    st: &diag::ProbeStats,
+    p: &diag::Periodicity,
+    report: &diag::AttribReport,
+) {
+    let ts = unix_secs();
+    let period = p.period_s.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let freq = p.freq_hz.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let _ = writeln!(
+        w,
+        "{{\"type\":\"summary\",\"ts\":{:.3},\"window_s\":{:.1},\"n\":{},\
+         \"mean_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\
+         \"period_s\":{},\"freq_hz\":{},\"confidence\":{:.3},\
+         \"stalls\":{},\"calm\":{}}}",
+        ts, st.window_s, st.count, st.mean_ms, st.p99_ms, st.max_ms,
+        period, freq, p.confidence, report.spike_count, report.base_count
+    );
+    for s in &report.suspects {
+        let _ = writeln!(
+            w,
+            "{{\"type\":\"suspect\",\"ts\":{:.3},\"name\":{},\"unit\":{},\
+             \"spike_mean\":{:.3},\"base_mean\":{:.3},\"score\":{:.3}}}",
+            ts, json_str(s.name), json_str(s.unit), s.spike_mean, s.base_mean, s.score
+        );
+    }
+}
+
+/// Minimal JSON string escaper for the small, known label set we log.
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Analyze a captured --scope-log file offline and print a text report.
+///
+/// Reconstructs the latency series from `sample` records, reruns the same
+/// periodicity analysis used live, and summarises the suspects that were logged
+/// during the session (attribution itself needs live /proc and is not recomputed).
+fn run_scope_analyze(path: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read scope log: {path}"))?;
+
+    let mut samples: Vec<diag::Sample> = Vec::new();
+    let mut first_ts: Option<f64> = None;
+    // Tally how often each signal was the top suspect across summary windows.
+    let mut suspect_tally: HashMap<String, usize> = HashMap::new();
+    let mut last_summary: Option<serde_json::Value> = None;
+
+    for line in content.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v["type"].as_str() {
+            Some("sample") => {
+                if let (Some(ts), Some(ms)) = (v["ts"].as_f64(), v["ms"].as_f64()) {
+                    let f0 = *first_ts.get_or_insert(ts);
+                    samples.push(diag::Sample { t: ts - f0, overshoot_ms: ms as f32 });
+                }
+            }
+            Some("summary") => last_summary = Some(v),
+            Some("suspect") => {
+                if let Some(name) = v["name"].as_str() {
+                    *suspect_tally.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if samples.len() < 8 {
+        anyhow::bail!("only {} latency samples in {path} — not enough to analyze", samples.len());
+    }
+
+    let st = diag::stats(&samples, 0.0);
+    let p = diag::analyze_periodicity(&samples, diag::AnalysisConfig::default());
+
+    println!("aerie latency-scope offline report — {path}");
+    println!("  samples (downsampled): {}", st.count);
+    println!("  window:                {:.1} s", st.window_s);
+    println!("  latency  mean {:.2} ms · p99 {:.2} ms · max {:.2} ms",
+        st.mean_ms, st.p99_ms, st.max_ms);
+    match p.period_s {
+        Some(period) => {
+            let strong = p.confidence > 0.4;
+            println!("  periodicity: recurring stall ≈ every {:.2} s ({:.2} Hz), confidence {:.0}% ({})",
+                period, p.freq_hz.unwrap_or(0.0), p.confidence * 100.0,
+                if strong { "strong" } else { "weak / quasi-periodic" });
+        }
+        None => println!("  periodicity: no clear period detected"),
+    }
+    if !suspect_tally.is_empty() {
+        let mut ranked: Vec<(&String, &usize)> = suspect_tally.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1));
+        let names: Vec<String> = ranked.iter().take(3).map(|(n, c)| format!("{n} (×{c})")).collect();
+        println!("  suspects logged during session: {}", names.join(", "));
+    } else if let Some(s) = last_summary {
+        let stalls = s["stalls"].as_u64().unwrap_or(0);
+        println!("  no suspects were logged ({stalls} stall intervals in the last window)");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -2480,7 +2638,21 @@ fn main() -> Result<()> {
         return run_daemon(Duration::from_secs_f64(cli.interval));
     }
 
+    if let Some(path) = &cli.scope_analyze {
+        return run_scope_analyze(path);
+    }
+
     let mut state = AppState::new(&cli)?;
+
+    // --scope-log: spawn the probe at startup and open the capture log so the
+    // whole session is recorded regardless of which view is showing.
+    if let Some(path) = &cli.scope_log {
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("cannot create scope log: {path}"))?;
+        state.scope_log = Some(std::io::BufWriter::new(file));
+        state.scope = Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+    }
+
     // Do an initial refresh before entering the TUI so the first frame shows data.
     state.refresh();
 
@@ -2540,6 +2712,61 @@ fn main() -> Result<()> {
         {
             state.last_hist_sample = Some(Instant::now());
             state.sample_histograms();
+        }
+
+        // The scope subsystem runs when its probe exists AND we are either viewing
+        // it or capturing a log. (The probe persists across view toggles, so guard
+        // on actual need rather than just probe existence.)
+        let scope_active = state.scope.is_some()
+            && (state.scope_log.is_some() || matches!(state.view, AppView::Scope));
+
+        // Drive spike attribution every tick: read cheap /proc counters and tag the
+        // interval with the worst probe overshoot since last tick. Kept on the
+        // (non-realtime) main thread so the probe stays pure.
+        if scope_active {
+            if let Some(probe) = state.scope.as_ref() {
+                let now = Instant::now();
+                let dt = state
+                    .scope_attrib_at
+                    .map(|t| now.duration_since(t).as_secs_f64())
+                    .unwrap_or(0.0);
+                // A long gap means the scope was idle and resumed; pass 0 to
+                // re-prime the counters rather than record one giant bogus interval.
+                let dt = if dt > 1.0 { 0.0 } else { dt };
+                state.scope_attrib_at = Some(now);
+                let recorded = state.scope_attrib.sample(probe, dt);
+                // Capture log: one downsampled latency sample per tick.
+                if let (Some(ms), Some(w)) = (recorded, state.scope_log.as_mut()) {
+                    let _ = writeln!(w, "{{\"type\":\"sample\",\"ts\":{:.3},\"ms\":{:.3}}}",
+                        unix_secs(), ms);
+                }
+            }
+        }
+
+        // Recompute the latency-scope periodicity analysis and attribution report
+        // ~once/sec. Both are too heavy to run every render frame, and their
+        // results are stable second-to-second.
+        if scope_active
+            && state
+                .last_scope_analysis
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            if let Some(samples) = state.scope.as_ref().map(|p| p.snapshot()) {
+                let tick_ms = state.scope.as_ref().map(|p| p.tick_ms()).unwrap_or(0.0);
+                let analysis = diag::analyze_periodicity(&samples, diag::AnalysisConfig::default());
+                // Stall threshold for attribution: a few × the typical overshoot,
+                // floored at 5 ms so we never accuse anyone on a calm machine.
+                let st = diag::stats(&samples, tick_ms);
+                let threshold = (st.mean_ms * 4.0).max(5.0);
+                let report = state.scope_attrib.rank(threshold);
+                if let Some(w) = state.scope_log.as_mut() {
+                    log_scope_summary(w, &st, &analysis, &report);
+                    let _ = w.flush();
+                }
+                state.scope_analysis = Some(analysis);
+                state.scope_report = Some(report);
+                state.last_scope_analysis = Some(Instant::now());
+            }
         }
 
         terminal.draw(|buf| {
@@ -2614,6 +2841,8 @@ fn main() -> Result<()> {
                                 // is up-to-date after disconnecting.
                                 state.last_refresh = None;
                             }
+                            // Esc closes the scope and returns to the group list.
+                            AppView::Scope => state.view = AppView::Groups,
                             // Pressing Esc on the top-level group list exits the app.
                             AppView::Groups => break 'main,
                         }
@@ -2639,6 +2868,22 @@ fn main() -> Result<()> {
                     }
                     KeyCode::Char('v') => {
                         state.smooth_display = !state.smooth_display;
+                    }
+                    // Toggle the latency scope (diagnostics). Spawns the probe on
+                    // first use; the probe then keeps running so history persists.
+                    KeyCode::Char('d') => {
+                        if matches!(state.view, AppView::Scope) {
+                            state.view = AppView::Groups;
+                        } else if matches!(
+                            state.view,
+                            AppView::Groups | AppView::Threads { .. } | AppView::Manual
+                        ) {
+                            if state.scope.is_none() {
+                                state.scope =
+                                    Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+                            }
+                            state.view = AppView::Scope;
+                        }
                     }
                     // Cycle grouping strategy (Groups view, local or Proxmox mode)
                     KeyCode::Char('g') if matches!(state.view, AppView::Groups) => {
