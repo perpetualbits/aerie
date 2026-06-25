@@ -213,7 +213,11 @@ The view shows:
   via autocorrelation (central-lobe-skipping) + a narrow-band DFT;
 - a **ranked culprit list** — which system signals (IRQ/softirq, I/O & memory
   pressure, kernel CPU, power draw) are reliably elevated during the stalls
-  versus calm periods.
+  versus calm periods;
+- a **periodic-offender list** — process groups acting *on a clock*: periodic CPU
+  bursts or periodically spawning short-lived helpers (poll-on-a-timer). This is
+  the pattern behind a single-threaded compositor freezing every few seconds
+  because one extension/app blocks its main loop on a timer.
 
 For intermittent stalls you can't sit and watch, capture a whole session and
 inspect it later:

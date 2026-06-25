@@ -30,7 +30,7 @@
 //! (periodicity, …) behind the same seams, rather than by threading new fields
 //! through the rest of aerie.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -348,6 +348,249 @@ fn read_procs_running() -> u64 {
         }
     }
     0
+}
+
+// ── Periodic-offender detector (instrument #3) ─────────────────────────────
+
+/// One time step of a process group's activity (instrument #3). Opaque outside
+/// `diag` — produced by [`OffenderProbe::snapshot`] and consumed by [`analyze_offenders`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GroupActivity {
+    t: f64,
+    /// CPU jiffies used by the group in this interval (shape, not absolute %).
+    cpu: f32,
+    /// Short-lived children spawned *by* this group in this interval.
+    spawns: f32,
+}
+
+/// What kind of periodic behaviour an offender exhibits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffenderKind {
+    /// Periodic CPU bursts (e.g. a timer callback doing work on the main loop).
+    CpuBurst,
+    /// Periodically spawning short-lived helpers (poll-on-a-timer; the Astra/lsblk pattern).
+    Spawns,
+}
+
+/// A process group whose activity is periodic — the automated version of "find the
+/// thing doing something every N seconds".
+#[derive(Clone, Debug)]
+pub struct Offender {
+    pub group: String,
+    pub kind: OffenderKind,
+    pub period_s: f64,
+    pub freq_hz: f64,
+    pub confidence: f32,
+    /// Representative spawned child comm (for `Spawns`).
+    pub child: Option<String>,
+    /// Mean spawns/interval (Spawns) or mean CPU jiffies/interval (CpuBurst).
+    pub rate: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OffenderReport {
+    pub offenders: Vec<Offender>,
+}
+
+struct OffShared {
+    groups: HashMap<String, VecDeque<GroupActivity>>,
+    /// Representative recent child comm per spawning group.
+    children: HashMap<String, String>,
+    cap: usize,
+    max_groups: usize,
+}
+
+/// Scans /proc on a dedicated thread, tracking per-group CPU and spawn activity so
+/// [`analyze_offenders`] can find process groups behaving on a clock — the class of
+/// fault that froze the desktop here (a periodic extension blocking the compositor).
+pub struct OffenderProbe {
+    shared: Arc<Mutex<OffShared>>,
+    stop: Arc<AtomicBool>,
+    _handle: JoinHandle<()>,
+}
+
+impl OffenderProbe {
+    pub fn spawn(tick: Duration) -> Self {
+        let shared = Arc::new(Mutex::new(OffShared {
+            groups: HashMap::new(),
+            children: HashMap::new(),
+            cap: 300,        // ~60 s at 5 Hz
+            max_groups: 64,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared_t = Arc::clone(&shared);
+        let stop_t = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("aerie-offender-probe".into())
+            .spawn(move || offender_loop(shared_t, stop_t, tick))
+            .expect("spawn offender probe thread");
+        Self { shared, stop, _handle: handle }
+    }
+
+    /// Clone the per-group activity series and representative children for analysis.
+    pub fn snapshot(&self) -> (HashMap<String, Vec<GroupActivity>>, HashMap<String, String>) {
+        let g = self.shared.lock().unwrap();
+        let groups = g.groups.iter().map(|(k, v)| (k.clone(), v.iter().copied().collect())).collect();
+        (groups, g.children.clone())
+    }
+}
+
+impl Drop for OffenderProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Read `(comm, ppid, utime+stime)` from /proc/PID/stat. The comm field is wrapped
+/// in parens and may contain spaces, so split on the last ')'.
+fn read_pid_stat(pid: &str) -> Option<(String, u32, u64)> {
+    let data = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let lp = data.find('(')?;
+    let rp = data.rfind(')')?;
+    let comm = data.get(lp + 1..rp)?.to_string();
+    let rest: Vec<&str> = data.get(rp + 2..)?.split_whitespace().collect();
+    // After comm: state(0) ppid(1) ... utime(11) stime(12) (0-based into `rest`).
+    let ppid: u32 = rest.get(1)?.parse().ok()?;
+    let utime: u64 = rest.get(11)?.parse().ok()?;
+    let stime: u64 = rest.get(12)?.parse().ok()?;
+    Some((comm, ppid, utime + stime))
+}
+
+/// Scan every numeric /proc entry once: pid → (comm, ppid, jiffies).
+fn scan_procs() -> HashMap<u32, (String, u32, u64)> {
+    let mut map = HashMap::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else { return map };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Some((comm, ppid, j)) = read_pid_stat(name) {
+            if let Ok(pid) = name.parse::<u32>() {
+                map.insert(pid, (comm, ppid, j));
+            }
+        }
+    }
+    map
+}
+
+fn offender_loop(shared: Arc<Mutex<OffShared>>, stop: Arc<AtomicBool>, tick: Duration) {
+    let start = Instant::now();
+    let mut prev: HashMap<u32, (String, u32, u64)> = scan_procs();
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(tick);
+        let t = Instant::now().duration_since(start).as_secs_f64();
+        let cur = scan_procs();
+
+        let mut cpu: HashMap<String, f64> = HashMap::new();
+        let mut spawns: HashMap<String, u32> = HashMap::new();
+        let mut child_of: HashMap<String, String> = HashMap::new();
+        for (pid, (comm, ppid, j)) in &cur {
+            match prev.get(pid) {
+                Some((_, _, pj)) => {
+                    *cpu.entry(comm.clone()).or_default() += j.saturating_sub(*pj) as f64;
+                }
+                None => {
+                    // A pid we didn't see last tick = newly spawned. Blame the parent
+                    // group (the spawner is the offender, not the short-lived child).
+                    if let Some((pcomm, _, _)) = cur.get(ppid) {
+                        *spawns.entry(pcomm.clone()).or_default() += 1;
+                        child_of.entry(pcomm.clone()).or_insert_with(|| comm.clone());
+                    }
+                    *cpu.entry(comm.clone()).or_default() += *j as f64;
+                }
+            }
+        }
+
+        let mut g = shared.lock().unwrap();
+        let cap = g.cap;
+        // Append this tick to every tracked group, plus any newly active one,
+        // pushing zeros for tracked-but-idle groups so each series stays uniform.
+        let active: std::collections::HashSet<String> =
+            cpu.keys().chain(spawns.keys()).cloned().collect();
+        let tracked: std::collections::HashSet<String> = g.groups.keys().cloned().collect();
+        for grp in active.union(&tracked) {
+            let sample = GroupActivity {
+                t,
+                cpu: *cpu.get(grp).unwrap_or(&0.0) as f32,
+                spawns: *spawns.get(grp).unwrap_or(&0) as f32,
+            };
+            let ring = g.groups.entry(grp.clone()).or_default();
+            if ring.len() >= cap {
+                ring.pop_front();
+            }
+            ring.push_back(sample);
+        }
+        for (grp, ch) in child_of {
+            g.children.insert(grp, ch);
+        }
+        // Prune all-idle groups, then cap the tracked set by recent activity.
+        g.groups.retain(|_, ring| ring.iter().any(|a| a.cpu > 0.0 || a.spawns > 0.0));
+        if g.groups.len() > g.max_groups {
+            let mut by_activity: Vec<(String, f32)> = g.groups.iter()
+                .map(|(k, v)| (k.clone(), v.iter().map(|a| a.cpu + a.spawns * 50.0).sum()))
+                .collect();
+            by_activity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let keep: std::collections::HashSet<String> =
+                by_activity.into_iter().take(g.max_groups).map(|(k, _)| k).collect();
+            g.groups.retain(|k, _| keep.contains(k));
+        }
+        drop(g);
+        prev = cur;
+    }
+}
+
+/// Find process groups whose CPU or spawn activity is periodic. Spawn periodicity
+/// (a clean impulse train) is preferred over CPU when both fire, since it is the
+/// more actionable signal (poll-on-a-timer). Confidence comes from the autocorrelation.
+pub fn analyze_offenders(
+    groups: &HashMap<String, Vec<GroupActivity>>,
+    children: &HashMap<String, String>,
+) -> OffenderReport {
+    const MIN_CONF: f32 = 0.25;
+    let mut offenders = Vec::new();
+    for (grp, series) in groups {
+        if series.len() < 24 {
+            continue;
+        }
+        let cpu_series: Vec<Sample> =
+            series.iter().map(|a| Sample { t: a.t, overshoot_ms: a.cpu }).collect();
+        let spawn_series: Vec<Sample> =
+            series.iter().map(|a| Sample { t: a.t, overshoot_ms: a.spawns }).collect();
+        let cfg = AnalysisConfig::default();
+        let cpu_p = analyze_periodicity(&cpu_series, cfg);
+        let spawn_p = analyze_periodicity(&spawn_series, cfg);
+
+        // Prefer the spawn signal when it is at least as confident.
+        let (kind, p) = match (spawn_p.period_s, cpu_p.period_s) {
+            (Some(_), Some(_)) if spawn_p.confidence >= cpu_p.confidence =>
+                (OffenderKind::Spawns, spawn_p),
+            (Some(_), Some(_)) => (OffenderKind::CpuBurst, cpu_p),
+            (Some(_), None) => (OffenderKind::Spawns, spawn_p),
+            (None, Some(_)) => (OffenderKind::CpuBurst, cpu_p),
+            (None, None) => continue,
+        };
+        if p.confidence < MIN_CONF {
+            continue;
+        }
+        let rate = match kind {
+            OffenderKind::Spawns => mean(&spawn_series.iter().map(|s| s.overshoot_ms).collect::<Vec<_>>()),
+            OffenderKind::CpuBurst => mean(&cpu_series.iter().map(|s| s.overshoot_ms).collect::<Vec<_>>()),
+        };
+        offenders.push(Offender {
+            group: grp.clone(),
+            kind,
+            period_s: p.period_s.unwrap(),
+            freq_hz: p.freq_hz.unwrap_or(0.0),
+            confidence: p.confidence,
+            child: if kind == OffenderKind::Spawns { children.get(grp).cloned() } else { None },
+            rate,
+        });
+    }
+    offenders.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    offenders.truncate(6);
+    OffenderReport { offenders }
 }
 
 /// Compute [`ProbeStats`] over a slice of samples (oldest → newest).
@@ -900,6 +1143,41 @@ mod tests {
         let top = rep.suspects.first().expect("a suspect");
         assert_eq!(top.name, "IRQ/softirq CPU");
         assert!(top.spike_mean > top.base_mean);
+    }
+
+    #[test]
+    fn offender_detects_periodic_spawner() {
+        // 300 samples at 0.2 s (60 s). "poller" spawns one child every 3 s (15 ticks).
+        let series: Vec<GroupActivity> = (0..300)
+            .map(|i| GroupActivity {
+                t: i as f64 * 0.2,
+                cpu: 0.0,
+                spawns: if i % 15 == 0 { 1.0 } else { 0.0 },
+            })
+            .collect();
+        let mut groups = HashMap::new();
+        groups.insert("poller".to_string(), series);
+        let mut children = HashMap::new();
+        children.insert("poller".to_string(), "lsblk".to_string());
+
+        let rep = analyze_offenders(&groups, &children);
+        let o = rep.offenders.first().expect("should flag the periodic spawner");
+        assert_eq!(o.group, "poller");
+        assert_eq!(o.kind, OffenderKind::Spawns);
+        assert!((o.period_s - 3.0).abs() < 0.4, "period was {}", o.period_s);
+        assert_eq!(o.child.as_deref(), Some("lsblk"));
+    }
+
+    #[test]
+    fn offender_ignores_steady_group() {
+        // Constant activity (no rhythm) must not be flagged.
+        let series: Vec<GroupActivity> = (0..300)
+            .map(|i| GroupActivity { t: i as f64 * 0.2, cpu: 5.0, spawns: 0.0 })
+            .collect();
+        let mut groups = HashMap::new();
+        groups.insert("steady".to_string(), series);
+        let rep = analyze_offenders(&groups, &HashMap::new());
+        assert!(rep.offenders.is_empty(), "steady group should not be an offender");
     }
 
     #[test]

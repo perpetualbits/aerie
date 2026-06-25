@@ -1350,8 +1350,36 @@ fn render_scope(buf: &mut Buffer, area: Rect, state: &AppState) {
         }
     }
 
+    // ── Periodic offenders (row y+4): groups acting on a clock ────────────
+    let off_y = area.y + 4;
+    match state.offender_report.as_ref() {
+        Some(r) if !r.offenders.is_empty() => {
+            let o = &r.offenders[0];
+            let what = match (o.kind, o.child.as_deref()) {
+                (crate::diag::OffenderKind::Spawns, Some(c)) => format!("spawning {c}"),
+                (crate::diag::OffenderKind::Spawns, None) => "spawning helpers".to_string(),
+                (crate::diag::OffenderKind::CpuBurst, _) => "CPU bursts".to_string(),
+            };
+            let mut x = buf.set_string(area.x, off_y, " periodic offender: ", faint);
+            x = buf.set_string(x, off_y, &o.group,
+                Style::default().fg(Color::Rgb(235, 120, 40)).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, off_y,
+                &format!(" every {:.1} s — {} (conf {:.0}%)", o.period_s, what, o.confidence * 100.0),
+                Style::default().fg(Color::Gray));
+            if r.offenders.len() > 1 {
+                let also: Vec<&str> = r.offenders[1..].iter().take(2).map(|o| o.group.as_str()).collect();
+                buf.set_string(x, off_y, &format!("   also: {}", also.join(", ")), faint);
+            }
+        }
+        Some(_) => {
+            buf.set_string(area.x, off_y,
+                " periodic offenders: none — no process group is acting on a clock", dim);
+        }
+        None => { buf.set_string(area.x, off_y, " scanning for periodic offenders…", dim); }
+    }
+
     if samples.len() < 2 {
-        buf.set_string(area.x, area.y + 4, "  collecting latency samples…", dim);
+        buf.set_string(area.x, area.y + 5, "  collecting latency samples…", dim);
         return;
     }
 
@@ -1359,8 +1387,8 @@ fn render_scope(buf: &mut Buffer, area: Rect, state: &AppState) {
     // The two instruments answer different questions: the CPU-wakeup trace shows
     // scheduling jitter; the pressure trace shows run-queue / PSI stall, which
     // catches compositor- and memory-bound freezes the wakeup probe is blind to.
-    let body_top = area.y + 4;
-    let body_h = area.height.saturating_sub(4);
+    let body_top = area.y + 5;
+    let body_h = area.height.saturating_sub(5);
     if body_h == 0 { return; }
 
     let two = body_h >= 8 && state.pressure.is_some();
@@ -1697,7 +1725,9 @@ fn manual_lines() -> Vec<String> {
         "  memory-bound freezes that delay rendering without delaying CPU threads.".into(),
         "  Each carries a periodicity readout (the recurring stall's period); a".into(),
         "  ranked list names the system signals (IRQ/softirq, I/O & memory pressure,".into(),
-        "  power) that co-occur with the latency stalls.".into(),
+        "  power) that co-occur with the latency stalls; and a periodic-offender line".into(),
+        "  names any process group acting on a clock — CPU bursts or spawning helpers".into(),
+        "  on a timer (the pattern that lets one app periodically stall the desktop).".into(),
         "".into(),
         "  --scope-log FILE      capture diagnostics to FILE (line-delimited JSON)".into(),
         "                        for the whole session, even without opening the view.".into(),

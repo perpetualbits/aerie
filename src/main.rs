@@ -1011,6 +1011,10 @@ pub struct AppState {
     pub pressure: Option<diag::PressureProbe>,
     /// Most-periodic pressure channel and its cached analysis (recomputed at 1 Hz).
     pub pressure_analysis: Option<(diag::PressureChannel, diag::Periodicity)>,
+    /// Periodic-offender detector (instrument #3): per-group CPU/spawn periodicity.
+    pub offenders: Option<diag::OffenderProbe>,
+    /// Cached ranked offender report (recomputed at 1 Hz).
+    pub offender_report: Option<diag::OffenderReport>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1549,6 +1553,8 @@ impl AppState {
             scope_log: None,
             pressure: None,
             pressure_analysis: None,
+            offenders: None,
+            offender_report: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
                 orientation: Orientation::Vertical,
@@ -2600,6 +2606,24 @@ fn log_pressure_summary(w: &mut impl Write, ch: diag::PressureChannel, p: &diag:
     );
 }
 
+/// Write one `offender` record per detected periodic offender (instrument #3).
+fn log_offenders(w: &mut impl Write, report: &diag::OffenderReport) {
+    let ts = unix_secs();
+    for o in &report.offenders {
+        let kind = match o.kind {
+            diag::OffenderKind::Spawns => "spawns",
+            diag::OffenderKind::CpuBurst => "cpu",
+        };
+        let child = o.child.as_deref().map(json_str).unwrap_or_else(|| "null".into());
+        let _ = writeln!(
+            w,
+            "{{\"type\":\"offender\",\"ts\":{:.3},\"group\":{},\"kind\":\"{}\",\
+             \"period_s\":{:.4},\"freq_hz\":{:.4},\"confidence\":{:.3},\"child\":{}}}",
+            ts, json_str(&o.group), kind, o.period_s, o.freq_hz, o.confidence, child
+        );
+    }
+}
+
 /// Analyze a captured --scope-log file offline and print a text report.
 ///
 /// Reconstructs the latency series from `sample` records, reruns the same
@@ -2616,6 +2640,8 @@ fn run_scope_analyze(path: &str) -> Result<()> {
     // Tally how often each signal was the top suspect across summary windows.
     let mut suspect_tally: HashMap<String, usize> = HashMap::new();
     let mut last_summary: Option<serde_json::Value> = None;
+    // Best (highest-confidence) offender record seen per group.
+    let mut offenders: HashMap<String, (f64, f64, String, Option<String>)> = HashMap::new();
 
     for line in content.lines() {
         let v: serde_json::Value = match serde_json::from_str(line) {
@@ -2645,6 +2671,20 @@ fn run_scope_analyze(path: &str) -> Result<()> {
             Some("suspect") => {
                 if let Some(name) = v["name"].as_str() {
                     *suspect_tally.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+            Some("offender") => {
+                if let Some(group) = v["group"].as_str() {
+                    let conf = v["confidence"].as_f64().unwrap_or(0.0);
+                    let entry = offenders.entry(group.to_string()).or_insert((0.0, 0.0, String::new(), None));
+                    if conf >= entry.0 {
+                        *entry = (
+                            conf,
+                            v["period_s"].as_f64().unwrap_or(0.0),
+                            v["kind"].as_str().unwrap_or("").to_string(),
+                            v["child"].as_str().map(|s| s.to_string()),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -2695,6 +2735,24 @@ fn run_scope_analyze(path: &str) -> Result<()> {
             _ => println!("  system pressure: no clear period in run-queue / PSI channels"),
         }
     }
+
+    // Instrument #3: periodic offenders (process groups behaving on a clock).
+    if !offenders.is_empty() {
+        let mut ranked: Vec<_> = offenders.iter().collect();
+        ranked.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+        println!("  periodic offenders (process groups acting on a clock):");
+        for (group, (conf, period, kind, child)) in ranked.into_iter().take(5) {
+            let what = if kind == "spawns" {
+                match child {
+                    Some(c) => format!("spawning {c}"),
+                    None => "spawning helpers".to_string(),
+                }
+            } else {
+                "CPU bursts".to_string()
+            };
+            println!("     {group}: every {period:.2} s — {what} (confidence {:.0}%)", conf * 100.0);
+        }
+    }
     Ok(())
 }
 
@@ -2724,6 +2782,7 @@ fn main() -> Result<()> {
         state.scope_log = Some(std::io::BufWriter::new(file));
         state.scope = Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
         state.pressure = Some(diag::PressureProbe::spawn(Duration::from_millis(20), 12_000));
+        state.offenders = Some(diag::OffenderProbe::spawn(Duration::from_millis(200)));
     }
 
     // Do an initial refresh before entering the TUI so the first frame shows data.
@@ -2847,16 +2906,26 @@ fn main() -> Result<()> {
                 let pressure_samples = state.pressure.as_ref().map(|p| p.snapshot());
                 let best_pressure = pressure_samples.as_ref().and_then(|ps| best_pressure_channel(ps));
 
+                // Instrument #3: find process groups behaving on a clock.
+                let offender_report = state.offenders.as_ref().map(|o| {
+                    let (groups, children) = o.snapshot();
+                    diag::analyze_offenders(&groups, &children)
+                });
+
                 if let Some(w) = state.scope_log.as_mut() {
                     log_scope_summary(w, &st, &analysis, &report);
                     if let Some((ch, ref pp)) = best_pressure {
                         log_pressure_summary(w, ch, pp);
+                    }
+                    if let Some(ref orep) = offender_report {
+                        log_offenders(w, orep);
                     }
                     let _ = w.flush();
                 }
                 state.scope_analysis = Some(analysis);
                 state.scope_report = Some(report);
                 state.pressure_analysis = best_pressure;
+                state.offender_report = offender_report;
                 state.last_scope_analysis = Some(Instant::now());
             }
         }
@@ -2975,6 +3044,8 @@ fn main() -> Result<()> {
                                     Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
                                 state.pressure = Some(diag::PressureProbe::spawn(
                                     Duration::from_millis(20), 12_000));
+                                state.offenders = Some(diag::OffenderProbe::spawn(
+                                    Duration::from_millis(200)));
                             }
                             state.view = AppView::Scope;
                         }
