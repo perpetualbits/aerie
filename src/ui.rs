@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
-use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
+use mullion::{Buffer, BorderGap, Rect, gaussian, render_rim, tree::id_from_key};
 use mullion::layout::TileId;
 use mullion::label::Align;
 use mullion::style::{Color, Modifier, Style};
@@ -287,20 +287,6 @@ fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap]) {
     if area.width < 2 || area.height < 2 {
         return;
     }
-    let x0 = area.x;
-    let y0 = area.y;
-    let x1 = area.x + area.width - 1;
-    let y1 = area.y + area.height - 1;
-
-    // Enumerate every border cell exactly once, clockwise from the top-left corner.
-    let cap = 2 * (area.width + area.height) as usize;
-    let mut cells: Vec<(u16, u16)> = Vec::with_capacity(cap);
-    for x in x0..=x1           { cells.push((x, y0)); }  // top:    L → R
-    for y in y0+1..=y1         { cells.push((x1, y)); }  // right:  T → B
-    for x in (x0..x1).rev()   { cells.push((x, y1)); }  // bottom: R → L
-    for y in (y0+1..y1).rev() { cells.push((x0, y)); }  // left:   B → T
-
-    let n = cells.len() as f32;
 
     // 2 : 5 speed ratio.  Base unit = 1 / 20 s⁻¹ so yellow orbits in 10 s,
     // red in 4 s.  They travel in opposite directions on the same loop.
@@ -311,14 +297,10 @@ fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap]) {
     // Blob half-width: 5 % of perimeter length.
     const SIGMA: f32 = 0.05;
 
-    for (idx, &(x, y)) in cells.iter().enumerate() {
-        // Skip cells inside any non-glow gap — those are owned by pass 3.
-        if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
-            continue;
-        }
-
-        let p = idx as f32 / n;
-
+    // render_rim walks the perimeter clockwise from the top-left corner (the same
+    // order this code used to build by hand), skips non-glow gaps for us, and hands
+    // each cell its normalised perimeter position `p` and current style.
+    render_rim(buf, area, gaps, |p, current| {
         // Shortest angular distance on the closed loop.
         let d_cw  = { let d = (p - cw_pos).abs();  d.min(1.0 - d) };
         let d_ccw = { let d = (p - ccw_pos).abs(); d.min(1.0 - d) };
@@ -333,9 +315,11 @@ fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap]) {
         let g = (200.0 * i_y +  50.0 * i_r).min(255.0) as u8;
 
         if r > 12 || g > 12 {
-            buf.get_mut(x, y).style.fg = Color::Rgb(r, g, 0);
+            Some(current.fg(Color::Rgb(r, g, 0)))
+        } else {
+            None
         }
-    }
+    });
 }
 
 /// Compact single-line status text for the bottom border left gap.
