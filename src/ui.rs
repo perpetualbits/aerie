@@ -48,6 +48,7 @@ pub fn render(buf: &mut Buffer, state: &mut AppState) {
         AppView::Threads { .. } => render_body(buf, body_rect, state),
         AppView::Manual => render_manual(buf, body_rect, state),
         AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
+        AppView::Scope if state.scope_detect => render_verdict(buf, body_rect, state),
         AppView::Scope => render_scope(buf, body_rect, state),
     }
 }
@@ -753,7 +754,13 @@ fn border_status(state: &AppState) -> String {
         }
         AppView::Manual => "manual".to_string(),
         AppView::Connecting { label } => format!("connecting to {label}"),
-        AppView::Scope => "latency scope · system wakeup jitter".to_string(),
+        AppView::Scope => {
+            if state.scope_detect {
+                "stutter · detection".to_string()
+            } else {
+                "stutter · observation · system wakeup jitter".to_string()
+            }
+        }
         _ => {
             let parts = groups_status_parts(state);
             parts.join(" · ")
@@ -788,8 +795,10 @@ fn border_keys(state: &AppState) -> String {
             "[↑/↓] scroll [m] close [q] quit".to_string(),
         AppView::Connecting { .. } =>
             "[Esc] cancel [q] quit".to_string(),
-        AppView::Scope =>
-            "[d]/[Esc] close [q] quit".to_string(),
+        AppView::Scope => {
+            let other = if state.scope_detect { "observe" } else { "detect" };
+            format!("[Tab] {other} [d]/[Esc] close [q] quit")
+        }
     }
 }
 
@@ -1657,6 +1666,79 @@ fn draw_series_trace(
     fill_braille_plot(buf, area, &heights);
     buf.set_string(area.x, area.y, top_label, faint);
     buf.set_string(area.x, area.bottom().saturating_sub(1), "0 ┘", faint);
+}
+
+/// Render the **detection** view of stutter mode: a plain-language verdict on
+/// whether the system has a recurring stutter, plus its fingerprint and likely
+/// cause. The live traces are one Tab away ([`render_scope`]).
+fn render_verdict(buf: &mut Buffer, area: Rect, state: &AppState) {
+    let faint = Style::default().fg(Color::DarkGray);
+    let gray = Style::default().fg(Color::Gray);
+    let label = |buf: &mut Buffer, y: u16, k: &str, v: String| {
+        let x = buf.set_string(area.x + 4, y, k, faint);
+        buf.set_string(x, y, &v, gray);
+    };
+
+    let analysis = state.scope_analysis.as_ref();
+    let shape = state.stutter_shape.as_ref();
+    let conf = shape.map(|s| s.confidence).unwrap_or(0.0);
+    let has_period = analysis.is_some_and(|a| a.period_s.is_some());
+
+    // Verdict light + headline.
+    let (light, headline, lcolor) = if state.scope.is_none() {
+        ("·", "starting probe…", Color::DarkGray)
+    } else if has_period && conf >= 0.45 {
+        ("●", "RECURRING STUTTER DETECTED", Color::Rgb(235, 80, 40))
+    } else if has_period {
+        ("◐", "possible stutter — keep watching", Color::Rgb(220, 180, 60))
+    } else if analysis.is_some() {
+        ("○", "no recurring stutter detected", Color::Rgb(60, 200, 90))
+    } else {
+        ("·", "gathering data…", Color::DarkGray)
+    };
+
+    let mut y = area.y + 1;
+    buf.set_string(area.x + 2, y, &format!("{light}  {headline}"),
+        Style::default().fg(lcolor).add_modifier(Modifier::BOLD));
+    y += 2;
+
+    if let Some(sh) = shape.filter(|s| s.confidence >= 0.30) {
+        label(buf, y, "every     ", format!("{:.1} s   ({:.2} Hz)", sh.period_s,
+            if sh.period_s > 0.0 { 1.0 / sh.period_s } else { 0.0 }));
+        y += 1;
+        label(buf, y, "duration  ", format!("{:.0}–{:.0} ms  (mean {:.0})",
+            sh.dur_mean_ms.min(sh.dur_max_ms), sh.dur_max_ms, sh.dur_mean_ms));
+        y += 1;
+        let onset = if sh.onset_jitter < 0.06 { "steady onset" } else { "jittery onset" };
+        let length = if sh.dur_cv < 0.25 { "fixed length" } else { "varying length" };
+        label(buf, y, "shape     ", format!("{onset} · {length}"));
+        y += 2;
+
+        // Confidence bar.
+        let pct = (conf * 100.0).round() as u32;
+        let cells = (conf * 16.0).round() as usize;
+        let bar: String = (0..16).map(|i| if i < cells { '█' } else { '░' }).collect();
+        let x = buf.set_string(area.x + 4, y, "confidence ", faint);
+        let x = buf.set_string(x, y, &bar, Style::default().fg(heat_color(conf)));
+        buf.set_string(x, y, &format!(" {pct}%"), gray);
+        y += 2;
+    }
+
+    // Likely cause (the offender "who"), if any.
+    if let Some(o) = state.offender_report.as_ref().and_then(|r| r.offenders.first()) {
+        let what = match (o.kind, o.child.as_deref()) {
+            (crate::diag::OffenderKind::Spawns, Some(c)) => format!("spawning {c}"),
+            (crate::diag::OffenderKind::Spawns, None) => "spawning helpers".to_string(),
+            (crate::diag::OffenderKind::CpuBurst, _) => "CPU bursts".to_string(),
+        };
+        let x = buf.set_string(area.x + 4, y, "likely    ", faint);
+        let x = buf.set_string(x, y, &o.group,
+            Style::default().fg(Color::Rgb(235, 120, 40)).add_modifier(Modifier::BOLD));
+        buf.set_string(x, y, &format!(" — {what} every {:.1} s", o.period_s), gray);
+    }
+
+    buf.set_string(area.x + 2, area.bottom().saturating_sub(1),
+        "[Tab] live traces   [d]/[Esc] close", faint);
 }
 
 /// Render the latency scope: a live braille trace of the wakeup-jitter probe.

@@ -138,6 +138,13 @@ struct Cli {
     #[arg(long)]
     scope_analyze: Option<String>,
 
+    /// Start in stutter mode: open the latency scope at launch (probes running)
+    /// in its detection view — a verdict on whether the desktop has a recurring
+    /// stutter, with its fingerprint. Press Tab to switch to the live observation
+    /// traces. (Same instrument the `d` key toggles from any view.)
+    #[arg(long)]
+    stutter: bool,
+
     /// [EXPERIMENTAL] Monitor Kubernetes pods via kubectl exec.
     /// Accepts NAMESPACE or NAMESPACE/SELECTOR (label selector).
     /// Examples: --kube default   --kube monitoring/app=prometheus
@@ -1022,6 +1029,9 @@ pub struct AppState {
     /// rim. Computed from the latency probe when it is alive; `None` falls the
     /// rim back to its own frame-cadence characterisation.
     pub stutter_shape: Option<diag::StutterShape>,
+    /// In the scope view: `true` shows the detection verdict, `false` the live
+    /// observation traces. Toggled with Tab; set by `--stutter` at launch.
+    pub scope_detect: bool,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1563,6 +1573,7 @@ impl AppState {
             offenders: None,
             last_offender_analysis: None,
             stutter_shape: None,
+            scope_detect: false,
             offender_report: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
@@ -2794,6 +2805,17 @@ fn main() -> Result<()> {
         state.offenders = Some(diag::OffenderProbe::spawn(Duration::from_millis(200)));
     }
 
+    // --stutter: launch straight into the scope's detection view, probes running.
+    if cli.stutter {
+        if state.scope.is_none() {
+            state.scope = Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+            state.pressure = Some(diag::PressureProbe::spawn(Duration::from_millis(20), 12_000));
+            state.offenders = Some(diag::OffenderProbe::spawn(Duration::from_millis(200)));
+        }
+        state.view = AppView::Scope;
+        state.scope_detect = true;
+    }
+
     // Do an initial refresh before entering the TUI so the first frame shows data.
     state.refresh();
 
@@ -3196,6 +3218,9 @@ fn main() -> Result<()> {
                                 Side::Left => Side::Right,
                                 Side::Right => Side::Left,
                             };
+                        } else if matches!(state.view, AppView::Scope) {
+                            // Switch between the detection verdict and the live traces.
+                            state.scope_detect = !state.scope_detect;
                         }
                     }
                     // Sort by the active side's metric

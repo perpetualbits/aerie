@@ -191,7 +191,14 @@ aerie --enable-remote --hosts web1,web2,db1
 Each host appears as a row; metrics are the busiest process group on that host.
 Press Enter to drill in. Use `--thin` for hosts without aerie installed.
 
-## Latency scope
+## Latency scope / stutter mode
+
+Run `aerie --stutter` to launch straight into **stutter mode** — the latency
+instrument as a front door. It opens on a plain-language **detection** verdict
+(*is* there a recurring desktop stutter, and what's its fingerprint — period,
+duration, onset/length shape, likely cause); press **Tab** to switch to the live
+**observation** traces. The same instrument is one keypress (`d`) away from any
+view.
 
 Press `d` for the latency scope — a built-in [cyclictest](https://wiki.linuxfoundation.org/realtime/documentation/howto/tools/cyclictest/start).
 A dedicated thread asks the OS to wake it on a fixed interval and records how
