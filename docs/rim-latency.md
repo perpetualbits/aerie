@@ -177,7 +177,7 @@ a human reads the knot and decides what it is.
 |-----------------------------------|---------------|
 | Two smooth blobs gliding evenly around the rim | Healthy. The draw loop is being scheduled on time (< 60 ms/frame). |
 | A blob **freezes, then jumps ahead** | A stall. It stopped where the freeze began; the size of the jump is roughly how long it stalled. |
-| A **braille knot** blinks on at a fixed angle during the stall | The recurring stutter's fingerprint. Its **angle** = when in the cycle the stall starts; its **height** = how long the stall lasts. A knot at the *same* angle each time = cleanly periodic. |
+| A **braille knot** sits at a fixed angle while the stutter persists (brightening as each stall hits) | The recurring stutter's fingerprint. Its **angle** = when in the cycle the stall starts; its **height** = how long the stall lasts. A knot at the *same* angle each time = cleanly periodic. |
 | The knot is **narrow** vs **smeared along the rim** | Narrow = steady onset timing; smeared = jittery onset (starts early/late each cycle). |
 | The knot is **steady-height** vs **varying-height** | Steady = every stall the same length; varying = the stall length changes cycle to cycle. |
 | Knot is **cool white** vs **cyan / violet** | White = unattributed; **cyan** = a periodically-spawning process lines up with it, **violet** = a periodic-CPU-burst process does (needs `d` opened once to attribute). |
@@ -230,9 +230,16 @@ back to the frame fold.
 * **Hue = attribution.** Cool white for an unattributed stutter; cyan/violet when
   a periodic offender lines up with that phase (the Design 2 "who", now folded in
   as the knot's colour rather than a separate mark).
-* Drawn only while a stall is currently being felt (`engaged`) and pulsed by
-  severity, so a calm rim stays pure orbiter and the fingerprint blinks up at its
-  fixed angle exactly as the lag hits.
+* **Shown while the problem is present**, not while aerie itself stalls. The knot
+  appears whenever a confident fingerprint exists *or* — its fallback — any
+  periodic offender is detected (so "offenders in the scope ⇒ knots on the rim",
+  even when a messy stress test keeps the latency fold below the confidence gate;
+  the fallback marks *where*, the fingerprint adds *how long*). Brightness has a
+  visible floor and pulses up with the live stall severity. Gating on a detected
+  *problem* rather than on aerie's own render freeze matters: a CPU stress test
+  can stutter the system while aerie's cheap 20 fps redraw keeps up, so the
+  earlier "only while aerie's frame stalls" gate hid the knots exactly when they
+  were most wanted.
 
 The scope view (`d`) also prints the shape in words on the periodicity line —
 e.g. *"steady onset, varying length (~40–120 ms)"*.

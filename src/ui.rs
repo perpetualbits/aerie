@@ -355,18 +355,15 @@ fn comet_braille_mask(amp: f32, col: usize) -> u8 {
 /// between two successive calls *is* the draw loop's frame interval.  A healthy
 /// loop wakes on the 50 ms `RENDER_TICK`; a system-wide stall (compositor or
 /// scheduler hold-up — the very thing the orbiting glow visibly hitches on)
-/// stretches that gap.  We decay that excess into a 0..1 severity and latch an
-/// `engaged` flag with hysteresis, used to reveal the offender knots only while a
-/// stall is actually being felt.  See `docs/rim-latency.md`.
+/// stretches that gap.  We decay that excess into a 0..1 severity used to *pulse*
+/// the knots' brightness (they are shown whenever a recurring problem is
+/// detected, not only while aerie itself stalls).  See `docs/rim-latency.md`.
 struct RimTrail {
     /// Wall-clock seconds of the previous frame (same clock as the orbit phase).
     last_t: f32,
     /// Decaying stall severity (in perimeter-fraction units): jumps up on a slow
     /// frame, falls off smoothly, so a single long frame leaves a ~1 s tail.
     smear: f32,
-    /// Whether a stall is currently being felt.  Latched with hysteresis so a
-    /// severity hovering near the trigger does not flicker the knots on and off.
-    engaged: bool,
     /// Rolling `(t, lateness_ms)` per frame for ~60 s — the always-on,
     /// self-contained event source the stutter characteriser folds when no
     /// latency probe is running.  `lateness_ms` is the frame interval above the
@@ -427,22 +424,16 @@ fn apply_border_glow(
     const MS_PER_PERIM: f32 = 0.0006; // 200 ms over floor ≈ 0.08 of the perimeter.
     const LEN_MAX:      f32 = 0.33;   // a comet wraps at most a third of the rim.
     const TAU_S:        f32 = 0.6;    // comet fade time-constant (frame-rate independent).
-    // Braille engages above ON, disengages below OFF (hysteresis).  sev = smear /
-    // LEN_MAX, so ON ≈ 0.14 corresponds to a frame ~130 ms late: mild jitter keeps
-    // the smooth glow, a real stall shatters it into dots.
-    const BRAILLE_ON:   f32 = 0.14;
-    const BRAILLE_OFF:  f32 = 0.07;
     // Frame-cadence event ring → fallback fingerprint: keep ~60 s of per-frame
     // lateness, and re-fold it at most ~2 Hz when no probe fingerprint is given.
     const RING_S:      f32 = 60.0;
     const CHAR_EVERY:  f32 = 0.5;
     const EVENT_FLOOR: f32 = 30.0; // ms over the render tick to count as a stall
-    let (smear, engaged, frame_shape) = {
+    let (smear, frame_shape) = {
         let trail = TRAIL.get_or_init(|| {
             Mutex::new(RimTrail {
                 last_t: t,
                 smear: 0.0,
-                engaged: false,
                 ring: std::collections::VecDeque::new(),
                 last_char_t: t,
                 shape: None,
@@ -455,8 +446,6 @@ fn apply_border_glow(
         let instant = ((dt_ms - FLOOR_MS).max(0.0) * MS_PER_PERIM).min(LEN_MAX);
         let decay = (-dt / TAU_S).exp();          // rise instantly…
         s.smear = (s.smear * decay).max(instant); // …fall slowly.
-        let sev_now = (s.smear / LEN_MAX).clamp(0.0, 1.0);
-        s.engaged = (s.engaged && sev_now > BRAILLE_OFF) || sev_now > BRAILLE_ON;
 
         // Record this frame's lateness above the render tick, evict the old tail.
         s.ring.push_back((t, (dt_ms - 50.0).max(0.0)));
@@ -473,7 +462,7 @@ fn apply_border_glow(
             s.shape = crate::diag::characterise_stutter(&samples, EVENT_FLOOR);
             s.last_char_t = t;
         }
-        (s.smear, s.engaged, s.shape.clone())
+        (s.smear, s.shape.clone())
     };
     // Severity in [0,1] of the current stall, used to pulse the knots.
     let sev = (smear / LEN_MAX).clamp(0.0, 1.0);
@@ -518,68 +507,81 @@ fn apply_border_glow(
     // the onset jitter — while its braille *height* is the stall's duration.  A
     // burst pattern (one long stall then short ones) lights several bins.
     //
+    // Knots are shown while a recurring problem is *present* — a confident
+    // fingerprint, OR (its fallback) any detected periodic offender — rather than
+    // gated on aerie's own frame stall, which may never happen even while the
+    // system stutters.  When the fingerprint is too weak (messy stress), we still
+    // mark the offender phases so "offenders in the scope ⇒ knots on the rim".
+    // Brightness has a visible floor and pulses up with the live severity.
+    //
     // Hue is the attribution: cyan/violet when a periodic offender lines up with
-    // this phase (the "who"), else cool white (an unattributed stutter).  Drawn
-    // only while a stall is currently being felt (`engaged`), pulsed by severity,
-    // so a calm rim is pure orbiter and the fingerprint blinks up exactly as the
-    // lag hits — at the same angle each time when it is cleanly periodic.
+    // this phase (the "who"), else cool white (an unattributed stutter).
     const KNOT_SIGMA:   f32 = 0.02;  // knot half-width on the rim
     const ATTRIB_NEAR:  f32 = 0.04;  // offender within this phase → its hue
-    if engaged {
-        if let Some(shape) = shape {
-            // Significant fold bins → (rim phase, normalised duration height).
-            let bins: Vec<(f32, f32)> = shape
-                .hist
+
+    // Knot sources as (phase, height): prefer the duration fingerprint, else the
+    // offender phases (a fixed-height marker — we know *where*, not *how long*).
+    let fingerprint: Vec<(f32, f32)> = shape
+        .filter(|s| s.confidence >= 0.30)
+        .map(|s| {
+            s.hist
                 .iter()
                 .enumerate()
                 .filter(|(_, &h)| h > 0.15)
                 .map(|(i, &h)| ((i as f32 + 0.5) / crate::diag::STUTTER_BINS as f32, h))
-                .collect();
-            if shape.confidence >= 0.30 && !bins.is_empty() {
-                for (col, &(x, y)) in perim.cells().iter().enumerate() {
-                    // Knots replace the glyph with braille, so skip text cells.
-                    if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
-                        continue;
-                    }
-                    let p = area.border_pos(x, y);
-                    // Height here = strongest nearby fold bin, Gaussian-spread.
-                    let mut height = 0.0f32;
-                    for &(ph, h) in &bins {
-                        let d = { let d = (p - ph).abs(); d.min(1.0 - d) };
-                        height = height.max(h * gaussian(d, KNOT_SIGMA));
-                    }
-                    if height < 0.20 {
-                        continue;
-                    }
-                    let mask = comet_braille_mask(height, col);
-                    if mask == 0 {
-                        continue;
-                    }
-                    let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or('⠿');
-                    // Attribution hue: nearest offender within a small phase window.
-                    let mut hue = (235.0f32, 235.0, 255.0); // unattributed: cool white
-                    let mut near = ATTRIB_NEAR;
-                    for off in offenders {
-                        let d = { let d = (p - off.phase).abs(); d.min(1.0 - d) };
-                        if d < near {
-                            near = d;
-                            hue = if off.spawns {
-                                (40.0, 200.0, 255.0) // spawns → cyan
-                            } else {
-                                (210.0, 90.0, 255.0) // CPU bursts → violet
-                            };
-                        }
-                    }
-                    // Pulse brightness with the live stall so it flares as you feel it.
-                    let f = (0.5 + 0.5 * sev).clamp(0.0, 1.0);
-                    let style = buf.get(x, y).style.fg(Color::Rgb(
-                        (hue.0 * f) as u8,
-                        (hue.1 * f) as u8,
-                        (hue.2 * f) as u8,
-                    ));
-                    buf.set_char(x, y, glyph, style);
+                .collect()
+        })
+        .unwrap_or_default();
+    let knots: Vec<(f32, f32)> = if !fingerprint.is_empty() {
+        fingerprint
+    } else {
+        offenders.iter().map(|o| (o.phase, 0.75)).collect()
+    };
+
+    if !knots.is_empty() {
+        for (col, &(x, y)) in perim.cells().iter().enumerate() {
+            // Knots replace the glyph with braille, so skip text cells.
+            if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
+                continue;
+            }
+            let p = area.border_pos(x, y);
+            // Height here = strongest nearby knot source, Gaussian-spread.
+            let mut height = 0.0f32;
+            for &(ph, h) in &knots {
+                let d = { let d = (p - ph).abs(); d.min(1.0 - d) };
+                height = height.max(h * gaussian(d, KNOT_SIGMA));
+            }
+            if height < 0.20 {
+                continue;
+            }
+            let mask = comet_braille_mask(height, col);
+            if mask == 0 {
+                continue;
+            }
+            let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or('⠿');
+            // Attribution hue: nearest offender within a small phase window.
+            let mut hue = (235.0f32, 235.0, 255.0); // unattributed: cool white
+            let mut near = ATTRIB_NEAR;
+            for off in offenders {
+                let d = { let d = (p - off.phase).abs(); d.min(1.0 - d) };
+                if d < near {
+                    near = d;
+                    hue = if off.spawns {
+                        (40.0, 200.0, 255.0) // spawns → cyan
+                    } else {
+                        (210.0, 90.0, 255.0) // CPU bursts → violet
+                    };
                 }
             }
+            // Visible floor so the knot persists while the problem does; pulses
+            // brighter with the live stall severity.
+            let f = (0.6 + 0.4 * sev).clamp(0.0, 1.0);
+            let style = buf.get(x, y).style.fg(Color::Rgb(
+                (hue.0 * f) as u8,
+                (hue.1 * f) as u8,
+                (hue.2 * f) as u8,
+            ));
+            buf.set_char(x, y, glyph, style);
         }
     }
 }
