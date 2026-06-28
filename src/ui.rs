@@ -141,8 +141,8 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
         .map(|r| {
             r.offenders
                 .iter()
-                .filter(|o| o.confidence >= 0.30)
-                .take(3)
+                .filter(|o| o.confidence >= 0.25) // match the scope's MIN_CONF
+                .take(4)
                 .map(|o| RimOffender {
                     phase: o.phase,
                     spawns: matches!(o.kind, crate::diag::OffenderKind::Spawns),
@@ -358,12 +358,33 @@ fn comet_braille_mask(amp: f32, col: usize) -> u8 {
 /// stretches that gap.  We decay that excess into a 0..1 severity used to *pulse*
 /// the knots' brightness (they are shown whenever a recurring problem is
 /// detected, not only while aerie itself stalls).  See `docs/rim-latency.md`.
+/// One persistent stutter knot, kept across frames so that brief gaps in
+/// detection (the offender/fingerprint confidence wobbling across its threshold
+/// on a noisy system) do not blink the knot off.  Refreshed to `intensity = 1.0`
+/// whenever a matching knot is detected, and decayed otherwise.
+#[derive(Clone, Copy)]
+struct HeldKnot {
+    /// Rim position in `[0, 1)`.
+    phase: f32,
+    /// Normalised stall duration (fingerprint) or a fixed marker (offender fallback).
+    height: f32,
+    /// Hue: `Some(true)` = spawns (cyan), `Some(false)` = CPU bursts (violet),
+    /// `None` = unattributed (white).
+    spawns: Option<bool>,
+    /// 1.0 when freshly detected, decays toward 0 so a vanished knot fades out.
+    intensity: f32,
+}
+
 struct RimTrail {
     /// Wall-clock seconds of the previous frame (same clock as the orbit phase).
     last_t: f32,
     /// Decaying stall severity (in perimeter-fraction units): jumps up on a slow
     /// frame, falls off smoothly, so a single long frame leaves a ~1 s tail.
     smear: f32,
+    /// Persistent knot set (see [`HeldKnot`]) and the wall-clock of its last
+    /// decay, so detection dropouts hold rather than flicker.
+    held: Vec<HeldKnot>,
+    held_t: f32,
     /// Rolling `(t, lateness_ms)` per frame for ~60 s — the always-on,
     /// self-contained event source the stutter characteriser folds when no
     /// latency probe is running.  `lateness_ms` is the frame interval above the
@@ -434,6 +455,8 @@ fn apply_border_glow(
             Mutex::new(RimTrail {
                 last_t: t,
                 smear: 0.0,
+                held: Vec::new(),
+                held_t: t,
                 ring: std::collections::VecDeque::new(),
                 last_char_t: t,
                 shape: None,
@@ -518,61 +541,104 @@ fn apply_border_glow(
     // this phase (the "who"), else cool white (an unattributed stutter).
     const KNOT_SIGMA:   f32 = 0.02;  // knot half-width on the rim
     const ATTRIB_NEAR:  f32 = 0.04;  // offender within this phase → its hue
+    const HOLD_TAU:     f32 = 2.5;   // knot-persistence time constant (~6 s to fade)
+    const MATCH:        f32 = 0.03;  // a detection within this phase refreshes a held knot
 
-    // Knot sources as (phase, height): prefer the duration fingerprint, else the
-    // offender phases (a fixed-height marker — we know *where*, not *how long*).
-    let fingerprint: Vec<(f32, f32)> = shape
-        .filter(|s| s.confidence >= 0.30)
-        .map(|s| {
-            s.hist
-                .iter()
-                .enumerate()
-                .filter(|(_, &h)| h > 0.15)
-                .map(|(i, &h)| ((i as f32 + 0.5) / crate::diag::STUTTER_BINS as f32, h))
-                .collect()
-        })
-        .unwrap_or_default();
-    let knots: Vec<(f32, f32)> = if !fingerprint.is_empty() {
-        fingerprint
-    } else {
-        offenders.iter().map(|o| (o.phase, 0.75)).collect()
+    // Hue of the nearest offender within ATTRIB_NEAR, if any.
+    let nearest_kind = |phase: f32| -> Option<bool> {
+        let mut best = ATTRIB_NEAR;
+        let mut kind = None;
+        for off in offenders {
+            let d = { let d = (phase - off.phase).abs(); d.min(1.0 - d) };
+            if d < best {
+                best = d;
+                kind = Some(off.spawns);
+            }
+        }
+        kind
     };
 
-    if !knots.is_empty() {
+    // This frame's knot candidates: prefer the duration fingerprint, else the
+    // offender phases (a fixed-height marker — we know *where*, not *how long*).
+    let mut current: Vec<HeldKnot> = Vec::new();
+    if let Some(fp) = shape.filter(|s| s.confidence >= 0.30) {
+        for (i, &h) in fp.hist.iter().enumerate() {
+            if h > 0.15 {
+                let phase = (i as f32 + 0.5) / crate::diag::STUTTER_BINS as f32;
+                current.push(HeldKnot { phase, height: h, spawns: nearest_kind(phase), intensity: 1.0 });
+            }
+        }
+    }
+    if current.is_empty() {
+        for off in offenders {
+            current.push(HeldKnot { phase: off.phase, height: 0.75, spawns: Some(off.spawns), intensity: 1.0 });
+        }
+    }
+
+    // Merge into the sticky held set: refresh matches to full intensity, decay the
+    // rest, so a noisy detector dropping out for a tick or two does not blink the
+    // knots off — a detected stutter holds for several seconds and fades only when
+    // it is genuinely gone.
+    let held: Vec<HeldKnot> = {
+        let mut s = TRAIL.get().expect("TRAIL initialised above").lock().unwrap();
+        let dt = (t - s.held_t).max(0.0);
+        s.held_t = t;
+        let decay = (-dt / HOLD_TAU).exp();
+        for k in s.held.iter_mut() {
+            k.intensity *= decay;
+        }
+        for c in &current {
+            if let Some(k) = s.held.iter_mut().find(|k| {
+                let d = (k.phase - c.phase).abs();
+                d.min(1.0 - d) < MATCH
+            }) {
+                *k = *c; // refresh phase/height/hue, intensity back to 1.0
+            } else {
+                s.held.push(*c);
+            }
+        }
+        s.held.retain(|k| k.intensity > 0.1);
+        // Safety cap: under very jittery onsets many distinct phases can register;
+        // keep the strongest so the rim never fills with knots.
+        if s.held.len() > 16 {
+            s.held.sort_by(|a, b| b.intensity.partial_cmp(&a.intensity).unwrap_or(std::cmp::Ordering::Equal));
+            s.held.truncate(16);
+        }
+        s.held.clone()
+    };
+
+    if !held.is_empty() {
         for (col, &(x, y)) in perim.cells().iter().enumerate() {
             // Knots replace the glyph with braille, so skip text cells.
             if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
                 continue;
             }
             let p = area.border_pos(x, y);
-            // Height here = strongest nearby knot source, Gaussian-spread.
+            // Strongest held knot covering this cell; its intensity dims+shortens
+            // the braille as it fades, its hue wins the colour.
             let mut height = 0.0f32;
-            for &(ph, h) in &knots {
-                let d = { let d = (p - ph).abs(); d.min(1.0 - d) };
-                height = height.max(h * gaussian(d, KNOT_SIGMA));
+            let mut spawns = None;
+            for k in &held {
+                let d = { let d = (p - k.phase).abs(); d.min(1.0 - d) };
+                let i = k.height * k.intensity * gaussian(d, KNOT_SIGMA);
+                if i > height {
+                    height = i;
+                    spawns = k.spawns;
+                }
             }
             if height < 0.20 {
                 continue;
             }
-            let mask = comet_braille_mask(height, col);
+            let mask = comet_braille_mask(height.min(1.0), col);
             if mask == 0 {
                 continue;
             }
             let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or('⠿');
-            // Attribution hue: nearest offender within a small phase window.
-            let mut hue = (235.0f32, 235.0, 255.0); // unattributed: cool white
-            let mut near = ATTRIB_NEAR;
-            for off in offenders {
-                let d = { let d = (p - off.phase).abs(); d.min(1.0 - d) };
-                if d < near {
-                    near = d;
-                    hue = if off.spawns {
-                        (40.0, 200.0, 255.0) // spawns → cyan
-                    } else {
-                        (210.0, 90.0, 255.0) // CPU bursts → violet
-                    };
-                }
-            }
+            let hue = match spawns {
+                Some(true) => (40.0f32, 200.0, 255.0),  // spawns → cyan
+                Some(false) => (210.0f32, 90.0, 255.0), // CPU bursts → violet
+                None => (235.0f32, 235.0, 255.0),       // unattributed → cool white
+            };
             // Visible floor so the knot persists while the problem does; pulses
             // brighter with the live stall severity.
             let f = (0.6 + 0.4 * sev).clamp(0.0, 1.0);

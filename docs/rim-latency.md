@@ -240,6 +240,13 @@ back to the frame fold.
   can stutter the system while aerie's cheap 20 fps redraw keeps up, so the
   earlier "only while aerie's frame stalls" gate hid the knots exactly when they
   were most wanted.
+* **Held with hysteresis (`HeldKnot`).** On a noisy system the offender /
+  fingerprint confidence wobbles across its threshold every ~1 s analysis tick;
+  without memory each dropout would blink the knot off. So detected knots are
+  kept in a persistent set, refreshed to full intensity when re-detected and
+  decayed otherwise (`HOLD_TAU = 2.5 s`, ~6 s to fade), and a fading knot dims
+  and shortens rather than vanishing. A genuinely continuous stutter therefore
+  shows a steady knot, not an intermittent flicker.
 
 The scope view (`d`) also prints the shape in words on the periodicity line —
 e.g. *"steady onset, varying length (~40–120 ms)"*.
