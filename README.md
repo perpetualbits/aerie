@@ -237,10 +237,13 @@ latency display: each is driven by wall-clock time but only painted when the
 draw loop runs, sweeping continuously around the whole rim (tinting the legend
 text as they pass). When the system stalls, no frame is painted — so a blob
 visibly **freezes and then jumps ahead**, and the size of that jump is the
-stall. Once the scope probes are running (press `d` once), each periodic offender
-also blinks up a **braille knot** at its phase *while the stall is being felt*
-(cyan = periodically spawning helpers, violet = periodic CPU bursts) — a knot at
-the same angle each time is cleanly periodic, one that drifts is not. See
+stall. A recurring stutter folds into a **braille knot** that blinks up while the
+lag is felt: its **angle** is *when* in the cycle the stall starts (narrow =
+steady, smeared = jittery onset), its **height** is *how long* the stall lasts,
+and its colour attributes it to a periodic process when the scope probes are
+running (`d`; cyan = spawns, violet = CPU bursts). The fold works from aerie's own
+frame cadence with no probe, and sharpens to sub-millisecond once the latency
+probe is alive. See
 [`docs/rim-latency.md`](docs/rim-latency.md) for the mechanism, calibration, and
 the planned per-offender strobe orbiters.
 

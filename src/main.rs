@@ -1018,6 +1018,10 @@ pub struct AppState {
     /// Last time the offender report was recomputed (throttles the ambient
     /// rim-knot refresh that runs even when the scope view is closed).
     pub last_offender_analysis: Option<Instant>,
+    /// Probe-derived stutter fingerprint (onset phase + duration fold) for the
+    /// rim. Computed from the latency probe when it is alive; `None` falls the
+    /// rim back to its own frame-cadence characterisation.
+    pub stutter_shape: Option<diag::StutterShape>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1558,6 +1562,7 @@ impl AppState {
             pressure_analysis: None,
             offenders: None,
             last_offender_analysis: None,
+            stutter_shape: None,
             offender_report: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
@@ -2926,6 +2931,8 @@ fn main() -> Result<()> {
                     }
                     let _ = w.flush();
                 }
+                // Probe-grade stutter fingerprint for the rim (onset + duration).
+                state.stutter_shape = diag::characterise_stutter(&samples, threshold);
                 state.scope_analysis = Some(analysis);
                 state.scope_report = Some(report);
                 state.pressure_analysis = best_pressure;
@@ -2950,6 +2957,14 @@ fn main() -> Result<()> {
                 let (groups, children) = o.snapshot();
                 state.offender_report = Some(diag::analyze_offenders(&groups, &children));
                 state.last_offender_analysis = Some(Instant::now());
+            }
+            // Refresh the probe-grade stutter fingerprint too (the latency probe
+            // keeps running once spawned, even outside the scope view).
+            if let Some(probe) = state.scope.as_ref() {
+                let samples = probe.snapshot();
+                let st = diag::stats(&samples, probe.tick_ms());
+                let threshold = (st.mean_ms * 4.0).max(5.0);
+                state.stutter_shape = diag::characterise_stutter(&samples, threshold);
             }
         }
 

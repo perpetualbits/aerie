@@ -628,6 +628,113 @@ pub fn analyze_offenders(
     OffenderReport { offenders }
 }
 
+/// Number of phase bins in a [`StutterShape`] histogram.
+pub const STUTTER_BINS: usize = 120;
+
+/// The shape of a recurring stall, folded into one cycle of its own period.
+///
+/// Separates the two properties that vary independently: **onset timing** (when
+/// in the cycle the stall starts) and **duration** (how long it lasts). A clean
+/// periodic offender has a tight `phase` and small `onset_jitter`; a fixed-onset
+/// /varying-length stall has small `onset_jitter` but large `dur_cv`; a burst
+/// pattern shows as several populated `hist` bins.
+#[derive(Clone, Debug)]
+pub struct StutterShape {
+    pub period_s: f64,
+    pub confidence: f32,
+    /// Primary onset phase in `[0, 1)` (duration-weighted circular mean).
+    pub phase: f32,
+    /// Onset spread as `1 − R` of the circular mean (0 = perfectly aligned
+    /// onsets, → 1 = scattered). The "is the *timing* jittery" axis.
+    pub onset_jitter: f32,
+    pub dur_mean_ms: f32,
+    pub dur_max_ms: f32,
+    /// Coefficient of variation of stall duration (0 = every stall same length).
+    /// The "is the *length* variable" axis, independent of `onset_jitter`.
+    pub dur_cv: f32,
+    /// Phase-folded mean stall duration per bin, normalised to its own peak
+    /// (`[0, 1]`); index = `floor(phase · STUTTER_BINS)`. Drives the knot heights.
+    pub hist: Vec<f32>,
+}
+
+/// Characterise the recurring stutter in an excess-latency series.
+///
+/// `samples` is `(t, excess_ms)` — how late the loop (or wakeup) ran each frame
+/// or tick. `floor_ms` is the threshold above which a sample counts as a stall
+/// *event*. Returns `None` when no periodicity is found or there are too few
+/// events.
+///
+/// The fold uses event phase `frac(freq · t)`, which matches
+/// [`fundamental_phase`]'s convention (a peak at `t` lands at `frac(freq · t)`),
+/// so the histogram and the primary `phase` agree. Folding by *absolute* time
+/// keeps the result stable as the window slides and lets it **sharpen as more
+/// cycles accumulate**.
+pub fn characterise_stutter(samples: &[Sample], floor_ms: f32) -> Option<StutterShape> {
+    use std::f64::consts::TAU;
+    let p = analyze_periodicity(samples, AnalysisConfig::default());
+    let (period_s, freq_hz) = (p.period_s?, p.freq_hz?);
+
+    let events: Vec<(f64, f32)> = samples
+        .iter()
+        .filter(|s| s.overshoot_ms > floor_ms)
+        .map(|s| (s.t, s.overshoot_ms))
+        .collect();
+    if events.len() < 3 {
+        return None;
+    }
+
+    let mut hist = vec![0.0f32; STUTTER_BINS];
+    let mut count = vec![0.0f32; STUTTER_BINS];
+    let (mut cx, mut cy) = (0.0f64, 0.0f64); // duration-weighted resultant vector
+    let (mut dsum, mut dsqsum, mut dmax, mut wtot) = (0.0f64, 0.0f64, 0.0f32, 0.0f64);
+    for &(t, dur) in &events {
+        let ph = (freq_hz * t).rem_euclid(1.0);
+        let bin = ((ph * STUTTER_BINS as f64) as usize).min(STUTTER_BINS - 1);
+        hist[bin] += dur;
+        count[bin] += 1.0;
+        let ang = TAU * ph;
+        cx += dur as f64 * ang.cos();
+        cy += dur as f64 * ang.sin();
+        dsum += dur as f64;
+        dsqsum += (dur as f64) * (dur as f64);
+        dmax = dmax.max(dur);
+        wtot += dur as f64;
+    }
+
+    // Mean duration per bin, then normalise the histogram to its own peak.
+    let mut peak = 0.0f32;
+    for i in 0..STUTTER_BINS {
+        if count[i] > 0.0 {
+            hist[i] /= count[i];
+        }
+        peak = peak.max(hist[i]);
+    }
+    if peak > 0.0 {
+        for h in hist.iter_mut() {
+            *h /= peak;
+        }
+    }
+
+    let phase = (cy.atan2(cx) / TAU).rem_euclid(1.0) as f32;
+    let r = ((cx * cx + cy * cy).sqrt() / wtot.max(1e-9)).clamp(0.0, 1.0);
+    let onset_jitter = (1.0 - r) as f32;
+    let n = events.len() as f64;
+    let dmean = (dsum / n) as f32;
+    let dvar = ((dsqsum / n) - (dsum / n).powi(2)).max(0.0);
+    let dur_cv = if dmean > 0.0 { dvar.sqrt() as f32 / dmean } else { 0.0 };
+
+    Some(StutterShape {
+        period_s,
+        confidence: p.confidence,
+        phase,
+        onset_jitter,
+        dur_mean_ms: dmean,
+        dur_max_ms: dmax,
+        dur_cv,
+        hist,
+    })
+}
+
 /// Compute [`ProbeStats`] over a slice of samples (oldest → newest).
 ///
 /// `tick_ms` is carried through for display context. Percentile uses the
@@ -1279,6 +1386,37 @@ mod tests {
         let near = |a: f32, b: f32| (a - b).abs().min(1.0 - (a - b).abs());
         assert!(near(phase_a, expected) < 0.02, "phase {phase_a} vs expected {expected}");
         assert!(near(phase_a, phase_b) < 0.02, "phase drifted across windows: {phase_a} vs {phase_b}");
+    }
+
+    #[test]
+    fn characterise_clean_periodic_stutter() {
+        // 40 ms spikes every 3 s on a 0.2 ms baseline, sampled at 20 Hz.
+        let s = spike_train(0.05, 3.0, 90.0);
+        let shape = characterise_stutter(&s, 5.0).expect("should characterise");
+        assert!((shape.period_s - 3.0).abs() < 0.2, "period {}", shape.period_s);
+        // Identical spikes → tight onset, near-zero length variation.
+        assert!(shape.onset_jitter < 0.05, "onset_jitter {}", shape.onset_jitter);
+        assert!(shape.dur_cv < 0.05, "dur_cv {}", shape.dur_cv);
+        // Histogram should concentrate: one dominant bin, most bins empty.
+        let lit = shape.hist.iter().filter(|&&h| h > 0.1).count();
+        assert!(lit <= 3, "expected a concentrated fold, {lit} bins lit");
+        let peak_bin = shape
+            .hist
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let phase_bin = (shape.phase * STUTTER_BINS as f32) as usize % STUTTER_BINS;
+        let d = (peak_bin as i32 - phase_bin as i32).abs();
+        assert!(d <= 2 || d >= STUTTER_BINS as i32 - 2, "phase {phase_bin} vs peak {peak_bin}");
+    }
+
+    #[test]
+    fn characterise_rejects_flat_series() {
+        let s: Vec<Sample> =
+            (0..2000).map(|i| Sample { t: i as f64 * 0.05, overshoot_ms: 0.2 }).collect();
+        assert!(characterise_stutter(&s, 5.0).is_none(), "flat series has no stutter");
     }
 
     #[test]

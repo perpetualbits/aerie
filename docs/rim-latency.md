@@ -177,8 +177,11 @@ a human reads the knot and decides what it is.
 |-----------------------------------|---------------|
 | Two smooth blobs gliding evenly around the rim | Healthy. The draw loop is being scheduled on time (< 60 ms/frame). |
 | A blob **freezes, then jumps ahead** | A stall. It stopped where the freeze began; the size of the jump is roughly how long it stalled. |
-| A **cyan or violet braille knot** blinks on at a fixed angle during the stall (needs `d` opened once) | The periodic offender behind it. **Violet** = periodic CPU bursts, **cyan** = periodically spawning helpers; taller/brighter = more confident. A knot at the *same* angle each stall = cleanly periodic. |
-| The knot **wanders in a small arc** or **slowly drifts** | The offender is quasi-periodic (arc = period jitter) or its period is slowly changing (drift = detuning). |
+| A **braille knot** blinks on at a fixed angle during the stall | The recurring stutter's fingerprint. Its **angle** = when in the cycle the stall starts; its **height** = how long the stall lasts. A knot at the *same* angle each time = cleanly periodic. |
+| The knot is **narrow** vs **smeared along the rim** | Narrow = steady onset timing; smeared = jittery onset (starts early/late each cycle). |
+| The knot is **steady-height** vs **varying-height** | Steady = every stall the same length; varying = the stall length changes cycle to cycle. |
+| Knot is **cool white** vs **cyan / violet** | White = unattributed; **cyan** = a periodically-spawning process lines up with it, **violet** = a periodic-CPU-burst process does (needs `d` opened once to attribute). |
+| A **tall knot with a train of shorter ones** | A burst pattern — one long stall followed by shorter ones at fixed offsets. |
 
 When the rim stutters, press **`d`** to open the latency scope, where
 `LatencyProbe` / `PressureProbe` / `OffenderProbe` quantify the wakeup jitter,
@@ -187,30 +190,64 @@ ambient hint on the border.
 
 ---
 
-## 5. Next: the stutter characteriser
+## 5. Design 3 — the stutter characteriser (implemented)
 
 Design 1 makes a stall *visible* and Design 2 marks *whether/where* it recurs.
-The open work is to characterise the **shape** of the recurring stutter directly
-from the freeze-and-jump events, and to do it with the rim's two usable axes so
-two independent properties read at once:
+Design 3 characterises the **shape** of the recurring stutter and renders it on
+the rim's two usable axes, so the two independent properties read at once.
 
-* **Capture events.** Extend `RimTrail` into a small ring of recent stalls, each
-  `{ onset_t, duration }` taken straight from the frame-cadence freeze (already
-  measured) — self-contained, no probe required.
-* **Onset timing → rim angle.** Fold onsets by the detected period (reuse
-  `analyze_periodicity` / `fundamental_phase`). The fold **sharpens over passes**
-  as more cycles confirm the period — the "second or third pass becomes more
-  precise" behaviour. A tight angular cluster = precise onset timing; an arc =
-  onset jitter (the process starts a bit early/late each time).
-* **Duration → braille height.** At that angle, the braille fill height encodes
-  the stall length, and its variation encodes length variance. So the two failure
-  modes separate cleanly: *fixed onset / varying length* = a knot steady in angle
-  but breathing in height; *jittery onset / fixed length* = a knot smeared in
-  angle but steady in height.
-* **Patterns.** A "long burst then short bursts" signature shows as a tall knot
-  with a fixed train of shorter knots at characteristic angular offsets.
+### The fingerprint — `diag::characterise_stutter`
 
-The goal is recognition, not attribution: make the long-standing desktop stutter
-*obvious* and give its fingerprint (period, onset jitter, duration shape) so a
-human can act on it — file the bug, switch the offending software, or push the
-desktop's maintainers to fix the single-threaded main-loop stalls that cause it.
+Given an excess-latency series `(t, excess_ms)` it returns a `StutterShape`:
+
+* period + confidence (reuses `analyze_periodicity`);
+* a **phase-folded duration histogram** (`STUTTER_BINS = 120` bins): each stall
+  event folds to phase `frac(freq · t)` — the same convention as
+  `fundamental_phase`, and folding by *absolute* time means the fold **sharpens
+  as more cycles accumulate** (the "second or third pass gets more precise"
+  behaviour). Bins hold mean duration, normalised to the peak;
+* `onset_jitter` (`1 − R` of the duration-weighted circular mean — the *timing*
+  axis) and `dur_cv` (coefficient of variation of length — the *duration* axis),
+  which are independent, plus `dur_mean_ms` / `dur_max_ms`.
+
+Two sources feed it (see the §"both" decision): the **latency probe** when it is
+alive (sub-ms, 500 Hz — `state.stutter_shape`), else the rim's **own
+frame-cadence** ring in `RimTrail` (always-on, ~20 Hz, self-contained — no probe,
+works the instant you launch). The rim prefers the probe fingerprint and falls
+back to the frame fold.
+
+### On the rim
+
+* **Onset timing → rim angle.** Histogram bin `i` sits at rim phase
+  `i / STUTTER_BINS`, so the knot's angle is the stall's onset; the angular
+  *spread* of the lit region is the onset jitter.
+* **Duration → braille height.** At that angle the bottom-anchored braille fill
+  height is the stall's (relative) length.
+* So the failure modes separate: *fixed onset / varying length* = a knot steady
+  in angle, varying in height; *jittery onset / fixed length* = a knot smeared in
+  angle, steady in height. A **burst pattern** lights several bins — a tall knot
+  with a train of shorter ones at characteristic angular offsets.
+* **Hue = attribution.** Cool white for an unattributed stutter; cyan/violet when
+  a periodic offender lines up with that phase (the Design 2 "who", now folded in
+  as the knot's colour rather than a separate mark).
+* Drawn only while a stall is currently being felt (`engaged`) and pulsed by
+  severity, so a calm rim stays pure orbiter and the fingerprint blinks up at its
+  fixed angle exactly as the lag hits.
+
+The scope view (`d`) also prints the shape in words on the periodicity line —
+e.g. *"steady onset, varying length (~40–120 ms)"*.
+
+### The point
+
+The goal is recognition, not just attribution: make the long-standing desktop
+stutter *obvious* and give its fingerprint (period, onset jitter, duration shape)
+so a human can act — file the bug, switch the offending software, or push a
+desktop's maintainers to fix the single-threaded main-loop stalls behind it.
+
+### Still open
+
+* `onset_jitter` / `dur_cv` drive the *text* readout but the rim knot shows their
+  effect only implicitly (via histogram spread/height); an explicit shimmer for
+  length variance could make the duration axis pop more.
+* The frame-cadence fold is coarse (~50 ms granularity); the probe path is the
+  precise instrument.
