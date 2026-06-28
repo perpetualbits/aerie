@@ -248,8 +248,13 @@ back to the frame fold.
   and shortens rather than vanishing. A genuinely continuous stutter therefore
   shows a steady knot, not an intermittent flicker.
 
-The scope view (`d`) also prints the shape in words on the periodicity line —
-e.g. *"steady onset, varying length (~40–120 ms)"*.
+The period and duration are also surfaced as **text**, since the period folds
+away on the rim (the knot shows *where* in the cycle, not the cycle length):
+
+* the normal-view bottom status shows a compact `stutter ~3.0 s · 80–200 ms`
+  whenever a fingerprint is confident (available once the probe is running);
+* the scope view (`d`) prints the fuller shape on the periodicity line —
+  e.g. *"steady onset, varying length (~40–120 ms)"*.
 
 ### The point
 

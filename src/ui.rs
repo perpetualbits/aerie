@@ -1817,6 +1817,19 @@ fn groups_status_parts(state: &AppState) -> Vec<String> {
 
     let mut parts: Vec<String> = Vec::new();
 
+    // Surface the stutter fingerprint (period + duration) here too, so it is
+    // readable while watching the rim without opening the scope. Available once
+    // the latency probe is running (press `d` once); the rim shows *where* the
+    // stall lands, this shows *how often* and *how long*.
+    if let Some(sh) = state.stutter_shape.as_ref() {
+        if sh.confidence >= 0.30 {
+            parts.push(format!(
+                "stutter ~{:.1}s · {:.0}–{:.0}ms",
+                sh.period_s, sh.dur_mean_ms, sh.dur_max_ms
+            ));
+        }
+    }
+
     let n = state.entries.len();
     let hidden = state.total_groups.saturating_sub(n);
     if hidden > 0 {
