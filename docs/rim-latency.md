@@ -175,13 +175,12 @@ a human reads the knot and decides what it is.
 
 | What you see on the border        | What it means |
 |-----------------------------------|---------------|
-| Two smooth blobs gliding evenly around the rim | Healthy. The draw loop is being scheduled on time (< 60 ms/frame). |
-| A blob **freezes, then jumps ahead** | A stall. It stopped where the freeze began; the size of the jump is roughly how long it stalled. |
-| A **braille knot** sits at a fixed angle while the stutter persists (brightening as each stall hits) | The recurring stutter's fingerprint. Its **angle** = when in the cycle the stall starts; its **height** = how long the stall lasts. A knot at the *same* angle each time = cleanly periodic. |
-| The knot is **narrow** vs **smeared along the rim** | Narrow = steady onset timing; smeared = jittery onset (starts early/late each cycle). |
-| The knot is **steady-height** vs **varying-height** | Steady = every stall the same length; varying = the stall length changes cycle to cycle. |
-| Knot is **cool white** vs **cyan / violet** | White = unattributed; **cyan** = a periodically-spawning process lines up with it, **violet** = a periodic-CPU-burst process does (needs `d` opened once to attribute). |
-| A **tall knot with a train of shorter ones** | A burst pattern — one long stall followed by shorter ones at fixed offsets. |
+| **Four** small dots circling at different speeds (red fast … violet slow) | Healthy ambient orbiters — one per stutter-period *band* (red 1 s, orange-yellow 2 s, teal 4 s, violet 8 s). Their motion is the live clock; a stall makes them freeze and jump. |
+| A **bookended braille patch** `┤…├` appears at a fixed angle | A recurring stutter. Its **angle** = when in the cycle the stall starts; the braille **height** = how long it lasts; the `┤ ├` frame its structure. |
+| The patch's **colour** | The band the stutter's period falls in: **violet** < 1 s, **teal** 1–2 s, **orange-yellow** 2–4 s, **red** ≥ 4 s — matching the orbiter of that colour. |
+| The patch is **narrow** vs **smeared** along the rim | Narrow = steady onset timing; smeared = jittery onset (starts early/late each cycle). |
+| **Tall** vs **short / varying-height** braille | Taller = longer stalls; varying height across the patch = the stall length changes cycle to cycle, or a burst pattern (one long stall then shorter ones). |
+| The patch **fades out** | The stutter stopped recurring — the readout decays with a 4 s half-life, and each recurrence resets it to full. |
 
 When the rim stutters, press **`d`** to open the latency scope, where
 `LatencyProbe` / `PressureProbe` / `OffenderProbe` quantify the wakeup jitter,
