@@ -305,40 +305,7 @@ fn draw_bottom_border_content(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state:
     }
 }
 
-/// Intensity of a Gaussian blob that has been smeared into a *comet* along its
-/// trailing arc, evaluated at perimeter position `p`.  All positions are
-/// normalised fractions of the closed border loop, in `[0, 1)`.
-///
-/// `head` is the blob's leading edge (its instantaneous orbit position); the
-/// comet extends *backwards* from `head` by `len` perimeter fractions.  `dir`
-/// is the travel direction along `p`: `+1.0` for a blob moving toward increasing
-/// `p` (clockwise), `−1.0` for decreasing `p` (counter-clockwise).  The trail
-/// therefore always falls on the side the blob came from.
-///
-/// Cells on the swept trail return the solid core value (`gaussian(0)` = 1.0);
-/// off the trail the value falls off as a Gaussian of the shortest distance to
-/// either comet endpoint, so head and tail stay round.  With `len == 0` this
-/// degrades *exactly* to the original point blob `gaussian(d, sigma)`, so a
-/// healthy render loop looks identical to the pre-smear glow.
-///
-/// See `docs/rim-latency.md` for the geometry and why frame latency maps to
-/// comet length.
-fn smear_intensity(p: f32, head: f32, len: f32, dir: f32, sigma: f32) -> f32 {
-    // How far `p` sits *behind* the head, measured against travel — i.e. how
-    // deep into the trail it is.  rem_euclid keeps the measure on the loop.
-    let behind = (dir * (head - p)).rem_euclid(1.0);
-    let d = if behind <= len {
-        0.0 // p lies on the swept trail → solid comet body
-    } else {
-        // Off the trail: round off at whichever comet endpoint is nearer.
-        let circ = |a: f32, b: f32| { let d: f32 = (a - b).abs(); d.min(1.0 - d) };
-        let tail = (head - dir * len).rem_euclid(1.0);
-        circ(p, head).min(circ(p, tail))
-    };
-    gaussian(d, sigma)
-}
-
-/// Rasterise one border cell of the comet into a 2×4 **braille** dot mask.
+/// Rasterise one border cell of a knot into a 2×4 **braille** dot mask.
 ///
 /// `amp ∈ [0, 1]` is the comet intensity at this cell; `col` is the cell's index
 /// around the perimeter (it seeds the Bayer dither so neighbours don't share a
@@ -377,43 +344,37 @@ fn comet_braille_mask(amp: f32, col: usize) -> u8 {
     mask
 }
 
-/// Frame-latency trail shared across redraws of the rim glow.
+/// Stall detector shared across redraws of the rim glow.
 ///
 /// `apply_border_glow` runs once per rendered frame, so the wall-clock gap
 /// between two successive calls *is* the draw loop's frame interval.  A healthy
 /// loop wakes on the 50 ms `RENDER_TICK`; a system-wide stall (compositor or
-/// scheduler hold-up — the very thing the orbiting glow visibly hitched on)
-/// stretches that gap.  We turn the slow part of the gap into a comet-tail
-/// length, so the rim becomes a *calibrated* latency gauge instead of merely
-/// stuttering.  This is "Design 1" of `docs/rim-latency.md`; the per-offender
-/// strobe orbiters (Design 2) build on the same `smear_intensity` primitive.
+/// scheduler hold-up — the very thing the orbiting glow visibly hitches on)
+/// stretches that gap.  We decay that excess into a 0..1 severity and latch an
+/// `engaged` flag with hysteresis, used to reveal the offender knots only while a
+/// stall is actually being felt.  See `docs/rim-latency.md`.
 struct RimTrail {
     /// Wall-clock seconds of the previous frame (same clock as the orbit phase).
     last_t: f32,
-    /// Current comet length in perimeter fractions.  Rises instantly on a slow
-    /// frame and decays smoothly, so a single long frame leaves a ~1 s fading
-    /// comet the eye can actually catch rather than a one-frame flash.
+    /// Decaying stall severity (in perimeter-fraction units): jumps up on a slow
+    /// frame, falls off smoothly, so a single long frame leaves a ~1 s tail.
     smear: f32,
-    /// Whether the rim is currently drawing the braille comet.  At rest the
-    /// orbiters are a smooth solid glow; only a real stall "shatters" them into
-    /// travelling braille dots.  Latched with hysteresis so a severity hovering
-    /// near the trigger does not flicker the two looks frame-to-frame.
+    /// Whether a stall is currently being felt.  Latched with hysteresis so a
+    /// severity hovering near the trigger does not flicker the knots on and off.
     engaged: bool,
 }
 
-/// Animate two Gaussian blobs (yellow CW, red CCW) around the outer border, each
-/// smeared into a comet whose length reads out the current render-loop latency.
+/// Animate two Gaussian blobs (yellow CW, red CCW) continuously around the outer
+/// border, and reveal the periodic-offender knots while a stall is active.
 ///
 /// Speed ratio 2 : 5 — yellow makes one orbit every 10 s, red every 4 s.  Where
-/// they overlap the channels add like light, producing orange → warm-white.
-/// Under a stall both comets stretch together (the delay is *common-mode* — it
-/// hits the whole render equally) and flare toward white-hot.
+/// they overlap the channels add like light, producing orange.  The blobs are
+/// driven by wall-clock time, so a loop stall makes them visibly freeze and then
+/// jump — that motion *is* the live latency signal.
 ///
-/// Cells that fall inside a `BorderGap` with `rim_glow = false` are skipped
-/// entirely so the gap can render its own colours in the subsequent content pass.
-///
-/// `offenders` are the Design 2 periodic-offender knots, drawn on top of the
-/// orbiters at their fixed rim phase.
+/// The glow sweeps over the whole rim, recolouring legend/status text as it
+/// passes (foreground only; glyphs are preserved).  `offenders` are the Design 2
+/// knots, drawn on top at their fixed rim phase but only while `engaged`.
 fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap], offenders: &[RimOffender]) {
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
@@ -464,69 +425,52 @@ fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap], offenders
         s.engaged = (s.engaged && sev_now > BRAILLE_OFF) || sev_now > BRAILLE_ON;
         (s.smear, s.engaged)
     };
-    // Severity in [0,1] drives the brightness flare plus a touch of blue (a
-    // warm-white comet head) so a stall is unmistakable even at a glance.
+    // Severity in [0,1] of the current stall, for gating the knots below.
     let sev = (smear / LEN_MAX).clamp(0.0, 1.0);
 
-    // Walk the whole perimeter clockwise across all four corners.  `Field::perimeter`
-    // is the corner-crossing edge strip the spiral_stress example uses, so the glow
-    // flows around the box without breaking at the corners.
+    // ── The orbiters: a clean, continuous glow all the way around ────────────
+    // `Field::perimeter` is the corner-crossing edge strip the spiral_stress
+    // example uses, so the glow flows around the box without breaking at the
+    // corners.  Unlike the structural border, the glow is *not* gap-aware here:
+    // it recolours every cell it reaches — including the legend/status text — so
+    // the two blobs sweep continuously over the whole rim.  Only the foreground
+    // colour changes; the underlying glyph (box rule or text) is preserved, so
+    // the text stays readable, just briefly tinted as a blob passes.
     //
-    // Two looks, chosen by `engaged`:
-    //   • at rest — a smooth solid glow: the existing box glyph is recoloured
-    //     (identical to the original orbiters);
-    //   • under a stall — the glow shatters into a travelling braille comet whose
-    //     lit dots encode the local intensity (see `comet_braille_mask`).
-    // Cells the glow does not reach keep their box-drawing glyph either way.
+    // The blobs are plain Gaussians driven by wall-clock time.  Their motion is
+    // the live latency signal all on its own: when the loop stalls, no frame is
+    // painted, so a blob visibly *freezes* and then *jumps* ahead to where the
+    // clock has moved on — the gap you see is the stall.  We deliberately do not
+    // dress that up; the diagnostic that captures it is the knot pass below.
     let perim = Field::perimeter(area);
-    for (col, &(x, y)) in perim.cells().iter().enumerate() {
-        // Preserve legend/status/key cells: a non-glow gap renders itself later.
-        if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
-            continue;
-        }
+    for &(x, y) in perim.cells().iter() {
         let p = area.border_pos(x, y);
-
-        // Both blobs share `smear` because a loop stall is common-mode (it delays
-        // the whole render, not one blob).  Per-offender strobes (Design 2) will
-        // instead give each orbiter its own period + phase.
-        let i_y = smear_intensity(p, cw_pos,  smear,  1.0, SIGMA); // yellow, travels +p
-        let i_r = smear_intensity(p, ccw_pos, smear, -1.0, SIGMA); // red,    travels −p
-        let amp = (i_y + i_r).min(1.0);
-
-        // Heat colour: yellow ≈ (255, 200, 0), red ≈ (220, 50, 0), lifted toward
-        // white-hot as the stall grows (blue only appears under stress).
-        let boost = 1.0 + 1.2 * sev;
-        let r = ((255.0 * i_y + 220.0 * i_r) * boost).min(255.0) as u8;
-        let g = ((200.0 * i_y +  50.0 * i_r) * boost).min(255.0) as u8;
-        let b = ((200.0 * i_y + 120.0 * i_r) * sev).min(255.0) as u8;
-
-        if engaged {
-            let mask = comet_braille_mask(amp, col);
-            if mask == 0 {
-                continue; // comet hasn't reached this cell → leave the border glyph
-            }
-            let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or('⠿');
-            let style = buf.get(x, y).style.fg(Color::Rgb(r, g, b));
-            buf.set_char(x, y, glyph, style);
-        } else if r > 12 || g > 12 || b > 12 {
-            // Solid glow: recolour the existing glyph, leaving its shape intact.
+        let d_cw  = { let d = (p - cw_pos).abs();  d.min(1.0 - d) };
+        let d_ccw = { let d = (p - ccw_pos).abs(); d.min(1.0 - d) };
+        let i_y = gaussian(d_cw,  SIGMA); // yellow blob
+        let i_r = gaussian(d_ccw, SIGMA); // red blob
+        let r = (255.0 * i_y + 220.0 * i_r).min(255.0) as u8;
+        let g = (200.0 * i_y +  50.0 * i_r).min(255.0) as u8;
+        if r > 12 || g > 12 {
             let prev = buf.get(x, y);
             let symbol = prev.symbol.clone();
-            let style = prev.style.fg(Color::Rgb(r, g, b));
+            let style = prev.style.fg(Color::Rgb(r, g, 0));
             buf.set_grapheme(x, y, &symbol, style);
         }
     }
 
-    // ── Design 2: periodic-offender knots ────────────────────────────────────
-    // Each detected periodic offender sits at a fixed rim angle equal to its
-    // `phase`. While the period estimate holds, that phase is stable, so the knot
-    // holds still — a stationary bright knot *is* a confirmed periodic offender;
-    // a drifting or quasi-periodic one makes its knot precess around the rim.
-    // Hue encodes the kind (spawns vs CPU bursts); the braille fill height encodes
-    // confidence. Drawn after the orbiters so the diagnostic markers ride on top.
+    // ── Design 2: periodic-offender knots — only while a stall is active ──────
+    // A knot marks a periodic offender at its fixed rim `phase` (stable while the
+    // period estimate holds → stationary; precesses when it drifts).  It is drawn
+    // *only while a stall is currently being felt* (`engaged`), so a calm rim is
+    // pure orbiter and a knot blinking on at a fixed angle reads as "this is the
+    // thing stalling you, and it's happening right now".  Hue encodes the kind
+    // (cyan spawns / violet CPU bursts); braille fill height encodes confidence,
+    // pulsed up by the live stall severity so it jumps out against the glow.
     const KNOT_SIGMA: f32 = 0.015; // tight: a few cells wide
-    if !offenders.is_empty() {
+    if engaged && !offenders.is_empty() {
         for (col, &(x, y)) in perim.cells().iter().enumerate() {
+            // Knots replace the glyph with braille, so skip text cells here.
             if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
                 continue;
             }
@@ -542,10 +486,13 @@ fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap], offenders
                     spawns = off.spawns;
                 }
             }
-            if best < 0.22 {
+            // Pulse the knot with the live stall severity so it brightens exactly
+            // when you feel the lag, then settles back as the stall passes.
+            let amp = (best * (0.6 + 0.4 * sev)).min(1.0);
+            if amp < 0.22 {
                 continue; // outside every knot's core → leave the orbiter/border
             }
-            let mask = comet_braille_mask(best.min(1.0), col);
+            let mask = comet_braille_mask(amp, col);
             if mask == 0 {
                 continue;
             }
@@ -553,7 +500,7 @@ fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap], offenders
             // Spawns → cyan, CPU bursts → violet: a distinct layer from the
             // yellow/red latency orbiters.
             let (hr, hg, hb) = if spawns { (40.0, 200.0, 255.0) } else { (210.0, 90.0, 255.0) };
-            let f = 0.45 + 0.55 * best.min(1.0);
+            let f = 0.55 + 0.45 * amp;
             let style = buf
                 .get(x, y)
                 .style
@@ -1992,46 +1939,6 @@ pub fn manual_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn smear_zero_len_is_point_blob() {
-        // With no smear the comet must collapse to the original Gaussian blob.
-        const SIGMA: f32 = 0.05;
-        for &p in &[0.0_f32, 0.1, 0.3, 0.5, 0.73, 0.99] {
-            let head = 0.30;
-            let d = { let d = (p - head).abs(); d.min(1.0 - d) };
-            let expect = gaussian(d, SIGMA);
-            // Direction is irrelevant at len == 0.
-            assert!((smear_intensity(p, head, 0.0, 1.0, SIGMA) - expect).abs() < 1e-6);
-            assert!((smear_intensity(p, head, 0.0, -1.0, SIGMA) - expect).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn smear_trail_is_solid_and_one_sided() {
-        const SIGMA: f32 = 0.05;
-        let head = 0.50;
-        let len = 0.20;
-        // Clockwise blob (dir +1): trail extends *behind*, toward smaller p.
-        assert!((smear_intensity(head, head, len, 1.0, SIGMA) - 1.0).abs() < 1e-6, "head is solid");
-        assert!((smear_intensity(0.40, head, len, 1.0, SIGMA) - 1.0).abs() < 1e-6, "mid-trail is solid");
-        assert!((smear_intensity(0.31, head, len, 1.0, SIGMA) - 1.0).abs() < 1e-6, "tail edge is solid");
-        // Just ahead of the head (larger p) is off-trail → strict Gaussian falloff.
-        assert!(smear_intensity(0.60, head, len, 1.0, SIGMA) < 0.2, "leading side falls off");
-        // The counter-clockwise blob mirrors: its trail is on the larger-p side.
-        assert!((smear_intensity(0.60, head, len, -1.0, SIGMA) - 1.0).abs() < 1e-6, "ccw trail is solid");
-        assert!(smear_intensity(0.40, head, len, -1.0, SIGMA) < 0.2, "ccw leading side falls off");
-    }
-
-    #[test]
-    fn smear_trail_wraps_the_loop() {
-        // A comet whose tail crosses the 0/1 seam stays continuous.
-        const SIGMA: f32 = 0.05;
-        let head = 0.05;
-        let len = 0.20; // tail at 0.85, wrapping past the seam
-        assert!((smear_intensity(0.95, head, len, 1.0, SIGMA) - 1.0).abs() < 1e-6, "wrapped trail is solid");
-        assert!((smear_intensity(0.88, head, len, 1.0, SIGMA) - 1.0).abs() < 1e-6, "wrapped tail edge is solid");
-    }
 
     #[test]
     fn comet_mask_full_and_empty() {

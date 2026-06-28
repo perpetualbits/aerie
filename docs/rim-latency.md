@@ -42,99 +42,58 @@ The rim therefore already measures the latency of the loop that draws it. Design
 
 ---
 
-## 2. Design 1 — the comet (implemented)
+## 2. Design 1 — the clean orbiter (implemented)
 
-Instead of teleporting a round blob, we **smear** it into a comet whose trailing
-length equals the latency of the frame that just elapsed.
+The orbiter is left as a plain Gaussian blob driven by wall-clock time, sweeping
+**continuously around the whole rim**. Its own motion is the live signal: when
+the loop stalls, no frame is painted, so the blob visibly **freezes and then
+jumps** to where the clock moved on. The gap you see — where it stopped, and how
+far it skipped — is the stall's *onset* and *duration*. We deliberately do not
+dress this up (an earlier version smeared the blob into a "comet" and shattered
+it into braille; that read as clutter against the moving glow). The job of
+*capturing* the stall falls to the knot (Design 2); Design 1 just keeps the
+heartbeat clean and legible.
 
-* `apply_border_glow` runs once per painted frame, so the gap between two calls
-  *is* the frame interval. A `RimTrail` static records the previous frame's
-  timestamp and the current comet length.
-* Each frame: `dt = now − last`. The **slow part** of `dt` above a floor becomes
-  the comet length, in fractions of the perimeter.
-* Length rises instantly and **decays smoothly** (exponential, `TAU_S = 0.6 s`),
-  so a single long frame leaves a ~1 s fading comet the eye can catch rather
-  than a one-frame flash.
-* Both orbiters share the same length because a loop stall is **common-mode** —
-  it delays the whole render equally, not one blob. (Per-offender phase is
-  Design 2's job.)
-* As the comet grows it flares brighter and gains a touch of blue (a warm-white
-  head), so a stall is unmistakable at a glance.
-
-### Rendering: braille dots around the whole perimeter
-
-A faint colour smear turned out too subtle to read against the smoothly orbiting
-glow, so the comet is drawn as a **structural** change, not just a colour one.
+### Continuous, gap-crossing glow
 
 * `Field::perimeter(area)` (mullion) gives a 1-row strip that walks the border
-  clockwise **across all four corners**, so the comet flows around the box
-  without breaking at a corner — the same corner-crossing edge technique the
-  `spiral_stress` example uses for its sliding border ports.
-* **Two looks, by severity.** At rest the orbiters are the original **smooth
-  solid glow** — the existing box glyph is simply recoloured. Only a real stall
-  *engages* the braille comet: the glow shatters into travelling dots, then
-  reforms as the comet decays. The switch is latched with hysteresis
-  (`BRAILLE_ON ≈ 0.14`, `BRAILLE_OFF ≈ 0.07` of `LEN_MAX`, ≈ a frame 130 ms late)
-  so a severity hovering near the trigger does not flicker the two looks.
-* When engaged, each cell the comet reaches is replaced by a **braille glyph**
-  (a 2×4 dot matrix) whose lit dots encode the local intensity; cells it does not
-  reach keep their box-drawing glyph. Legend / status / key gaps are skipped just
-  as `render_rim` would (`!gap.rim_glow && gap.contains`).
-* `comet_braille_mask(amp, col)` fills the cell **bottom-anchored** — the bottom
-  dot row lights first, the top row last — and Bayer-dithers the partial rows:
-  * On the **horizontal** top/bottom edges the lit height reads as a little
-    level-meter bar — the *height* encoding.
-  * As the tail fades, the dither thins the dots into ever-sparser specks — the
-    *distance between them* growing with the hold-up.
-  * On the **vertical** side edges a within-cell height bar would not read
-    (travel is vertical there), so the signal is carried by the comet's *length*
-    along the rim instead; the same mask still renders as a coherent dot cluster.
-* Colour is still the green→red heat plus a white-hot lift under stress, applied
-  as the braille cell's foreground.
+  clockwise **across all four corners**, so the glow flows around the box without
+  breaking at a corner — the same corner-crossing edge strip the `spiral_stress`
+  example uses for its sliding border ports.
+* The glow is **not** gap-aware: it recolours every cell it reaches, *including
+  the legend/status text*, so the blobs sweep over the entire rim without a hole
+  where the text sits. Only the foreground colour changes — the underlying glyph
+  (box rule or text) is preserved, so the text stays readable, briefly tinted as
+  a blob passes.
+* Two plain Gaussians (`SIGMA = 0.05`), yellow CW (10 s orbit) and red CCW (4 s),
+  added like light where they overlap. No smear, no severity flare — steady.
 
-### Geometry: `smear_intensity`
+### Stall detection (drives the knots)
 
-A comet is a Gaussian blob stretched along its **trailing** arc — the side the
-blob came from. `smear_intensity(p, head, len, dir, sigma)`:
+`apply_border_glow` runs once per painted frame, so the gap between two calls
+*is* the frame interval. A `RimTrail` static records the previous frame's
+timestamp and a decaying **stall severity**:
 
-```
-behind = (dir * (head − p)) mod 1      // how far p sits *behind* the head
-if behind ≤ len:  d = 0                // p is on the swept trail → solid core
-else:             d = min distance to head or tail endpoint
-return gaussian(d, sigma)
-```
-
-* `head` — the blob's leading edge (its instantaneous orbit position).
-* `dir` — `+1` clockwise (trail extends toward smaller `p`), `−1`
-  counter-clockwise (trail extends toward larger `p`).
-* With `len == 0` this reduces *exactly* to the original point blob
-  `gaussian(d, sigma)`, so a healthy loop is visually identical to the old glow.
-* The arithmetic is modular, so a comet whose tail crosses the `0/1` seam stays
-  continuous. (All three properties are covered by unit tests in `src/ui.rs`.)
-
-### Calibration constants (`apply_border_glow`)
-
-| Constant        | Value     | Meaning |
-|-----------------|-----------|---------|
-| `FLOOR_MS`      | `60 ms`   | Below this the loop is healthy → no smear. Sits just above the 50 ms render tick, and conveniently filters aerie's own few-ms refresh read so a routine `/proc` scan is not mistaken for a stall. |
-| `MS_PER_PERIM`  | `0.0006`  | Gain: 200 ms over the floor ≈ 0.08 of the perimeter; 500 ms ≈ 0.26. |
-| `LEN_MAX`       | `0.33`    | A comet wraps at most a third of the rim, however long the stall. |
-| `TAU_S`         | `0.6 s`   | Comet fade time-constant; frame-rate independent (`exp(−dt/τ)`). |
-| `SIGMA`         | `0.05`    | Blob half-width (unchanged from the original glow). |
-
-The gain is a *display* choice — the rim is a gauge tuned for readability, like
-the braille scope traces that normalise to a ceiling. Tune `MS_PER_PERIM` /
-`FLOOR_MS` to taste.
+* Each frame `dt = now − last`; the part of `dt` above `FLOOR_MS = 60 ms`
+  (just over the 50 ms render tick, which also filters aerie's own few-ms refresh
+  read) feeds the severity.
+* Severity rises instantly and **decays smoothly** (`exp(−dt / TAU_S)`,
+  `TAU_S = 0.6 s`), then latches an `engaged` flag with hysteresis
+  (`BRAILLE_ON ≈ 0.14`, `BRAILLE_OFF ≈ 0.07` of `LEN_MAX`, ≈ a frame 130 ms late).
+* `engaged` gates the knot pass: a calm rim is pure orbiter; the knots appear
+  only while a stall is actually being felt.
 
 ### Known limitations
 
-* **Self-measurement.** The rim measures aerie's *own* draw cadence, which
+* **Self-measurement.** The detector reads aerie's *own* draw cadence, which
   includes aerie's refresh cost. `FLOOR_MS` filters the normal few-ms refresh,
   but on a heavily loaded box a slow refresh could contribute. The probe threads
   behind the `d` scope (`LatencyProbe`, `PressureProbe`, `OffenderProbe`) are
   immune to this and remain the authoritative source.
-* **Common-mode only.** Design 1 shows *that* the loop stalled and *how long* —
-  not *who* caused it or *whether it recurs*. That is Design 2.
+* **Onset/duration not yet quantified on the rim.** Design 1 makes the
+  freeze-and-jump *visible* and detects *that* a stall is happening; turning the
+  jump into a measured onset-phase and duration that sharpen over passes (and
+  separating timing jitter from length variance) is the next step — see §5.
 * **Resolution.** The perimeter has a finite number of cells, so very short
   stalls below the floor are intentionally invisible.
 
@@ -167,8 +126,13 @@ than animating an orbiter and waiting for it to lock:
   kind — cyan for `Spawns`, violet for `CpuBurst` — a deliberately different
   palette from the yellow/red latency orbiters, so the diagnostic layer reads
   apart from the ambient one. **Fill height / brightness** encodes confidence
-  (via the same bottom-anchored `comet_braille_mask`). Knots are drawn after the
-  orbiters, so they ride on top.
+  (via the bottom-anchored `comet_braille_mask`), pulsed up by the live stall
+  severity. Knots are drawn after the orbiters, so they ride on top.
+* **Stall-gated.** The knots are drawn *only while a stall is currently being
+  felt* (`engaged`). A calm rim is pure orbiter; a knot blinking on at a fixed
+  angle exactly as the lag hits reads as "this is the thing stalling you, and
+  it's happening right now" — and because it is gated, it cannot clutter the rim
+  when nothing is wrong.
 
 So the geometric reading the stroboscope promised falls out directly:
 
@@ -177,16 +141,16 @@ So the geometric reading the stroboscope promised falls out directly:
   per-window phase wobble);
 * drifting period → a knot that **slowly precesses** (the estimate is detuned).
 
-### Ambient vs diagnostic
+### When the data is available
 
-The knots are **ambient**: the offender report is refreshed at ~1 Hz whenever the
-offender probe is alive — both inside the scope view and, via a dedicated block
-in the main loop, outside it. The probe is spawned the first time the scope is
-opened with `d` (or at startup under `--scope-log`), and keeps scanning
-afterwards, so once you have peeked at the scope the knots persist on the border
-in every view. (They do **not** appear before the probe has ever run; making the
+The offender report is refreshed at ~1 Hz whenever the offender probe is alive —
+both inside the scope view and, via a dedicated block in the main loop, outside
+it. The probe is spawned the first time the scope is opened with `d` (or at
+startup under `--scope-log`) and keeps scanning afterwards, so once you have
+peeked at the scope the knots are available in every view (shown whenever a stall
+is being felt). They do **not** appear before the probe has ever run; making the
 probe start at boot for everyone is a separate policy choice, deliberately not
-taken here.)
+taken here.
 
 ### Not yet done
 
@@ -195,6 +159,8 @@ taken here.)
   into knot colour is the natural next refinement.
 * **Additive compositing.** A knot core overwrites the orbiter cell beneath it
   rather than blending; fine in practice because knots are tight and bright.
+* **Onset/duration split.** The knot marks *where/whether* it recurs, not yet the
+  separate shapes of onset-timing jitter vs duration variance — see §5.
 
 ### Staying domain-agnostic
 
@@ -203,28 +169,48 @@ a problem — period via angle, magnitude via brightness, kind/subsystem via hue
 periodicity-quality via stationarity. It never names a product or suggests a fix;
 a human reads the knot and decides what it is.
 
-### Staying domain-agnostic
-
-Like the rest of the Instruments subsystem, the rim reports only the **shape** of
-a problem — period via angle, magnitude via brightness, subsystem-category via
-hue, periodicity-quality via stationarity. It never names a product or suggests a
-fix; a human reads the knot and decides what it is.
-
 ---
 
 ## 4. Reading the rim — quick manual
 
 | What you see on the border        | What it means |
 |-----------------------------------|---------------|
-| Two smooth solid blobs gliding | Healthy. The draw loop is being scheduled on time (< 60 ms/frame). |
-| A blob **shatters into a comet of braille dots** | A real stall hit (≳ 130 ms frame). Longer comet = longer hold-up. On the top/bottom edges the dot **height** rises with it. |
-| The tail thins into **sparse, spread-out dots** | The fading edge of the comet — wider dot gaps mean a longer hold-up. |
-| The comet turns **white-hot**     | A large stall (hundreds of ms). |
-| Comets stretch and fade roughly **rhythmically** | Something on the system stalls the render on a cycle — open the latency scope to identify it. |
-| A **cyan or violet knot** sits on the rim (after you've opened `d` once) | A periodic offender. **Stationary** = cleanly periodic; **violet** = periodic CPU bursts, **cyan** = periodically spawning helpers; taller/brighter = more confident. |
-| A knot **wanders in a small arc** or **slowly drifts** around the rim | The offender is quasi-periodic (arc = period jitter) or its period is slowly changing (drift = detuning). |
+| Two smooth blobs gliding evenly around the rim | Healthy. The draw loop is being scheduled on time (< 60 ms/frame). |
+| A blob **freezes, then jumps ahead** | A stall. It stopped where the freeze began; the size of the jump is roughly how long it stalled. |
+| A **cyan or violet braille knot** blinks on at a fixed angle during the stall (needs `d` opened once) | The periodic offender behind it. **Violet** = periodic CPU bursts, **cyan** = periodically spawning helpers; taller/brighter = more confident. A knot at the *same* angle each stall = cleanly periodic. |
+| The knot **wanders in a small arc** or **slowly drifts** | The offender is quasi-periodic (arc = period jitter) or its period is slowly changing (drift = detuning). |
 
 When the rim stutters, press **`d`** to open the latency scope, where
 `LatencyProbe` / `PressureProbe` / `OffenderProbe` quantify the wakeup jitter,
 system pressure, and any periodic offender — the authoritative read behind the
 ambient hint on the border.
+
+---
+
+## 5. Next: the stutter characteriser
+
+Design 1 makes a stall *visible* and Design 2 marks *whether/where* it recurs.
+The open work is to characterise the **shape** of the recurring stutter directly
+from the freeze-and-jump events, and to do it with the rim's two usable axes so
+two independent properties read at once:
+
+* **Capture events.** Extend `RimTrail` into a small ring of recent stalls, each
+  `{ onset_t, duration }` taken straight from the frame-cadence freeze (already
+  measured) — self-contained, no probe required.
+* **Onset timing → rim angle.** Fold onsets by the detected period (reuse
+  `analyze_periodicity` / `fundamental_phase`). The fold **sharpens over passes**
+  as more cycles confirm the period — the "second or third pass becomes more
+  precise" behaviour. A tight angular cluster = precise onset timing; an arc =
+  onset jitter (the process starts a bit early/late each time).
+* **Duration → braille height.** At that angle, the braille fill height encodes
+  the stall length, and its variation encodes length variance. So the two failure
+  modes separate cleanly: *fixed onset / varying length* = a knot steady in angle
+  but breathing in height; *jittery onset / fixed length* = a knot smeared in
+  angle but steady in height.
+* **Patterns.** A "long burst then short bursts" signature shows as a tall knot
+  with a fixed train of shorter knots at characteristic angular offsets.
+
+The goal is recognition, not attribution: make the long-standing desktop stutter
+*obvious* and give its fingerprint (period, onset jitter, duration shape) so a
+human can act on it — file the bug, switch the offending software, or push the
+desktop's maintainers to fix the single-threaded main-loop stalls that cause it.
