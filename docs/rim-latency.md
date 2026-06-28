@@ -253,7 +253,10 @@ away on the rim (the knot shows *where* in the cycle, not the cycle length):
 
 * the bottom border carries a colour-popped `stutter ~3.0 s · 80–200 ms` segment
   (heat-coloured by the worst stall length, bold) just right of the status,
-  whenever a fingerprint is confident (available once the probe is running);
+  whenever a fingerprint is confident — **with no probe required**: it reads the
+  probe fingerprint when one is running, else the rim's own frame-cadence fold
+  (`rim_frame_shape`), so the readout appears at launch the moment a recurring
+  stutter is felt;
 * the scope view (`d`) prints the fuller shape on the periodicity line —
   e.g. *"steady onset, varying length (~40–120 ms)"*.
 

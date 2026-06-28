@@ -254,7 +254,9 @@ impl BottomSeg {
 
 /// The colour-popped stutter readout, or `None` when no confident fingerprint.
 fn stutter_segment(state: &AppState) -> Option<BottomSeg> {
-    let sh = state.stutter_shape.as_ref()?;
+    // Probe-grade fingerprint when the latency probe is alive, else the rim's own
+    // frame-cadence fold — so the readout works with no probe (press-`d`-free).
+    let sh = state.stutter_shape.clone().or_else(rim_frame_shape)?;
     if sh.confidence < 0.30 {
         return None;
     }
@@ -263,7 +265,7 @@ fn stutter_segment(state: &AppState) -> Option<BottomSeg> {
         sh.period_s, sh.dur_mean_ms, sh.dur_max_ms
     );
     // Pop: heat colour by the worst stall length (≈0 ms green → ≥300 ms red), bold.
-    let level = (sh.dur_max_ms / 300.0).clamp(0.0, 1.0);
+    let level: f32 = (sh.dur_max_ms / 300.0).clamp(0.0, 1.0);
     let style = Style::default().fg(heat_color(level)).add_modifier(Modifier::BOLD);
     Some(BottomSeg { text, style })
 }
@@ -433,6 +435,17 @@ struct RimTrail {
     shape: Option<crate::diag::StutterShape>,
 }
 
+/// The rim's per-frame trail state. Module-scoped (not a function-local static)
+/// so the bottom-border readout can read the frame-cadence fingerprint too —
+/// that is what lets the stutter readout work with no latency probe running.
+static RIM_TRAIL: std::sync::OnceLock<std::sync::Mutex<RimTrail>> = std::sync::OnceLock::new();
+
+/// The latest frame-cadence stutter fingerprint the rim has folded, if any.
+/// Lets [`stutter_segment`] show the stutter without a probe (press-`d`-free).
+fn rim_frame_shape() -> Option<crate::diag::StutterShape> {
+    RIM_TRAIL.get()?.lock().ok()?.shape.clone()
+}
+
 /// Animate two Gaussian blobs (yellow CW, red CCW) continuously around the outer
 /// border, and reveal the periodic-offender knots while a stall is active.
 ///
@@ -456,7 +469,6 @@ fn apply_border_glow(
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
-    static TRAIL: OnceLock<Mutex<RimTrail>> = OnceLock::new();
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f32();
 
     if area.width < 2 || area.height < 2 {
@@ -488,7 +500,7 @@ fn apply_border_glow(
     const CHAR_EVERY:  f32 = 0.5;
     const EVENT_FLOOR: f32 = 30.0; // ms over the render tick to count as a stall
     let (smear, frame_shape) = {
-        let trail = TRAIL.get_or_init(|| {
+        let trail = RIM_TRAIL.get_or_init(|| {
             Mutex::new(RimTrail {
                 last_t: t,
                 smear: 0.0,
@@ -620,7 +632,7 @@ fn apply_border_glow(
     // knots off — a detected stutter holds for several seconds and fades only when
     // it is genuinely gone.
     let held: Vec<HeldKnot> = {
-        let mut s = TRAIL.get().expect("TRAIL initialised above").lock().unwrap();
+        let mut s = RIM_TRAIL.get().expect("RIM_TRAIL initialised above").lock().unwrap();
         let dt = (t - s.held_t).max(0.0);
         s.held_t = t;
         let decay = (-dt / HOLD_TAU).exp();
