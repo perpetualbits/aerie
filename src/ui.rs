@@ -149,7 +149,7 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
                 .take(4)
                 .map(|o| RimOffender {
                     phase: o.phase,
-                    spawns: matches!(o.kind, crate::diag::OffenderKind::Spawns),
+                    period: o.period_s,
                 })
                 .collect()
         })
@@ -166,12 +166,13 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     apply_border_glow(buf, area, &gaps, &offenders, probe_shape);
 }
 
-/// A periodic offender reduced to what the rim needs to tint a stutter knot:
-/// where it sits (`phase` ∈ [0,1) around the perimeter) and its kind (`spawns` →
-/// hue). Built from [`crate::diag::Offender`] in [`draw_outer_border`].
+/// A periodic offender reduced to what the rim needs for the fallback marker when
+/// no fingerprint is confident: where it sits (`phase` ∈ [0,1)) and its `period`
+/// (for the band colour). Built from [`crate::diag::Offender`] in
+/// [`draw_outer_border`].
 struct RimOffender {
     phase: f32,
-    spawns: bool,
+    period: f64,
 }
 
 // ── Border structure (pass 1) ──────────────────────────────────────────────────
@@ -407,11 +408,28 @@ struct HeldKnot {
     phase: f32,
     /// Normalised stall duration (fingerprint) or a fixed marker (offender fallback).
     height: f32,
-    /// Hue: `Some(true)` = spawns (cyan), `Some(false)` = CPU bursts (violet),
-    /// `None` = unattributed (white).
-    spawns: Option<bool>,
-    /// 1.0 when freshly detected, decays toward 0 so a vanished knot fades out.
+    /// Band colour, chosen from the stutter's period by [`band_colour`].
+    colour: (f32, f32, f32),
+    /// 1.0 when freshly detected, decays by half every `HALF_LIFE` otherwise, so a
+    /// vanished stutter fades out; a recurrence resets it to 1.0.
     intensity: f32,
+}
+
+/// An RGB triple in float form, as the rim mixes colours additively.
+type Rgb = (f32, f32, f32);
+
+/// Colour for a stutter of period `period_s`, matching the orbiter bands:
+/// `[0,1)` → violet, `[1,2)` → teal, `[2,4)` → orange-yellow, `[4,8+)` → red.
+fn band_colour(period_s: f64) -> (f32, f32, f32) {
+    if period_s < 1.0 {
+        (170.0, 80.0, 255.0) // violet
+    } else if period_s < 2.0 {
+        (0.0, 200.0, 180.0) // teal
+    } else if period_s < 4.0 {
+        (255.0, 175.0, 0.0) // orange-yellow
+    } else {
+        (235.0, 55.0, 40.0) // red
+    }
 }
 
 struct RimTrail {
@@ -446,19 +464,18 @@ fn rim_frame_shape() -> Option<crate::diag::StutterShape> {
     RIM_TRAIL.get()?.lock().ok()?.shape.clone()
 }
 
-/// Animate two Gaussian blobs (yellow CW, red CCW) continuously around the outer
-/// border, and reveal the periodic-offender knots while a stall is active.
+/// Animate four tight clockwise Gaussian orbiters (red 1 s, orange-yellow 2 s,
+/// teal 4 s, violet 8 s) around the outer border, and draw the banded bookended
+/// stutter readout at the stall's phase.
 ///
-/// Speed ratio 2 : 5 — yellow makes one orbit every 10 s, red every 4 s.  Where
-/// they overlap the channels add like light, producing orange.  The blobs are
-/// driven by wall-clock time, so a loop stall makes them visibly freeze and then
-/// jump — that motion *is* the live latency signal.
+/// The orbiters are driven by wall-clock time, so a loop stall makes them visibly
+/// freeze and then jump — that motion *is* the live latency signal.  Their colours
+/// name the four stutter-period bands.  The glow is gap-aware: it flows over the
+/// structural dashes *between* the content islands, not over their text.
 ///
-/// The glow sweeps over the whole rim, recolouring legend/status text as it
-/// passes (foreground only; glyphs are preserved).  `offenders` tint the knots by
-/// kind when they line up with the stutter.  `probe_shape` is the probe-grade
-/// stutter fingerprint when the latency probe is alive; without it the rim folds
-/// its own frame-cadence events instead.
+/// `offenders` provide the fallback marker positions when no fingerprint is
+/// confident; `probe_shape` is the probe-grade fingerprint when the latency probe
+/// is alive, else the rim folds its own frame-cadence events.
 fn apply_border_glow(
     buf: &mut Buffer,
     area: Rect,
@@ -475,15 +492,18 @@ fn apply_border_glow(
         return;
     }
 
-    // ── Orbit phase (unchanged) ──────────────────────────────────────────────
-    // 2 : 5 speed ratio.  Base unit = 1 / 20 s⁻¹ so yellow orbits in 10 s,
-    // red in 4 s.  They travel in opposite directions on the same loop.
-    const BASE: f32 = 1.0 / 20.0;
-    let cw_pos  = (t * 2.0 * BASE).rem_euclid(1.0);        // yellow, CW  (+p travel)
-    let ccw_pos = 1.0 - (t * 5.0 * BASE).rem_euclid(1.0); // red,    CCW (−p travel)
-
-    // Blob half-width: 5 % of perimeter length.
-    const SIGMA: f32 = 0.05;
+    // ── Four tight clockwise orbiters, one per stutter-period band ───────────
+    // Periods are octaves (1, 2, 4, 8 s); each colour identifies the band a
+    // detected stutter falls into — see `band_colour`.  Tight σ keeps each blob
+    // localised so the four read as distinct dots, not a smear.
+    const ORBIT_SIGMA: f32 = 0.025;
+    let orbiters: [(f32, (f32, f32, f32)); 4] = [
+        (1.0, (235.0,  55.0,  40.0)), // red
+        (2.0, (255.0, 175.0,   0.0)), // orange-yellow
+        (4.0, (  0.0, 200.0, 180.0)), // teal
+        (8.0, (170.0,  80.0, 255.0)), // violet
+    ];
+    let orbit_pos: [f32; 4] = std::array::from_fn(|i| (t / orbiters[i].0).rem_euclid(1.0));
 
     // ── Frame latency → comet length ─────────────────────────────────────────
     // Measure the gap since the previous frame and turn its slow part into a
@@ -561,81 +581,68 @@ fn apply_border_glow(
             continue;
         }
         let p = area.border_pos(x, y);
-        let d_cw  = { let d = (p - cw_pos).abs();  d.min(1.0 - d) };
-        let d_ccw = { let d = (p - ccw_pos).abs(); d.min(1.0 - d) };
-        let i_y = gaussian(d_cw,  SIGMA); // yellow blob
-        let i_r = gaussian(d_ccw, SIGMA); // red blob
-        let r = (255.0 * i_y + 220.0 * i_r).min(255.0) as u8;
-        let g = (200.0 * i_y +  50.0 * i_r).min(255.0) as u8;
-        if r > 12 || g > 12 {
+        let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..4 {
+            let d = { let d = (p - orbit_pos[i]).abs(); d.min(1.0 - d) };
+            let inten = gaussian(d, ORBIT_SIGMA);
+            let (cr, cg, cb) = orbiters[i].1;
+            r += cr * inten;
+            g += cg * inten;
+            b += cb * inten;
+        }
+        let (r, g, b) = (r.min(255.0) as u8, g.min(255.0) as u8, b.min(255.0) as u8);
+        if r > 12 || g > 12 || b > 12 {
             let prev = buf.get(x, y);
             let symbol = prev.symbol.clone();
-            let style = prev.style.fg(Color::Rgb(r, g, 0));
+            let style = prev.style.fg(Color::Rgb(r, g, b));
             buf.set_grapheme(x, y, &symbol, style);
         }
     }
 
-    // ── Stutter knots: onset phase → rim angle, duration → braille height ─────
-    // The fingerprint (`shape`) folds recurring stalls into one cycle of their
-    // period; bin `i` sits at rim phase `i / STUTTER_BINS`.  So a knot's *angle*
-    // is the stall's onset timing — and the angular *spread* of the lit region is
-    // the onset jitter — while its braille *height* is the stall's duration.  A
-    // burst pattern (one long stall then short ones) lights several bins.
-    //
-    // Knots are shown while a recurring problem is *present* — a confident
-    // fingerprint, OR (its fallback) any detected periodic offender — rather than
-    // gated on aerie's own frame stall, which may never happen even while the
-    // system stutters.  When the fingerprint is too weak (messy stress), we still
-    // mark the offender phases so "offenders in the scope ⇒ knots on the rim".
-    // Brightness has a visible floor and pulses up with the live severity.
-    //
-    // Hue is the attribution: cyan/violet when a periodic offender lines up with
-    // this phase (the "who"), else cool white (an unattributed stutter).
-    const KNOT_SIGMA:   f32 = 0.02;  // knot half-width on the rim
-    const ATTRIB_NEAR:  f32 = 0.04;  // offender within this phase → its hue
-    const HOLD_TAU:     f32 = 2.5;   // knot-persistence time constant (~6 s to fade)
-    const MATCH:        f32 = 0.03;  // a detection within this phase refreshes a held knot
+    // ── Stutter bands: a bookended braille readout at the stall's phase ───────
+    // A detected stutter folds its recurring stall into one cycle; bin `i` sits at
+    // rim phase `i / STUTTER_BINS`, so the lit region's *angle* is the onset
+    // timing (its spread = onset jitter) and the braille *height* is the stall
+    // duration.  Colour is the band the period falls in (the four orbiter
+    // colours).  A `┤…├` pair frames each contiguous structure.  The set is held
+    // with a half-life so a recurrence keeps it lit and a vanished stutter fades.
+    // Shown while a problem is present (confident fingerprint, or — its fallback —
+    // any detected periodic offender), brightness floored and pulsed by severity.
+    const KNOT_SIGMA: f32 = 0.02;  // knot half-width on the rim
+    const MATCH:      f32 = 0.03;  // a detection within this phase refreshes a held knot
+    const HALF_LIFE:  f32 = 4.0;   // seconds for a held knot's intensity to halve
 
-    // Hue of the nearest offender within ATTRIB_NEAR, if any.
-    let nearest_kind = |phase: f32| -> Option<bool> {
-        let mut best = ATTRIB_NEAR;
-        let mut kind = None;
-        for off in offenders {
-            let d = { let d = (phase - off.phase).abs(); d.min(1.0 - d) };
-            if d < best {
-                best = d;
-                kind = Some(off.spawns);
-            }
-        }
-        kind
-    };
-
-    // This frame's knot candidates: prefer the duration fingerprint, else the
-    // offender phases (a fixed-height marker — we know *where*, not *how long*).
+    // This frame's candidates: prefer the duration fingerprint (banded by its
+    // period), else the offender phases (banded by the offender's period).
     let mut current: Vec<HeldKnot> = Vec::new();
     if let Some(fp) = shape.filter(|s| s.confidence >= 0.30) {
+        let colour = band_colour(fp.period_s);
         for (i, &h) in fp.hist.iter().enumerate() {
             if h > 0.15 {
                 let phase = (i as f32 + 0.5) / crate::diag::STUTTER_BINS as f32;
-                current.push(HeldKnot { phase, height: h, spawns: nearest_kind(phase), intensity: 1.0 });
+                current.push(HeldKnot { phase, height: h, colour, intensity: 1.0 });
             }
         }
     }
     if current.is_empty() {
         for off in offenders {
-            current.push(HeldKnot { phase: off.phase, height: 0.75, spawns: Some(off.spawns), intensity: 1.0 });
+            current.push(HeldKnot {
+                phase: off.phase,
+                height: 0.75,
+                colour: band_colour(off.period),
+                intensity: 1.0,
+            });
         }
     }
 
-    // Merge into the sticky held set: refresh matches to full intensity, decay the
-    // rest, so a noisy detector dropping out for a tick or two does not blink the
-    // knots off — a detected stutter holds for several seconds and fades only when
-    // it is genuinely gone.
+    // Merge into the sticky held set (half-life decay; a refresh resets to 1.0),
+    // so a noisy detector dropping out for a tick or two does not blink the
+    // readout off.
     let held: Vec<HeldKnot> = {
         let mut s = RIM_TRAIL.get().expect("RIM_TRAIL initialised above").lock().unwrap();
         let dt = (t - s.held_t).max(0.0);
         s.held_t = t;
-        let decay = (-dt / HOLD_TAU).exp();
+        let decay = 0.5_f32.powf(dt / HALF_LIFE);
         for k in s.held.iter_mut() {
             k.intensity *= decay;
         }
@@ -644,64 +651,103 @@ fn apply_border_glow(
                 let d = (k.phase - c.phase).abs();
                 d.min(1.0 - d) < MATCH
             }) {
-                *k = *c; // refresh phase/height/hue, intensity back to 1.0
+                *k = *c;
             } else {
                 s.held.push(*c);
             }
         }
         s.held.retain(|k| k.intensity > 0.1);
-        // Safety cap: under very jittery onsets many distinct phases can register;
-        // keep the strongest so the rim never fills with knots.
         if s.held.len() > 16 {
             s.held.sort_by(|a, b| b.intensity.partial_cmp(&a.intensity).unwrap_or(std::cmp::Ordering::Equal));
             s.held.truncate(16);
         }
         s.held.clone()
     };
+    if held.is_empty() {
+        return;
+    }
 
-    if !held.is_empty() {
-        for (col, &(x, y)) in perim.cells().iter().enumerate() {
-            // Knots replace the glyph with braille, so skip text cells.
-            if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
-                continue;
+    let f = (0.6 + 0.4 * sev).clamp(0.0, 1.0); // brightness floor + live pulse
+    let n = perim.cells().len();
+
+    // Build the lit field: per cell, the braille mask and the winning band colour.
+    let mut cell: Vec<Option<(u8, Rgb)>> = vec![None; n];
+    for (col, &(x, y)) in perim.cells().iter().enumerate() {
+        if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
+            continue; // protected content cell (reflow onto it is a later step)
+        }
+        let p = area.border_pos(x, y);
+        let mut height = 0.0f32;
+        let mut colour = (0.0, 0.0, 0.0);
+        for k in &held {
+            let d = { let d = (p - k.phase).abs(); d.min(1.0 - d) };
+            let i = k.height * k.intensity * gaussian(d, KNOT_SIGMA);
+            if i > height {
+                height = i;
+                colour = k.colour;
             }
-            let p = area.border_pos(x, y);
-            // Strongest held knot covering this cell; its intensity dims+shortens
-            // the braille as it fades, its hue wins the colour.
-            let mut height = 0.0f32;
-            let mut spawns = None;
-            for k in &held {
-                let d = { let d = (p - k.phase).abs(); d.min(1.0 - d) };
-                let i = k.height * k.intensity * gaussian(d, KNOT_SIGMA);
-                if i > height {
-                    height = i;
-                    spawns = k.spawns;
-                }
-            }
-            if height < 0.20 {
-                continue;
-            }
-            let mask = comet_braille_mask(height.min(1.0), col);
-            if mask == 0 {
-                continue;
-            }
+        }
+        if height < 0.20 {
+            continue;
+        }
+        let mask = comet_braille_mask(height.min(1.0), col);
+        if mask != 0 {
+            cell[col] = Some((mask, colour));
+        }
+    }
+
+    // Draw the braille structure.
+    for (col, slot) in cell.iter().enumerate() {
+        if let Some((mask, (cr, cg, cb))) = *slot {
+            let (x, y) = perim.cells()[col];
             let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or('⠿');
-            let hue = match spawns {
-                Some(true) => (40.0f32, 200.0, 255.0),  // spawns → cyan
-                Some(false) => (210.0f32, 90.0, 255.0), // CPU bursts → violet
-                None => (235.0f32, 235.0, 255.0),       // unattributed → cool white
-            };
-            // Visible floor so the knot persists while the problem does; pulses
-            // brighter with the live stall severity.
-            let f = (0.6 + 0.4 * sev).clamp(0.0, 1.0);
-            let style = buf.get(x, y).style.fg(Color::Rgb(
-                (hue.0 * f) as u8,
-                (hue.1 * f) as u8,
-                (hue.2 * f) as u8,
-            ));
+            let style = buf.get(x, y).style.fg(Color::Rgb((cr * f) as u8, (cg * f) as u8, (cb * f) as u8));
             buf.set_char(x, y, glyph, style);
         }
     }
+
+    // Frame each contiguous lit run with start/end bookends just outside it. Find
+    // runs from a non-lit anchor so a run never wraps the 0/n seam.
+    if let Some(anchor) = (0..n).find(|&i| cell[i].is_none()) {
+        let mut i = 0;
+        while i < n {
+            let idx = (anchor + i) % n;
+            if cell[idx].is_some() {
+                let run_start = idx;
+                let mut j = i;
+                while j < n && cell[(anchor + j) % n].is_some() {
+                    j += 1;
+                }
+                let run_end = (anchor + j - 1) % n;
+                let colour = cell[run_start].unwrap().1;
+                draw_bookend(buf, perim.cells(), gaps, (run_start + n - 1) % n, '┤', colour, f);
+                draw_bookend(buf, perim.cells(), gaps, (run_end + 1) % n, '├', colour, f);
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Draw a band-coloured bookend glyph just outside a stutter run, unless the cell
+/// belongs to a protected content gap (don't clobber legend/status text).
+fn draw_bookend(
+    buf: &mut Buffer,
+    cells: &[(u16, u16)],
+    gaps: &[BorderGap],
+    idx: usize,
+    glyph: char,
+    colour: (f32, f32, f32),
+    f: f32,
+) {
+    let (x, y) = cells[idx];
+    if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
+        return;
+    }
+    let (cr, cg, cb) = colour;
+    let style = buf.get(x, y).style.fg(Color::Rgb((cr * f) as u8, (cg * f) as u8, (cb * f) as u8));
+    buf.set_char(x, y, glyph, style);
 }
 
 /// Compact single-line status text for the bottom border left gap.
@@ -710,14 +756,14 @@ fn border_status(state: &AppState) -> String {
         AppView::Threads { label } => {
             let n = state.thread_samples.len();
             let total: f64 = state.thread_samples.iter().map(|t| t.cpu_pct).sum();
-            format!("{label}  ·  {n} threads  ·  {total:.1}% total")
+            format!("{label} · {n} threads · {total:.1}% total")
         }
         AppView::Manual => "manual".to_string(),
         AppView::Connecting { label } => format!("connecting to {label}"),
         AppView::Scope => "latency scope · system wakeup jitter".to_string(),
         _ => {
             let parts = groups_status_parts(state);
-            parts.join("  ·  ")
+            parts.join(" · ")
         }
     }
 }
@@ -727,30 +773,30 @@ fn border_keys(state: &AppState) -> String {
     if let Some(cursor) = state.history_cursor {
         let age   = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
         let total = state.history.len();
-        return format!("PAUSED  ◀ {age}s ago ▶  {}/{}  [←/→] scrub  [p] resume  [q] quit",
+        return format!("PAUSED ◀ {age}s ago ▶ {}/{} [←/→] scrub [p] resume [q] quit",
             cursor + 1, total);
     }
     match &state.view {
         AppView::Groups => {
             let enter = if matches!(state.mode, AppMode::Local) {
-                "  [Enter] threads"
+                " [↵] threads"
             } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. })
                    || state.enable_remote {
-                "  [Enter] drill"
+                " [↵] drill"
             } else { "" };
-            let smooth = if state.smooth_display { "  [v] raw" } else { "  [v] smooth" };
-            format!("[←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group{enter}  [p] pause{smooth}  [m] manual  [q] quit")
+            let smooth = if state.smooth_display { " [v] raw" } else { " [v] smooth" };
+            format!("[←/→] metric [Tab] side [s] sort [h] hist [g] group{enter} [p] pause{smooth} [m] manual [q] quit")
         }
         AppView::Remote { .. } =>
-            "[Esc] disconnect  [p] pause  [r] refresh  [q] quit".to_string(),
+            "[Esc] disconnect [p] pause [r] refresh [q] quit".to_string(),
         AppView::Threads { .. } =>
-            "[Esc] close  [r] refresh  [q] quit".to_string(),
+            "[Esc] close [r] refresh [q] quit".to_string(),
         AppView::Manual =>
-            "[↑/↓] scroll  [m] close  [q] quit".to_string(),
+            "[↑/↓] scroll [m] close [q] quit".to_string(),
         AppView::Connecting { .. } =>
-            "[Esc] cancel  [q] quit".to_string(),
+            "[Esc] cancel [q] quit".to_string(),
         AppView::Scope =>
-            "[d] or [Esc] close  [q] quit".to_string(),
+            "[d]/[Esc] close [q] quit".to_string(),
     }
 }
 
