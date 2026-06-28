@@ -230,6 +230,22 @@ aerie --scope-log ~/jitter.jsonl
 aerie --scope-analyze ~/jitter.jsonl
 ```
 
+### The border glow is a latency gauge
+
+The two Gaussian blobs orbiting aerie's outer border double as an *ambient*
+latency display: each is driven by wall-clock time but only painted when the
+draw loop runs. At rest they are a smooth solid glow; a real system stall
+**shatters a blob into a comet of braille dots** whose length (and, on the
+top/bottom edges, dot height) tracks the hold-up, with the fading tail thinning
+into ever-sparser dots and flaring white-hot for large ones. A smoothly gliding
+rim means the loop is being scheduled on time; a comet that recurs rhythmically
+is your cue to press `d` and let the probes identify it. Once the scope probes
+are running, each periodic offender also gets a **stationary knot** on the rim at
+its phase (cyan = periodically spawning helpers, violet = periodic CPU bursts) —
+a knot that holds still is cleanly periodic, one that drifts is not. See
+[`docs/rim-latency.md`](docs/rim-latency.md) for the mechanism, calibration, and
+the planned per-offender strobe orbiters.
+
 ## Anomaly alerts
 
 ```bash

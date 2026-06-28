@@ -385,6 +385,12 @@ pub struct Offender {
     pub child: Option<String>,
     /// Mean spawns/interval (Spawns) or mean CPU jiffies/interval (CpuBurst).
     pub rate: f32,
+    /// Phase of the periodic component, as a fraction of one cycle in `[0, 1)`.
+    /// Measured against absolute time so it is **stable across analysis windows**:
+    /// a genuinely periodic offender holds a constant phase, a drifting one
+    /// precesses. The rim uses it to place a stationary "knot" per offender (see
+    /// `fundamental_phase` and `docs/rim-latency.md`, Design 2).
+    pub phase: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -544,6 +550,32 @@ fn offender_loop(shared: Arc<Mutex<OffShared>>, stop: Arc<AtomicBool>, tick: Dur
 /// Find process groups whose CPU or spawn activity is periodic. Spawn periodicity
 /// (a clean impulse train) is preferred over CPU when both fire, since it is the
 /// more actionable signal (poll-on-a-timer). Confidence comes from the autocorrelation.
+/// Phase of the fundamental component at `freq_hz`, as a fraction of one cycle
+/// in `[0, 1)`.
+///
+/// A single-bin Goertzel-style projection of the (mean-subtracted) series onto
+/// cos/sin at the **absolute** sample times `s.t`. Because it references absolute
+/// time rather than the window's start, the result is *stable* as the analysis
+/// window slides: `x(t) ≈ cos(2π f t − θ)` peaks at `2π f t = θ`, and the
+/// normalised peak position `θ / 2π` stays fixed while the signal is genuinely
+/// periodic at `freq_hz` (and precesses when the true period drifts off it).
+///
+/// Returns `0.0` for a non-positive frequency or empty input.
+fn fundamental_phase(samples: &[Sample], freq_hz: f64) -> f32 {
+    if freq_hz <= 0.0 || samples.is_empty() {
+        return 0.0;
+    }
+    let mean = samples.iter().map(|s| s.overshoot_ms as f64).sum::<f64>() / samples.len() as f64;
+    let w = std::f64::consts::TAU * freq_hz;
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for s in samples {
+        let v = s.overshoot_ms as f64 - mean;
+        re += v * (w * s.t).cos();
+        im += v * (w * s.t).sin();
+    }
+    (im.atan2(re) / std::f64::consts::TAU).rem_euclid(1.0) as f32
+}
+
 pub fn analyze_offenders(
     groups: &HashMap<String, Vec<GroupActivity>>,
     children: &HashMap<String, String>,
@@ -574,10 +606,12 @@ pub fn analyze_offenders(
         if p.confidence < MIN_CONF {
             continue;
         }
-        let rate = match kind {
-            OffenderKind::Spawns => mean(&spawn_series.iter().map(|s| s.overshoot_ms).collect::<Vec<_>>()),
-            OffenderKind::CpuBurst => mean(&cpu_series.iter().map(|s| s.overshoot_ms).collect::<Vec<_>>()),
+        let event_series = match kind {
+            OffenderKind::Spawns => &spawn_series,
+            OffenderKind::CpuBurst => &cpu_series,
         };
+        let rate = mean(&event_series.iter().map(|s| s.overshoot_ms).collect::<Vec<_>>());
+        let phase = fundamental_phase(event_series, p.freq_hz.unwrap_or(0.0));
         offenders.push(Offender {
             group: grp.clone(),
             kind,
@@ -586,6 +620,7 @@ pub fn analyze_offenders(
             confidence: p.confidence,
             child: if kind == OffenderKind::Spawns { children.get(grp).cloned() } else { None },
             rate,
+            phase,
         });
     }
     offenders.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
@@ -1220,6 +1255,38 @@ mod tests {
         let p = analyze_periodicity(&s, AnalysisConfig::default());
         let f = p.freq_hz.expect("should find a frequency");
         assert!((f - 4.0).abs() < 0.3, "recovered freq {f} Hz");
+    }
+
+    #[test]
+    fn fundamental_phase_recovers_known_phase_and_is_window_stable() {
+        use std::f64::consts::TAU;
+        let f = 0.4_f64; // 2.5 s period
+        // Build a cosine peaking at absolute t0 = 1.3 s: phase = frac(t0 * f).
+        let t0 = 1.3_f64;
+        let mk_cos = |start: f64, n: usize| -> Vec<Sample> {
+            (0..n)
+                .map(|i| {
+                    let t = start + i as f64 * 0.05;
+                    Sample { t, overshoot_ms: (TAU * f * (t - t0)).cos() as f32 }
+                })
+                .collect()
+        };
+        let expected = (t0 * f).rem_euclid(1.0) as f32;
+        let phase_a = fundamental_phase(&mk_cos(0.0, 400), f);
+        // A window starting much later (the sliding-window case) must agree, since
+        // the phase is referenced to absolute time, not the window start.
+        let phase_b = fundamental_phase(&mk_cos(37.0, 400), f);
+        let near = |a: f32, b: f32| (a - b).abs().min(1.0 - (a - b).abs());
+        assert!(near(phase_a, expected) < 0.02, "phase {phase_a} vs expected {expected}");
+        assert!(near(phase_a, phase_b) < 0.02, "phase drifted across windows: {phase_a} vs {phase_b}");
+    }
+
+    #[test]
+    fn fundamental_phase_guards_bad_input() {
+        assert_eq!(fundamental_phase(&[], 1.0), 0.0);
+        let s = mk(&[(0.0, 1.0), (0.1, 2.0)]);
+        assert_eq!(fundamental_phase(&s, 0.0), 0.0);
+        assert_eq!(fundamental_phase(&s, -1.0), 0.0);
     }
 
     #[test]

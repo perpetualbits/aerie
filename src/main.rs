@@ -1015,6 +1015,9 @@ pub struct AppState {
     pub offenders: Option<diag::OffenderProbe>,
     /// Cached ranked offender report (recomputed at 1 Hz).
     pub offender_report: Option<diag::OffenderReport>,
+    /// Last time the offender report was recomputed (throttles the ambient
+    /// rim-knot refresh that runs even when the scope view is closed).
+    pub last_offender_analysis: Option<Instant>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1554,6 +1557,7 @@ impl AppState {
             pressure: None,
             pressure_analysis: None,
             offenders: None,
+            last_offender_analysis: None,
             offender_report: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
@@ -2927,6 +2931,25 @@ fn main() -> Result<()> {
                 state.pressure_analysis = best_pressure;
                 state.offender_report = offender_report;
                 state.last_scope_analysis = Some(Instant::now());
+                state.last_offender_analysis = Some(Instant::now());
+            }
+        }
+
+        // Keep the rim's offender knots (Design 2) live even outside the scope
+        // view, as long as the offender probe is running — it is spawned the first
+        // time the scope is opened, then keeps scanning. Throttled to ~1 Hz like
+        // the in-scope path. When the scope is open the block above already does
+        // this (and also logs/attributes), so only run here when it is closed.
+        if !scope_active
+            && state.offenders.is_some()
+            && state
+                .last_offender_analysis
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            if let Some(o) = state.offenders.as_ref() {
+                let (groups, children) = o.snapshot();
+                state.offender_report = Some(diag::analyze_offenders(&groups, &children));
+                state.last_offender_analysis = Some(Instant::now());
             }
         }
 
