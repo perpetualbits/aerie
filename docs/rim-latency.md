@@ -251,10 +251,19 @@ back to the frame fold.
 The period and duration are also surfaced as **text**, since the period folds
 away on the rim (the knot shows *where* in the cycle, not the cycle length):
 
-* the normal-view bottom status shows a compact `stutter ~3.0 s · 80–200 ms`
+* the bottom border carries a colour-popped `stutter ~3.0 s · 80–200 ms` segment
+  (heat-coloured by the worst stall length, bold) just right of the status,
   whenever a fingerprint is confident (available once the probe is running);
 * the scope view (`d`) prints the fuller shape on the periodicity line —
   e.g. *"steady onset, varying length (~40–120 ms)"*.
+
+The bottom border is a **coordinated segment layout** (`draw_bottom_border`):
+status, stutter, and keys are bookended `┤ … ├` islands placed so they never
+overlap (the stutter is dropped first when space is tight), and one layout
+produces both the drawn content and the glow's skip-gaps. The rim glow is
+gap-aware — it flows over the structural dashes and bookends *between* the
+segments but skips the coloured text, so the segments stay crisp instead of being
+overwritten by the passing orbiters.
 
 ### The point
 

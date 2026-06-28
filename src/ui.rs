@@ -126,11 +126,15 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     draw_bottom_border_structure(buf, y1, x0, x1, dim);
 
     // Pass 2 — gap content (drawn before glow so the skip logic protects it).
+    // Each piece of border text is a crisp island; the glow flows over the
+    // structural dashes and bookends *between* them, not over the text.  The
+    // bottom border draws its content and returns its gaps together, so one
+    // layout drives both.
     draw_top_border_content(buf, y0, x0, x1, state, dim);
-    draw_bottom_border_content(buf, y1, x0, x1, state, dim);
+    let mut gaps = top_border_gaps(area, state);
+    gaps.extend(draw_bottom_border(buf, y1, x0, x1, state, dim));
 
     // Pass 3 — rim glow (applied last; skips cells inside non-glow gaps).
-    let gaps = border_gaps(area, state);
 
     // Design 2: place a stationary knot per confident periodic offender. The
     // report is refreshed in the main loop while the offender probe runs (first
@@ -186,21 +190,21 @@ fn draw_bottom_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim:
 
 // ── Gap declarations (between passes 1 and 2) ─────────────────────────────────
 
-/// Compute [BorderGap]s for the current render frame.
+/// Compute the **top** border's legend gaps for the current frame.
 ///
-/// Called after the structural pass so gap rects can be passed to the
-/// rim-glow function before content is drawn.
-fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
+/// (The bottom border draws its content and returns its own gaps together — see
+/// [`draw_bottom_border`] — so a single layout drives both, with no duplicated
+/// geometry to drift out of sync.)
+///
+/// Structural chars (──, ┤, ├, padding dashes) between and around the legend
+/// sections are left exposed so the rim glow travels visibly across the full top
+/// edge and only skips the coloured content.
+fn top_border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
     let x0 = area.x;
     let y0 = area.y;
     let x1 = area.x + area.width - 1;
-    let y1 = area.y + area.height - 1;
     let mut gaps: Vec<BorderGap> = Vec::new();
 
-    // Top border — three precise gaps, one per coloured legend section.
-    // Structural chars (──, ┤, ├, " = work density", padding dashes) between
-    // and around the sections are left exposed so the rim glow travels visibly
-    // across the full top edge and only skips the coloured content.
     const FIXED: usize = 50;
     const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
@@ -215,35 +219,93 @@ fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
         // "← balanced"  — 10 green chars starting at x0+4 (after ──┤)
         gaps.push(BorderGap::new(Rect::new(x0 + 4, y0, 10, 1)));
         // swatch + " = work density" — both sit between the same ┤ ├ bookends
-        //   swatch:            swatch_w planck chars  at x0+18+left_pad
-        //   " = work density": 15 dim   chars  at x0+18+left_pad+swatch_w
         gaps.push(BorderGap::new(Rect::new(x0 + 18 + left_pad as u16, y0, swatch_w as u16 + 15, 1)));
         // "hot spots →"  — 11 orange chars; offset from right corner is fixed
-        //                  regardless of terminal width (left_pad+swatch_w+right_pad = inner_w-50)
         gaps.push(BorderGap::new(Rect::new(x1 - 14, y0, 11, 1)));
     }
 
-    // Bottom border — GPU selector overrides both text gaps with one wide region.
-    if state.gpu_enabled && !state.gpu_devices.is_empty() {
-        gaps.push(BorderGap::new(Rect::new(x0 + 2, y1, x1.saturating_sub(x0 + 2), 1)));
-        return gaps;
+    gaps
+}
+
+/// One bookended segment on the bottom border, drawn as `┤ text ├` with `style`
+/// on the text. The text cells become a (non-glow) gap so the rim glow skips
+/// them — the bookends and the dashes *between* segments still glow, so the glow
+/// is the connective tissue and each segment is a crisp island.
+struct BottomSeg {
+    text: String,
+    style: Style,
+}
+
+impl BottomSeg {
+    /// Full `┤ text ├` span (assumes single-width glyphs, as the rest of the
+    /// border layout does).
+    fn full_w(&self) -> u16 {
+        4 + self.text.chars().count() as u16
     }
 
-    // Bottom border — gaps cover only the content *between* the ┤ ├ bookends.
-    // The bookends themselves sit outside the gap so they receive rim glow
-    // just like structural border characters.
-    let status = border_status(state);
-    let status_full_w = 4 + status.chars().count() as u16; // full "┤ text ├" span
-    // Gap: " {text} " = status_full_w - 2, starts one past the ┤ bookend
-    gaps.push(BorderGap::new(Rect::new(x0 + 3, y1, status_full_w - 2, 1)));
+    /// Draw at leading-`┤` position `x`; return the protected content gap.
+    fn draw(&self, buf: &mut Buffer, x: u16, y: u16, dim: Style) -> BorderGap {
+        let text_x = buf.set_string(x, y, "┤ ", dim);
+        let after = buf.set_string(text_x, y, &self.text, self.style);
+        buf.set_string(after, y, " ├", dim);
+        BorderGap::new(Rect::new(text_x, y, after.saturating_sub(text_x), 1))
+    }
+}
 
-    let keys = border_keys(state);
-    let keys_full_w = 4 + keys.chars().count() as u16;
-    let keys_start = x1.saturating_sub(keys_full_w + 2); // x-pos of leading ┤
-    let after_status_bookend = x0 + 2 + status_full_w;   // x-pos just past ├
-    if keys_start > after_status_bookend + 1 {
-        // Gap: " {text} " = keys_full_w - 2, starts one past the ┤ bookend
-        gaps.push(BorderGap::new(Rect::new(keys_start + 1, y1, keys_full_w - 2, 1)));
+/// The colour-popped stutter readout, or `None` when no confident fingerprint.
+fn stutter_segment(state: &AppState) -> Option<BottomSeg> {
+    let sh = state.stutter_shape.as_ref()?;
+    if sh.confidence < 0.30 {
+        return None;
+    }
+    let text = format!(
+        "stutter ~{:.1}s · {:.0}–{:.0}ms",
+        sh.period_s, sh.dur_mean_ms, sh.dur_max_ms
+    );
+    // Pop: heat colour by the worst stall length (≈0 ms green → ≥300 ms red), bold.
+    let level = (sh.dur_max_ms / 300.0).clamp(0.0, 1.0);
+    let style = Style::default().fg(heat_color(level)).add_modifier(Modifier::BOLD);
+    Some(BottomSeg { text, style })
+}
+
+/// Draw the bottom border content as a coordinated layout — `status` left,
+/// `stutter` centre (colour-popped), `keys` right — and return the content gaps.
+/// Segments are placed so they never overlap; the centre stutter is dropped first
+/// when space is tight.
+fn draw_bottom_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) -> Vec<BorderGap> {
+    // GPU selector takes the whole edge (one wide region, unchanged behaviour).
+    if write_gpu_selector_line(buf, state, x0 + 2, y) {
+        return vec![BorderGap::new(Rect::new(x0 + 2, y, x1.saturating_sub(x0 + 2), 1))];
+    }
+
+    let mut gaps = Vec::new();
+
+    let left = BottomSeg { text: border_status(state), style: Style::default().fg(Color::DarkGray) };
+    let lx = x0 + 2;
+    let l_end = lx + left.full_w();
+    gaps.push(left.draw(buf, lx, y, dim));
+
+    let keys_style = if state.history_cursor.is_some() {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(55, 55, 55))
+    };
+    let right = BottomSeg { text: border_keys(state), style: keys_style };
+    let rx = x1.saturating_sub(right.full_w() + 2);
+    let right_bound = if rx > l_end + 1 {
+        gaps.push(right.draw(buf, rx, y, dim));
+        rx
+    } else {
+        x1.saturating_sub(2)
+    };
+
+    // The stutter sits just right of the status (a couple of dashes let the glow
+    // show between them), drawn only if it still clears the keys on the right.
+    if let Some(seg) = stutter_segment(state) {
+        let sx = l_end + 2;
+        if sx + seg.full_w() + 1 < right_bound {
+            gaps.push(seg.draw(buf, sx, y, dim));
+        }
     }
 
     gaps
@@ -283,31 +345,6 @@ fn draw_top_border_content(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &A
     x = buf.set_string(x, y, "hot spots →", Style::default().fg(Color::Rgb(220, 80, 0)));
     x = buf.set_string(x, y, "├──", dim);
     let _ = x;
-}
-
-fn draw_bottom_border_content(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
-    if write_gpu_selector_line(buf, state, x0 + 2, y) { return; }
-
-    let status = border_status(state);
-    let keys   = border_keys(state);
-    let keys_style = if state.history_cursor.is_some() {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(55, 55, 55))
-    };
-
-    let mut after = x0 + 2;
-    after = buf.set_string(after, y, "┤ ", dim);
-    after = buf.set_string(after, y, &status, Style::default().fg(Color::DarkGray));
-    after = buf.set_string(after, y, " ├", dim);
-
-    let keys_w    = (4 + keys.chars().count()) as u16;
-    let gap_start = x1.saturating_sub(keys_w + 2);
-    if gap_start > after + 1 {
-        let mut x = buf.set_string(gap_start, y, "┤ ", dim);
-        x = buf.set_string(x, y, &keys, keys_style);
-        buf.set_string(x, y, " ├", dim);
-    }
 }
 
 /// Rasterise one border cell of a knot into a 2×4 **braille** dot mask.
@@ -495,11 +532,10 @@ fn apply_border_glow(
     // ── The orbiters: a clean, continuous glow all the way around ────────────
     // `Field::perimeter` is the corner-crossing edge strip the spiral_stress
     // example uses, so the glow flows around the box without breaking at the
-    // corners.  Unlike the structural border, the glow is *not* gap-aware here:
-    // it recolours every cell it reaches — including the legend/status text — so
-    // the two blobs sweep continuously over the whole rim.  Only the foreground
-    // colour changes; the underlying glyph (box rule or text) is preserved, so
-    // the text stays readable, just briefly tinted as a blob passes.
+    // corners.  The glow is gap-aware: it skips the protected content cells
+    // (legend, status, stutter, keys) so those stay crisp coloured islands, and
+    // flows over the structural dashes and bookends *between* them — the glow is
+    // the connective tissue, the segments are the islands.
     //
     // The blobs are plain Gaussians driven by wall-clock time.  Their motion is
     // the live latency signal all on its own: when the loop stalls, no frame is
@@ -508,6 +544,10 @@ fn apply_border_glow(
     // dress that up; the diagnostic that captures it is the knot pass below.
     let perim = Field::perimeter(area);
     for &(x, y) in perim.cells().iter() {
+        // Protect content cells: a non-glow gap renders (and keeps) its own colour.
+        if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
+            continue;
+        }
         let p = area.border_pos(x, y);
         let d_cw  = { let d = (p - cw_pos).abs();  d.min(1.0 - d) };
         let d_ccw = { let d = (p - ccw_pos).abs(); d.min(1.0 - d) };
@@ -1816,19 +1856,6 @@ fn groups_status_parts(state: &AppState) -> Vec<String> {
     };
 
     let mut parts: Vec<String> = Vec::new();
-
-    // Surface the stutter fingerprint (period + duration) here too, so it is
-    // readable while watching the rim without opening the scope. Available once
-    // the latency probe is running (press `d` once); the rim shows *where* the
-    // stall lands, this shows *how often* and *how long*.
-    if let Some(sh) = state.stutter_shape.as_ref() {
-        if sh.confidence >= 0.30 {
-            parts.push(format!(
-                "stutter ~{:.1}s · {:.0}–{:.0}ms",
-                sh.period_s, sh.dur_mean_ms, sh.dur_max_ms
-            ));
-        }
-    }
 
     let n = state.entries.len();
     let hidden = state.total_groups.saturating_sub(n);
