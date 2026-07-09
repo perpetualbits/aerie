@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
 use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
+use mullion::border::{draw_box, render_rim, Borders, BorderStyle, CornerStyle, LineWeight};
+use mullion::field::Field;
 use mullion::layout::TileId;
 use mullion::label::Align;
 use mullion::style::{Color, Modifier, Style};
@@ -47,6 +49,8 @@ pub fn render(buf: &mut Buffer, state: &mut AppState) {
         AppView::Threads { .. } => render_body(buf, body_rect, state),
         AppView::Manual => render_manual(buf, body_rect, state),
         AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
+        AppView::Scope if state.scope_detect => render_verdict(buf, body_rect, state),
+        AppView::Scope => render_scope(buf, body_rect, state),
     }
 }
 
@@ -56,6 +60,7 @@ fn has_header_content(state: &AppState) -> bool {
         AppView::Groups => state.error.is_some() || state.proxmox_insecure,
         AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Manual => true,
         AppView::Threads { .. } => false, // thread info lives in the right pane
+        AppView::Scope => false,          // scope draws its own header rows in the body
     }
 }
 
@@ -92,7 +97,7 @@ fn render_header_content(buf: &mut Buffer, area: Rect, state: &AppState) {
             x = buf.set_string(x, area.y,
                 "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", dim);
         }
-        AppView::Threads { .. } => {}
+        AppView::Threads { .. } | AppView::Scope => {}
     }
     let _ = x;
 }
@@ -114,97 +119,207 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     let x1 = area.x + area.width - 1;
     let y1 = area.y + area.height - 1;
 
-    // Pass 1 — structural glyphs only.
-    for y in y0 + 1..y1 {
-        buf.set_string(x0, y, "│", dim);
-        buf.set_string(x1, y, "│", dim);
-    }
-    draw_top_border_structure(buf, y0, x0, x1, dim);
-    draw_bottom_border_structure(buf, y1, x0, x1, dim);
+    // Pass 1 — structural glyphs: one rounded box drawn by mullion (corners
+    // ╭╮╰╯, side │ bars, top/bottom ─ fills). Content (pass 2) and the rim glow
+    // (pass 3) overwrite the gap cells afterwards.
+    draw_box(buf, area, Borders::ALL, &BorderStyle {
+        weight: LineWeight::Light,
+        corners: CornerStyle::Rounded,
+        style: dim,
+    });
 
-    // Pass 2 — gap content (drawn before glow so the skip logic protects it).
-    draw_top_border_content(buf, y0, x0, x1, state, dim);
-    draw_bottom_border_content(buf, y1, x0, x1, state, dim);
+    // Offender fallback positions (banded by period) when no confident fingerprint.
+    let offenders: Vec<RimOffender> = state
+        .offender_report
+        .as_ref()
+        .map(|r| {
+            r.offenders
+                .iter()
+                .filter(|o| o.confidence >= 0.25) // match the scope's MIN_CONF
+                .take(4)
+                .map(|o| RimOffender { phase: o.phase, period: o.period_s })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Probe-grade stutter fingerprint when the latency probe is alive; otherwise
+    // the rim folds its own frame-cadence events.
+    let probe_shape = if state.scope.is_some() { state.stutter_shape.as_ref() } else { None };
 
-    // Pass 3 — rim glow (applied last; skips cells inside non-glow gaps).
-    let gaps = border_gaps(area, state);
-    apply_border_glow(buf, area, &gaps);
+    // Fold the current stutter into segments *first* (no drawing yet) so the
+    // header/footer can flow around them.
+    let (segs, sev, orbit_pos) = compute_rim(area, &offenders, probe_shape);
+    let top_reserved = edge_reserved(&segs, y0);
+    let bot_reserved = edge_reserved(&segs, y1);
+
+    // Pass 2 — content, flowing around the stutter braille so both stay visible.
+    let mut gaps = draw_top_border(buf, y0, x0, x1, state, dim, &top_reserved);
+    gaps.extend(draw_bottom_border(buf, y1, x0, x1, state, dim, &bot_reserved));
+
+    // Pass 3 — the stutter braille at its phase (skipping cells the content kept),
+    // then the orbiters last (skipping every content + stutter gap).
+    let braille_gaps = draw_stutter_segments(buf, &segs, sev, &gaps);
+    gaps.extend(braille_gaps);
+    draw_orbiters(buf, area, &gaps, orbit_pos);
 }
 
-// ── Border structure (pass 1) ──────────────────────────────────────────────────
-
-fn draw_top_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim: Style) {
-    buf.set_string(x0, y, "╭", dim);
-    buf.set_string(x1, y, "╮", dim);
-    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
-}
-
-fn draw_bottom_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim: Style) {
-    buf.set_string(x0, y, "╰", dim);
-    buf.set_string(x1, y, "╯", dim);
-    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
+/// A periodic offender reduced to what the rim needs for the fallback marker when
+/// no fingerprint is confident: where it sits (`phase` ∈ [0,1)) and its `period`
+/// (for the band colour). Built from [`crate::diag::Offender`] in
+/// [`draw_outer_border`].
+struct RimOffender {
+    phase: f32,
+    period: f64,
 }
 
 // ── Gap declarations (between passes 1 and 2) ─────────────────────────────────
 
-/// Compute [BorderGap]s for the current render frame.
+/// Compute the **top** border's legend gaps for the current frame.
 ///
-/// Called after the structural pass so gap rects can be passed to the
-/// rim-glow function before content is drawn.
-fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
-    let x0 = area.x;
-    let y0 = area.y;
-    let x1 = area.x + area.width - 1;
-    let y1 = area.y + area.height - 1;
+/// (The bottom border draws its content and returns its own gaps together — see
+/// [`draw_bottom_border`] — so a single layout drives both, with no duplicated
+/// geometry to drift out of sync.)
+///
+/// Structural chars (──, ┤, ├, padding dashes) between and around the legend
+/// sections are left exposed so the rim glow travels visibly across the full top
+/// edge and only skips the coloured content.
+fn draw_top_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style, reserved: &[(u16, u16)]) -> Vec<BorderGap> {
     let mut gaps: Vec<BorderGap> = Vec::new();
-
-    // Top border — three precise gaps, one per coloured legend section.
-    // Structural chars (──, ┤, ├, " = work density", padding dashes) between
-    // and around the sections are left exposed so the rim glow travels visibly
-    // across the full top edge and only skips the coloured content.
     const FIXED: usize = 50;
     const MAX_SWATCH: usize = 28;
     const MIN_SWATCH: usize = 4;
     let show_legend = state.show_histogram
         && matches!(state.view, AppView::Groups | AppView::Remote { .. });
     let inner_w = (x1 - x0).saturating_sub(1) as usize;
-    if show_legend && inner_w >= FIXED + MIN_SWATCH {
-        let available = inner_w - FIXED;
-        let swatch_w  = available.min(MAX_SWATCH);
-        let left_pad  = (available - swatch_w) / 2;
-
-        // "← balanced"  — 10 green chars starting at x0+4 (after ──┤)
-        gaps.push(BorderGap::new(Rect::new(x0 + 4, y0, 10, 1)));
-        // swatch + " = work density" — both sit between the same ┤ ├ bookends
-        //   swatch:            swatch_w planck chars  at x0+18+left_pad
-        //   " = work density": 15 dim   chars  at x0+18+left_pad+swatch_w
-        gaps.push(BorderGap::new(Rect::new(x0 + 18 + left_pad as u16, y0, swatch_w as u16 + 15, 1)));
-        // "hot spots →"  — 11 orange chars; offset from right corner is fixed
-        //                  regardless of terminal width (left_pad+swatch_w+right_pad = inner_w-50)
-        gaps.push(BorderGap::new(Rect::new(x1 - 14, y0, 11, 1)));
-    }
-
-    // Bottom border — GPU selector overrides both text gaps with one wide region.
-    if state.gpu_enabled && !state.gpu_devices.is_empty() {
-        gaps.push(BorderGap::new(Rect::new(x0 + 2, y1, x1.saturating_sub(x0 + 2), 1)));
+    if !show_legend || inner_w < FIXED + MIN_SWATCH {
         return gaps;
     }
+    let available = inner_w - FIXED;
+    let swatch_w  = available.min(MAX_SWATCH);
+    let extra     = available - swatch_w;
+    let left_pad  = extra / 2;
+    let right_pad = extra - left_pad;
 
-    // Bottom border — gaps cover only the content *between* the ┤ ├ bookends.
-    // The bookends themselves sit outside the gap so they receive rim glow
-    // just like structural border characters.
-    let status = border_status(state);
-    let status_full_w = 4 + status.chars().count() as u16; // full "┤ text ├" span
-    // Gap: " {text} " = status_full_w - 2, starts one past the ┤ bookend
-    gaps.push(BorderGap::new(Rect::new(x0 + 3, y1, status_full_w - 2, 1)));
+    // The three coloured pieces flow past any stutter-braille reserved interval
+    // (skip_reserved before each) so the braille and the legend coexist; the gap
+    // recorded for each is its *actual* drawn span, so the glow protects it.
+    let mut x = x0 + 1;
+    x = buf.set_string(x, y, "──┤", dim);
+    x = skip_reserved(x, reserved);
+    let g = x;
+    x = buf.set_string(x, y, "← balanced", Style::default().fg(Color::Rgb(60, 180, 60)));
+    gaps.push(BorderGap::new(Rect::new(g, y, x.saturating_sub(g), 1)));
+    x = buf.set_string(x, y, "├──", dim);
+    if left_pad > 0 { x = buf.set_string(x, y, &"─".repeat(left_pad), dim); }
+    x = buf.set_string(x, y, "┤", dim);
+    x = skip_reserved(x, reserved);
+    let g = x;
+    for i in 0..swatch_w {
+        let frac = i as f64 / (swatch_w - 1).max(1) as f64;
+        x = buf.set_string(x, y, "◻", Style::default().fg(planck_color(frac)));
+    }
+    x = buf.set_string(x, y, " = work density", dim);
+    gaps.push(BorderGap::new(Rect::new(g, y, x.saturating_sub(g), 1)));
+    x = buf.set_string(x, y, "├", dim);
+    if right_pad > 0 { x = buf.set_string(x, y, &"─".repeat(right_pad), dim); }
+    x = buf.set_string(x, y, "──┤", dim);
+    x = skip_reserved(x, reserved);
+    let g = x;
+    x = buf.set_string(x, y, "hot spots →", Style::default().fg(Color::Rgb(220, 80, 0)));
+    gaps.push(BorderGap::new(Rect::new(g, y, x.saturating_sub(g), 1)));
+    x = buf.set_string(x, y, "├──", dim);
+    let _ = x;
+    gaps
+}
 
-    let keys = border_keys(state);
-    let keys_full_w = 4 + keys.chars().count() as u16;
-    let keys_start = x1.saturating_sub(keys_full_w + 2); // x-pos of leading ┤
-    let after_status_bookend = x0 + 2 + status_full_w;   // x-pos just past ├
-    if keys_start > after_status_bookend + 1 {
-        // Gap: " {text} " = keys_full_w - 2, starts one past the ┤ bookend
-        gaps.push(BorderGap::new(Rect::new(keys_start + 1, y1, keys_full_w - 2, 1)));
+/// One bookended segment on the bottom border, drawn as `┤ text ├` with `style`
+/// on the text. The text cells become a (non-glow) gap so the rim glow skips
+/// them — the bookends and the dashes *between* segments still glow, so the glow
+/// is the connective tissue and each segment is a crisp island.
+struct BottomSeg {
+    text: String,
+    style: Style,
+}
+
+impl BottomSeg {
+    /// Full `┤ text ├` span (assumes single-width glyphs, as the rest of the
+    /// border layout does).
+    fn full_w(&self) -> u16 {
+        4 + self.text.chars().count() as u16
+    }
+
+    /// Draw at leading-`┤` position `x`; return the protected content gap.
+    fn draw(&self, buf: &mut Buffer, x: u16, y: u16, dim: Style) -> BorderGap {
+        let text_x = buf.set_string(x, y, "┤ ", dim);
+        let after = buf.set_string(text_x, y, &self.text, self.style);
+        buf.set_string(after, y, " ├", dim);
+        BorderGap::new(Rect::new(text_x, y, after.saturating_sub(text_x), 1))
+    }
+}
+
+/// The colour-popped stutter readout, or `None` when no confident fingerprint.
+fn stutter_segment(state: &AppState) -> Option<BottomSeg> {
+    // Probe-grade fingerprint when the latency probe is alive, else the rim's own
+    // frame-cadence fold — so the readout works with no probe (press-`d`-free).
+    let sh = state.stutter_shape.clone().or_else(rim_frame_shape)?;
+    if sh.confidence < 0.30 {
+        return None;
+    }
+    let text = format!(
+        "stutter ~{:.1}s · {:.0}–{:.0}ms",
+        sh.period_s, sh.dur_mean_ms, sh.dur_max_ms
+    );
+    // Pop: heat colour by the worst stall length (≈0 ms green → ≥300 ms red), bold.
+    let level: f32 = (sh.dur_max_ms / 300.0).clamp(0.0, 1.0);
+    let style = Style::default().fg(heat_color(level)).add_modifier(Modifier::BOLD);
+    Some(BottomSeg { text, style })
+}
+
+/// Draw the bottom border content as a coordinated layout — `status` left,
+/// `stutter` centre (colour-popped), `keys` right — and return the content gaps.
+/// Segments are placed so they never overlap; the centre stutter is dropped first
+/// when space is tight.
+fn draw_bottom_border(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style, reserved: &[(u16, u16)]) -> Vec<BorderGap> {
+    // GPU selector takes the whole edge (one wide region, unchanged behaviour).
+    if write_gpu_selector_line(buf, state, x0 + 2, y) {
+        return vec![BorderGap::new(Rect::new(x0 + 2, y, x1.saturating_sub(x0 + 2), 1))];
+    }
+
+    let mut gaps = Vec::new();
+
+    // Status, anchored left but shifted right past any stutter braille at the left.
+    let left = BottomSeg { text: border_status(state), style: Style::default().fg(Color::DarkGray) };
+    let lx = skip_reserved(x0 + 2, reserved);
+    let l_end = lx + left.full_w();
+    gaps.push(left.draw(buf, lx, y, dim));
+
+    // Keys, anchored right but shifted left past any stutter braille on the right.
+    let keys_style = if state.history_cursor.is_some() {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(55, 55, 55))
+    };
+    let right = BottomSeg { text: border_keys(state), style: keys_style };
+    let rw = right.full_w();
+    let mut rx = x1.saturating_sub(rw + 2);
+    for &(a, b) in reserved {
+        if rx <= b && rx + rw >= a {
+            rx = a.saturating_sub(rw + 1); // clear the braille on its left
+        }
+    }
+    let right_bound = if rx > l_end + 1 {
+        gaps.push(right.draw(buf, rx, y, dim));
+        rx
+    } else {
+        x1.saturating_sub(2)
+    };
+
+    // The stutter readout sits just right of the status, flowed past any braille,
+    // drawn only if it still clears the keys.
+    if let Some(seg) = stutter_segment(state) {
+        let sx = skip_reserved(l_end + 2, reserved);
+        if sx + seg.full_w() + 1 < right_bound {
+            gaps.push(seg.draw(buf, sx, y, dim));
+        }
     }
 
     gaps
@@ -212,130 +327,403 @@ fn border_gaps(area: Rect, state: &AppState) -> Vec<BorderGap> {
 
 // ── Gap content (pass 3) ──────────────────────────────────────────────────────
 
-fn draw_top_border_content(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
-    let show_legend = state.show_histogram
-        && matches!(state.view, AppView::Groups | AppView::Remote { .. });
-    const FIXED: usize = 50;
-    const MAX_SWATCH: usize = 28;
-    const MIN_SWATCH: usize = 4;
-    let inner_w = (x1 - x0).saturating_sub(1) as usize;
-    if !show_legend || inner_w < FIXED + MIN_SWATCH { return; }
-
-    let available = inner_w - FIXED;
-    let swatch_w  = available.min(MAX_SWATCH);
-    let extra     = available - swatch_w;
-    let left_pad  = extra / 2;
-    let right_pad = extra - left_pad;
-
-    let mut x = x0 + 1;
-    x = buf.set_string(x, y, "──┤", dim);
-    x = buf.set_string(x, y, "← balanced", Style::default().fg(Color::Rgb(60, 180, 60)));
-    x = buf.set_string(x, y, "├──", dim);
-    if left_pad > 0 { x = buf.set_string(x, y, &"─".repeat(left_pad), dim); }
-    x = buf.set_string(x, y, "┤", dim);
-    for i in 0..swatch_w {
-        let frac = i as f64 / (swatch_w - 1).max(1) as f64;
-        x = buf.set_string(x, y, "◻", Style::default().fg(planck_color(frac)));
+/// Rasterise one border cell of a knot into a 2×4 **braille** dot mask.
+///
+/// `amp ∈ [0, 1]` is the comet intensity at this cell; `col` is the cell's index
+/// around the perimeter (it seeds the Bayer dither so neighbours don't share a
+/// pattern).  Dots fill **bottom-anchored**: the bottom row lights first and the
+/// top row last, so on the horizontal top/bottom edges the lit height reads as a
+/// little level-meter bar (the "height" encoding) while a 4×4 ordered-dither
+/// scatters the partial rows — a fading comet tail therefore thins into ever
+/// sparser dots (the "distance between them" growing with the hold-up).  On the
+/// vertical side edges the same mask reads as a dot cluster whose *length* along
+/// the rim carries the signal instead, since a within-cell height bar only reads
+/// cleanly where travel is horizontal.
+///
+/// Returns `0` (no dots → `⠀`) when the comet has not reached this cell, so the
+/// caller can leave the box-drawing glyph untouched and the rim stays a clean
+/// line at rest.
+fn comet_braille_mask(amp: f32, col: usize) -> u8 {
+    // 4×4 Bayer matrix → 16 ordered-dither levels (same matrix mullion's
+    // `Field::render_braille_xy` uses), tiled over the sub-pixel grid.
+    const BAYER: [[u8; 4]; 4] =
+        [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    let mut mask = 0u8;
+    for sy in 0..4u16 {
+        // Bottom row (sy = 3) needs the least intensity → fills first.
+        let row_thr = (4 - sy) as f32 / 4.0;
+        for sx in 0..2u16 {
+            let gx = ((col as u16 * 2 + sx) % 4) as usize;
+            let dither = BAYER[(sy % 4) as usize][gx] as f32 / 16.0;
+            let thr = row_thr * 0.8 + dither * 0.2;
+            if amp > thr {
+                // Unicode braille bit layout: dots 1-6 column-major, 7-8 the
+                // bottom row (U+2800 + mask).
+                mask |= if sy < 3 { 1 << (sx * 3 + sy) } else { 1 << (6 + sx) };
+            }
+        }
     }
-    x = buf.set_string(x, y, " = work density", dim);
-    x = buf.set_string(x, y, "├", dim);
-    if right_pad > 0 { x = buf.set_string(x, y, &"─".repeat(right_pad), dim); }
-    x = buf.set_string(x, y, "──┤", dim);
-    x = buf.set_string(x, y, "hot spots →", Style::default().fg(Color::Rgb(220, 80, 0)));
-    x = buf.set_string(x, y, "├──", dim);
-    let _ = x;
+    mask
 }
 
-fn draw_bottom_border_content(buf: &mut Buffer, y: u16, x0: u16, x1: u16, state: &AppState, dim: Style) {
-    if write_gpu_selector_line(buf, state, x0 + 2, y) { return; }
+/// Stall detector shared across redraws of the rim glow.
+///
+/// `apply_border_glow` runs once per rendered frame, so the wall-clock gap
+/// between two successive calls *is* the draw loop's frame interval.  A healthy
+/// loop wakes on the 50 ms `RENDER_TICK`; a system-wide stall (compositor or
+/// scheduler hold-up — the very thing the orbiting glow visibly hitches on)
+/// stretches that gap.  We decay that excess into a 0..1 severity used to *pulse*
+/// the knots' brightness (they are shown whenever a recurring problem is
+/// detected, not only while aerie itself stalls).  See `docs/rim-latency.md`.
+/// One persistent stutter knot, kept across frames so that brief gaps in
+/// detection (the offender/fingerprint confidence wobbling across its threshold
+/// on a noisy system) do not blink the knot off.  Refreshed to `intensity = 1.0`
+/// whenever a matching knot is detected, and decayed otherwise.
+#[derive(Clone, Copy)]
+struct HeldKnot {
+    /// Rim position in `[0, 1)`.
+    phase: f32,
+    /// Normalised stall duration (fingerprint) or a fixed marker (offender fallback).
+    height: f32,
+    /// Band colour, chosen from the stutter's period by [`band_colour`].
+    colour: (f32, f32, f32),
+    /// 1.0 when freshly detected, decays by half every `HALF_LIFE` otherwise, so a
+    /// vanished stutter fades out; a recurrence resets it to 1.0.
+    intensity: f32,
+}
 
-    let status = border_status(state);
-    let keys   = border_keys(state);
-    let keys_style = if state.history_cursor.is_some() {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+/// An RGB triple in float form, as the rim mixes colours additively.
+type Rgb = (f32, f32, f32);
+
+/// Colour for a stutter of period `period_s`, matching the orbiter bands:
+/// `[0,1)` → violet, `[1,2)` → teal, `[2,4)` → orange-yellow, `[4,8+)` → red.
+fn band_colour(period_s: f64) -> (f32, f32, f32) {
+    if period_s < 1.0 {
+        (170.0, 80.0, 255.0) // violet
+    } else if period_s < 2.0 {
+        (0.0, 200.0, 180.0) // teal
+    } else if period_s < 4.0 {
+        (255.0, 175.0, 0.0) // orange-yellow
     } else {
-        Style::default().fg(Color::Rgb(55, 55, 55))
-    };
-
-    let mut after = x0 + 2;
-    after = buf.set_string(after, y, "┤ ", dim);
-    after = buf.set_string(after, y, &status, Style::default().fg(Color::DarkGray));
-    after = buf.set_string(after, y, " ├", dim);
-
-    let keys_w    = (4 + keys.chars().count()) as u16;
-    let gap_start = x1.saturating_sub(keys_w + 2);
-    if gap_start > after + 1 {
-        let mut x = buf.set_string(gap_start, y, "┤ ", dim);
-        x = buf.set_string(x, y, &keys, keys_style);
-        buf.set_string(x, y, " ├", dim);
+        (235.0, 55.0, 40.0) // red
     }
 }
 
-/// Animate two Gaussian blobs (yellow CW, red CCW) around the outer border.
+struct RimTrail {
+    /// Wall-clock seconds of the previous frame (same clock as the orbit phase).
+    last_t: f32,
+    /// Decaying stall severity (in perimeter-fraction units): jumps up on a slow
+    /// frame, falls off smoothly, so a single long frame leaves a ~1 s tail.
+    smear: f32,
+    /// Persistent knot set (see [`HeldKnot`]) and the wall-clock of its last
+    /// decay, so detection dropouts hold rather than flicker.
+    held: Vec<HeldKnot>,
+    held_t: f32,
+    /// Rolling `(t, lateness_ms)` per frame for ~60 s — the always-on,
+    /// self-contained event source the stutter characteriser folds when no
+    /// latency probe is running.  `lateness_ms` is the frame interval above the
+    /// 50 ms render tick, so it is ~0 on a healthy frame and spikes on a stall.
+    ring: std::collections::VecDeque<(f32, f32)>,
+    /// Wall-clock of the last characterisation (throttles the ~heavy fold).
+    last_char_t: f32,
+    /// Cached frame-cadence stutter fingerprint (the ambient fallback).
+    shape: Option<crate::diag::StutterShape>,
+}
+
+/// The rim's per-frame trail state. Module-scoped (not a function-local static)
+/// so the bottom-border readout can read the frame-cadence fingerprint too —
+/// that is what lets the stutter readout work with no latency probe running.
+static RIM_TRAIL: std::sync::OnceLock<std::sync::Mutex<RimTrail>> = std::sync::OnceLock::new();
+
+/// The latest frame-cadence stutter fingerprint the rim has folded, if any.
+/// Lets [`stutter_segment`] show the stutter without a probe (press-`d`-free).
+fn rim_frame_shape() -> Option<crate::diag::StutterShape> {
+    RIM_TRAIL.get()?.lock().ok()?.shape.clone()
+}
+
+/// Animate four tight clockwise Gaussian orbiters (red 1 s, orange-yellow 2 s,
+/// teal 4 s, violet 8 s) around the outer border, and draw the banded bookended
+/// stutter readout at the stall's phase.
 ///
-/// Speed ratio 2 : 5 — yellow makes one orbit every 10 s, red every 4 s.
-/// Where they overlap the channels add like light, producing orange → warm-white.
+/// The orbiters are driven by wall-clock time, so a loop stall makes them visibly
+/// freeze and then jump — that motion *is* the live latency signal.  Their colours
+/// name the four stutter-period bands.  The glow is gap-aware: it flows over the
+/// structural dashes *between* the content islands, not over their text.
 ///
-/// Cells that fall inside a `BorderGap` with `rim_glow = false` are skipped
-/// entirely so the gap can render its own colours in the subsequent content pass.
-fn apply_border_glow(buf: &mut Buffer, area: Rect, gaps: &[BorderGap]) {
-    use std::sync::OnceLock;
+/// `offenders` provide the fallback marker positions when no fingerprint is
+/// confident; `probe_shape` is the probe-grade fingerprint when the latency probe
+/// is alive, else the rim folds its own frame-cadence events.
+/// The four orbiter bands: `(orbit_period_s, colour)`, octave-spaced.  The colour
+/// names the stutter-period band — see [`band_colour`].
+const ORBITERS: [(f32, Rgb); 4] = [
+    (1.0, (235.0,  55.0,  40.0)), // red
+    (2.0, (255.0, 175.0,   0.0)), // orange-yellow
+    (4.0, (  0.0, 200.0, 180.0)), // teal
+    (8.0, (170.0,  80.0, 255.0)), // violet
+];
+const ORBIT_SIGMA: f32 = 0.025; // tight, so the four read as distinct dots
+
+/// A contiguous stutter structure to draw on the rim: its lit braille cells
+/// (`x, y, mask`), the two `┤ ├` bookend cells framing it, and its band colour.
+struct StutterSeg {
+    cells: Vec<(u16, u16, u8)>,
+    bookends: [((u16, u16), char); 2],
+    colour: Rgb,
+}
+
+/// Update the rim's trail state and fold the current stutter into drawable
+/// [`StutterSeg`]s, **without touching the buffer** — so the caller can lay the
+/// header/footer content out around them (reflow) before anything is drawn.
+///
+/// Returns the segments, the live stall severity (for the brightness pulse), and
+/// the four orbiter positions.
+fn compute_rim(
+    area: Rect,
+    offenders: &[RimOffender],
+    probe_shape: Option<&crate::diag::StutterShape>,
+) -> (Vec<StutterSeg>, f32, [f32; 4]) {
+    use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f32();
+    let orbit_pos: [f32; 4] = std::array::from_fn(|i| (t / ORBITERS[i].0).rem_euclid(1.0));
 
     if area.width < 2 || area.height < 2 {
-        return;
+        return (Vec::new(), 0.0, orbit_pos);
     }
-    let x0 = area.x;
-    let y0 = area.y;
-    let x1 = area.x + area.width - 1;
-    let y1 = area.y + area.height - 1;
 
-    // Enumerate every border cell exactly once, clockwise from the top-left corner.
-    let cap = 2 * (area.width + area.height) as usize;
-    let mut cells: Vec<(u16, u16)> = Vec::with_capacity(cap);
-    for x in x0..=x1           { cells.push((x, y0)); }  // top:    L → R
-    for y in y0+1..=y1         { cells.push((x1, y)); }  // right:  T → B
-    for x in (x0..x1).rev()   { cells.push((x, y1)); }  // bottom: R → L
-    for y in (y0+1..y1).rev() { cells.push((x0, y)); }  // left:   B → T
+    // ── Frame latency → stall severity + frame-cadence fingerprint ───────────
+    const FLOOR_MS:     f32 = 60.0;
+    const MS_PER_PERIM: f32 = 0.0006;
+    const LEN_MAX:      f32 = 0.33;
+    const TAU_S:        f32 = 0.6;
+    const RING_S:       f32 = 60.0;
+    const CHAR_EVERY:   f32 = 0.5;
+    const EVENT_FLOOR:  f32 = 30.0;
+    let (smear, frame_shape) = {
+        let trail = RIM_TRAIL.get_or_init(|| {
+            Mutex::new(RimTrail {
+                last_t: t,
+                smear: 0.0,
+                held: Vec::new(),
+                held_t: t,
+                ring: std::collections::VecDeque::new(),
+                last_char_t: t,
+                shape: None,
+            })
+        });
+        let mut s = trail.lock().unwrap();
+        let dt = (t - s.last_t).max(0.0);
+        s.last_t = t;
+        let dt_ms = (dt * 1000.0).min(2000.0);
+        let instant = ((dt_ms - FLOOR_MS).max(0.0) * MS_PER_PERIM).min(LEN_MAX);
+        let decay = (-dt / TAU_S).exp();
+        s.smear = (s.smear * decay).max(instant);
+        s.ring.push_back((t, (dt_ms - 50.0).max(0.0)));
+        while s.ring.front().is_some_and(|&(ft, _)| t - ft > RING_S) {
+            s.ring.pop_front();
+        }
+        if probe_shape.is_none() && t - s.last_char_t >= CHAR_EVERY && s.ring.len() >= 64 {
+            let samples: Vec<crate::diag::Sample> = s
+                .ring
+                .iter()
+                .map(|&(ft, late)| crate::diag::Sample { t: ft as f64, overshoot_ms: late })
+                .collect();
+            s.shape = crate::diag::characterise_stutter(&samples, EVENT_FLOOR);
+            s.last_char_t = t;
+        }
+        (s.smear, s.shape.clone())
+    };
+    let sev = (smear / LEN_MAX).clamp(0.0, 1.0);
+    let shape = probe_shape.or(frame_shape.as_ref());
 
-    let n = cells.len() as f32;
+    // ── Held set: candidates → sticky merge with a half-life ─────────────────
+    const KNOT_SIGMA: f32 = 0.02;
+    const MATCH:      f32 = 0.03;
+    const HALF_LIFE:  f32 = 4.0;
+    let mut current: Vec<HeldKnot> = Vec::new();
+    if let Some(fp) = shape.filter(|s| s.confidence >= 0.30) {
+        let colour = band_colour(fp.period_s);
+        for (i, &h) in fp.hist.iter().enumerate() {
+            if h > 0.15 {
+                let phase = (i as f32 + 0.5) / crate::diag::STUTTER_BINS as f32;
+                current.push(HeldKnot { phase, height: h, colour, intensity: 1.0 });
+            }
+        }
+    }
+    if current.is_empty() {
+        for off in offenders {
+            current.push(HeldKnot {
+                phase: off.phase,
+                height: 0.75,
+                colour: band_colour(off.period),
+                intensity: 1.0,
+            });
+        }
+    }
+    let held: Vec<HeldKnot> = {
+        let mut s = RIM_TRAIL.get().expect("RIM_TRAIL initialised above").lock().unwrap();
+        let dt = (t - s.held_t).max(0.0);
+        s.held_t = t;
+        let decay = 0.5_f32.powf(dt / HALF_LIFE);
+        for k in s.held.iter_mut() {
+            k.intensity *= decay;
+        }
+        for c in &current {
+            if let Some(k) = s.held.iter_mut().find(|k| {
+                let d = (k.phase - c.phase).abs();
+                d.min(1.0 - d) < MATCH
+            }) {
+                *k = *c;
+            } else {
+                s.held.push(*c);
+            }
+        }
+        s.held.retain(|k| k.intensity > 0.1);
+        if s.held.len() > 16 {
+            s.held.sort_by(|a, b| b.intensity.partial_cmp(&a.intensity).unwrap_or(std::cmp::Ordering::Equal));
+            s.held.truncate(16);
+        }
+        s.held.clone()
+    };
+    if held.is_empty() {
+        return (Vec::new(), sev, orbit_pos);
+    }
 
-    // 2 : 5 speed ratio.  Base unit = 1 / 20 s⁻¹ so yellow orbits in 10 s,
-    // red in 4 s.  They travel in opposite directions on the same loop.
-    const BASE: f32 = 1.0 / 20.0;
-    let cw_pos  = (t * 2.0 * BASE).rem_euclid(1.0);        // yellow, CW
-    let ccw_pos = 1.0 - (t * 5.0 * BASE).rem_euclid(1.0); // red,    CCW
-
-    // Blob half-width: 5 % of perimeter length.
-    const SIGMA: f32 = 0.05;
-
-    for (idx, &(x, y)) in cells.iter().enumerate() {
-        // Skip cells inside any non-glow gap — those are owned by pass 3.
-        if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
+    // ── Fold the held set into a per-cell lit field over the whole perimeter ──
+    let perim = Field::perimeter(area);
+    let n = perim.cells().len();
+    let mut cell: Vec<Option<(u8, Rgb)>> = vec![None; n];
+    for (col, &(x, y)) in perim.cells().iter().enumerate() {
+        let p = area.border_pos(x, y);
+        let mut height = 0.0f32;
+        let mut colour = (0.0, 0.0, 0.0);
+        for k in &held {
+            let d = { let d = (p - k.phase).abs(); d.min(1.0 - d) };
+            let i = k.height * k.intensity * gaussian(d, KNOT_SIGMA);
+            if i > height {
+                height = i;
+                colour = k.colour;
+            }
+        }
+        if height < 0.20 {
             continue;
         }
-
-        let p = idx as f32 / n;
-
-        // Shortest angular distance on the closed loop.
-        let d_cw  = { let d = (p - cw_pos).abs();  d.min(1.0 - d) };
-        let d_ccw = { let d = (p - ccw_pos).abs(); d.min(1.0 - d) };
-
-        let i_y = gaussian(d_cw,  SIGMA); // yellow blob intensity
-        let i_r = gaussian(d_ccw, SIGMA); // red blob intensity
-
-        // Additive RGB mix.  Yellow ≈ (255, 200, 0), Red ≈ (220, 50, 0).
-        // Where they coincide: (255, 250, 0) ≈ bright warm-white — like two
-        // coloured spotlights overlapping.
-        let r = (255.0 * i_y + 220.0 * i_r).min(255.0) as u8;
-        let g = (200.0 * i_y +  50.0 * i_r).min(255.0) as u8;
-
-        if r > 12 || g > 12 {
-            buf.get_mut(x, y).style.fg = Color::Rgb(r, g, 0);
+        let mask = comet_braille_mask(height.min(1.0), col);
+        if mask != 0 {
+            cell[col] = Some((mask, colour));
         }
     }
+
+    // ── Collect contiguous lit runs into segments (from a non-lit anchor) ─────
+    let mut segs = Vec::new();
+    if let Some(anchor) = (0..n).find(|&i| cell[i].is_none()) {
+        let cells = perim.cells();
+        let mut i = 0;
+        while i < n {
+            if cell[(anchor + i) % n].is_some() {
+                let mut j = i;
+                let mut run = Vec::new();
+                while j < n && cell[(anchor + j) % n].is_some() {
+                    let idx = (anchor + j) % n;
+                    run.push((cells[idx].0, cells[idx].1, cell[idx].unwrap().0));
+                    j += 1;
+                }
+                let colour = cell[(anchor + i) % n].unwrap().1;
+                let start = cells[(anchor + i + n - 1) % n];
+                let end = cells[(anchor + j) % n];
+                segs.push(StutterSeg {
+                    cells: run,
+                    bookends: [(start, '┤'), (end, '├')],
+                    colour,
+                });
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    (segs, sev, orbit_pos)
+}
+
+/// Draw the four orbiters around the perimeter, skipping protected content gaps.
+///
+/// `render_rim` (mullion §3.11) does the clockwise perimeter walk, the non-glow
+/// gap skip, and the `border_pos` lookup, and preserves each cell's glyph while
+/// re-styling it — so all that is left here is the additive Gaussian colour mix.
+fn draw_orbiters(buf: &mut Buffer, area: Rect, gaps: &[BorderGap], orbit_pos: [f32; 4]) {
+    render_rim(buf, area, gaps, |p, cur| {
+        let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..4 {
+            let d = { let d = (p - orbit_pos[i]).abs(); d.min(1.0 - d) };
+            let inten = gaussian(d, ORBIT_SIGMA);
+            let (cr, cg, cb) = ORBITERS[i].1;
+            r += cr * inten;
+            g += cg * inten;
+            b += cb * inten;
+        }
+        let (r, g, b) = (r.min(255.0) as u8, g.min(255.0) as u8, b.min(255.0) as u8);
+        (r > 12 || g > 12 || b > 12).then(|| cur.fg(Color::Rgb(r, g, b)))
+    });
+}
+
+/// Draw the stutter segments (braille + `┤ ├` bookends), brightness floored and
+/// pulsed by `sev`, and return their cells as gaps so the orbiters skip them.
+///
+/// `content` are the already-drawn header/footer gaps; a braille cell that lands
+/// on one is skipped rather than clobbering the text — on the bottom edge the
+/// content has flowed out of the way, on the top edge the legend wins its cells.
+fn draw_stutter_segments(buf: &mut Buffer, segs: &[StutterSeg], sev: f32, content: &[BorderGap]) -> Vec<BorderGap> {
+    let f = (0.6 + 0.4 * sev).clamp(0.0, 1.0);
+    let blocked = |x: u16, y: u16| content.iter().any(|g| !g.rim_glow && g.contains(x, y));
+    let mut gaps = Vec::new();
+    for seg in segs {
+        let (cr, cg, cb) = seg.colour;
+        for &(x, y, mask) in &seg.cells {
+            if blocked(x, y) {
+                continue;
+            }
+            let glyph = char::from_u32(0x2800 + mask as u32).unwrap_or('⠿');
+            let st = buf.get(x, y).style.fg(Color::Rgb((cr * f) as u8, (cg * f) as u8, (cb * f) as u8));
+            buf.set_char(x, y, glyph, st);
+            gaps.push(BorderGap::new(Rect::new(x, y, 1, 1)));
+        }
+        for &((x, y), glyph) in &seg.bookends {
+            if blocked(x, y) {
+                continue;
+            }
+            let st = buf.get(x, y).style.fg(Color::Rgb((cr * f) as u8, (cg * f) as u8, (cb * f) as u8));
+            buf.set_char(x, y, glyph, st);
+            gaps.push(BorderGap::new(Rect::new(x, y, 1, 1)));
+        }
+    }
+    gaps
+}
+
+/// The x-ranges (inclusive) occupied by stutter segments on the edge at `edge_y`,
+/// including their bookends — the obstacles the header/footer content flows around.
+fn edge_reserved(segs: &[StutterSeg], edge_y: u16) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    for seg in segs {
+        let (mut lo, mut hi, mut any) = (u16::MAX, 0u16, false);
+        for &(x, y, _) in &seg.cells {
+            if y == edge_y { lo = lo.min(x); hi = hi.max(x); any = true; }
+        }
+        for &((x, y), _) in &seg.bookends {
+            if y == edge_y { lo = lo.min(x); hi = hi.max(x); any = true; }
+        }
+        if any { out.push((lo, hi)); }
+    }
+    out
+}
+
+/// Advance `x` past any reserved interval covering it — content flows around the
+/// stutter braille rather than overlapping it.
+fn skip_reserved(mut x: u16, reserved: &[(u16, u16)]) -> u16 {
+    while let Some(&(_, b)) = reserved.iter().find(|&&(a, b)| x >= a && x <= b) {
+        x = b + 1;
+    }
+    x
 }
 
 /// Compact single-line status text for the bottom border left gap.
@@ -344,13 +732,20 @@ fn border_status(state: &AppState) -> String {
         AppView::Threads { label } => {
             let n = state.thread_samples.len();
             let total: f64 = state.thread_samples.iter().map(|t| t.cpu_pct).sum();
-            format!("{label}  ·  {n} threads  ·  {total:.1}% total")
+            format!("{label} · {n} threads · {total:.1}% total")
         }
         AppView::Manual => "manual".to_string(),
         AppView::Connecting { label } => format!("connecting to {label}"),
+        AppView::Scope => {
+            if state.scope_detect {
+                "stutter · detection".to_string()
+            } else {
+                "stutter · observation · system wakeup jitter".to_string()
+            }
+        }
         _ => {
             let parts = groups_status_parts(state);
-            parts.join("  ·  ")
+            parts.join(" · ")
         }
     }
 }
@@ -360,28 +755,32 @@ fn border_keys(state: &AppState) -> String {
     if let Some(cursor) = state.history_cursor {
         let age   = state.history.get(cursor).map(|h| h.at.elapsed().as_secs()).unwrap_or(0);
         let total = state.history.len();
-        return format!("PAUSED  ◀ {age}s ago ▶  {}/{}  [←/→] scrub  [p] resume  [q] quit",
+        return format!("PAUSED ◀ {age}s ago ▶ {}/{} [←/→] scrub [p] resume [q] quit",
             cursor + 1, total);
     }
     match &state.view {
         AppView::Groups => {
             let enter = if matches!(state.mode, AppMode::Local) {
-                "  [Enter] threads"
+                " [↵] threads"
             } else if matches!(state.mode, AppMode::Fleet { .. } | AppMode::Kube { .. })
                    || state.enable_remote {
-                "  [Enter] drill"
+                " [↵] drill"
             } else { "" };
-            let smooth = if state.smooth_display { "  [v] raw" } else { "  [v] smooth" };
-            format!("[←/→] metric  [Tab] side  [s] sort  [h] hist  [g] group{enter}  [p] pause{smooth}  [m] manual  [q] quit")
+            let smooth = if state.smooth_display { " [v] raw" } else { " [v] smooth" };
+            format!("[←/→] metric [Tab] side [s] sort [h] hist [g] group{enter} [p] pause{smooth} [m] manual [q] quit")
         }
         AppView::Remote { .. } =>
-            "[Esc] disconnect  [p] pause  [r] refresh  [q] quit".to_string(),
+            "[Esc] disconnect [p] pause [r] refresh [q] quit".to_string(),
         AppView::Threads { .. } =>
-            "[Esc] close  [r] refresh  [q] quit".to_string(),
+            "[Esc] close [r] refresh [q] quit".to_string(),
         AppView::Manual =>
-            "[↑/↓] scroll  [m] close  [q] quit".to_string(),
+            "[↑/↓] scroll [m] close [q] quit".to_string(),
         AppView::Connecting { .. } =>
-            "[Esc] cancel  [q] quit".to_string(),
+            "[Esc] cancel [q] quit".to_string(),
+        AppView::Scope => {
+            let other = if state.scope_detect { "observe" } else { "detect" };
+            format!("[Tab] {other} [d]/[Esc] close [q] quit")
+        }
     }
 }
 
@@ -624,18 +1023,6 @@ fn bar_color(m: Metric, frac: f64) -> Color {
 /// All characters are assumed to occupy one cell (no CJK wide-char support).
 /// If the label fits, it is left-padded to exactly `width` characters with spaces
 /// so column widths are consistent across all rows.
-fn truncate_label(label: &str, width: usize) -> String {
-    let chars: Vec<char> = label.chars().collect();
-    if chars.len() <= width {
-        format!("{label:<width$}")
-    } else {
-        // Truncate to width-1 chars and append the ellipsis character.
-        let mut s: String = chars[..width.saturating_sub(1)].iter().collect();
-        s.push('…');
-        s
-    }
-}
-
 /// Dim a colour toward dark gray when a metric is incomplete (EACCES).
 ///
 /// Applied to bar fill and value text when `entry_complete` returns false.
@@ -940,7 +1327,7 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         Some(|buf: &mut Buffer, cols: &[Rect]| {
             let hy = cols[0].y;
             ColumnGrid::write_text(buf, cols[0], hy,
-                &truncate_label(&group_by_label, label_w as usize),
+                &group_by_label,
                 Align::Start, Style::default().fg(Color::Rgb(60, 60, 60)));
             buf.set_string(cols[4].x, hy, lname, left_hdr_style);
             let rname_x = cols[4].x + cols[4].width.saturating_sub(rname.len() as u16);
@@ -1007,9 +1394,9 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
             };
 
             let display_label = if is_anomaly && !e.fading && !is_selected {
-                truncate_label(&format!("! {}", e.label), label_w as usize)
+                format!("! {}", e.label)
             } else {
-                truncate_label(&e.label, label_w as usize)
+                e.label.clone()
             };
 
             let l_str = metric_display_str(e, lm, total_ram_bytes);
@@ -1034,6 +1421,10 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
                 ("   ", "   ", Style::default())
             };
 
+            // Fill the label cell first so a selection/anomaly highlight spans the
+            // whole column, then overlay the label — write_text elides it
+            // grapheme/width-correctly (mullion §3.13), so no manual truncation.
+            buf.set_string(cols[0].x, ey, &" ".repeat(cols[0].width as usize), label_style);
             ColumnGrid::write_text(buf, cols[0], ey, &display_label, Align::Start, label_style);
             buf.set_string(cols[2].x, ey, l_arrow, a_style);
             ColumnGrid::write_text(buf, cols[3], ey, &l_str, Align::End, Style::default().fg(lc));
@@ -1179,6 +1570,350 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
             ColumnGrid::write_text(buf, Rect::new(tcols[4].x, ty, tcols[4].width, 1),
                 ty, &format!("{}:{}", t.pid, t.tid), Align::Start, gray);
         }
+    }
+}
+
+/// Map a normalised level `[0, 1]` to a green → yellow → red heat colour.
+/// Used to colour latency bars by height (low = calm green, high = alarming red).
+fn heat_color(level: f32) -> Color {
+    let l = level.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32, t: f32| (a + (b - a) * t) as u8;
+    if l < 0.5 {
+        let t = l * 2.0; // green → yellow
+        Color::Rgb(lerp(40.0, 220.0, t), lerp(200.0, 200.0, t), lerp(60.0, 40.0, t))
+    } else {
+        let t = (l - 0.5) * 2.0; // yellow → red
+        Color::Rgb(lerp(220.0, 235.0, t), lerp(200.0, 55.0, t), lerp(40.0, 40.0, t))
+    }
+}
+
+/// Fill `area` with a bottom-anchored braille plot from a pre-normalised
+/// `heights` array (`[0, 1]`, one entry per sub-pixel column, length = `2·width`).
+/// Each column is coloured by its height via [`heat_color`]. Shared by the
+/// latency trace and the spectrum plot.
+fn fill_braille_plot(buf: &mut Buffer, area: Rect, heights: &[f32]) {
+    if area.width == 0 || area.height == 0 || heights.is_empty() {
+        return;
+    }
+    let nb = heights.len();
+    let field = Field::rect(area);
+    field.render_braille_xy(
+        buf,
+        |u, v| {
+            let b = ((u * nb as f32) as usize).min(nb - 1);
+            if (1.0 - v) <= heights[b] { 1.0 } else { 0.0 }
+        },
+        |_mean, u, _v| {
+            let b = ((u * nb as f32) as usize).min(nb - 1);
+            Style::default().fg(heat_color(heights[b]))
+        },
+    );
+}
+
+/// Draw a bottom-anchored, severity-coloured braille trace of a time-series into
+/// `area`, normalised to `ceil`, with a top-left scale label and a "0" baseline.
+/// Shared by the latency trace and the system-pressure trace.
+fn draw_series_trace(
+    buf: &mut Buffer,
+    area: Rect,
+    samples: &[crate::diag::Sample],
+    ceil: f32,
+    top_label: &str,
+) {
+    if area.height == 0 || area.width == 0 || samples.len() < 2 {
+        return;
+    }
+    let faint = Style::default().fg(Color::Rgb(90, 90, 90));
+    let nb = area.width as usize * 2;
+    let t0 = samples[0].t;
+    let span = (samples[samples.len() - 1].t - t0).max(1e-9);
+    let c = ceil.max(1e-6);
+    let mut heights = vec![0.0f32; nb];
+    for s in samples {
+        let frac = ((s.t - t0) / span).clamp(0.0, 1.0);
+        let b = ((frac * nb as f64) as usize).min(nb - 1);
+        let h = (s.overshoot_ms / c).clamp(0.0, 1.0);
+        if h > heights[b] {
+            heights[b] = h;
+        }
+    }
+    fill_braille_plot(buf, area, &heights);
+    buf.set_string(area.x, area.y, top_label, faint);
+    buf.set_string(area.x, area.bottom().saturating_sub(1), "0 ┘", faint);
+}
+
+/// Render the **detection** view of stutter mode: a plain-language verdict on
+/// whether the system has a recurring stutter, plus its fingerprint and likely
+/// cause. The live traces are one Tab away ([`render_scope`]).
+fn render_verdict(buf: &mut Buffer, area: Rect, state: &AppState) {
+    let faint = Style::default().fg(Color::DarkGray);
+    let gray = Style::default().fg(Color::Gray);
+    let label = |buf: &mut Buffer, y: u16, k: &str, v: String| {
+        let x = buf.set_string(area.x + 4, y, k, faint);
+        buf.set_string(x, y, &v, gray);
+    };
+
+    let analysis = state.scope_analysis.as_ref();
+    let shape = state.stutter_shape.as_ref();
+    let conf = shape.map(|s| s.confidence).unwrap_or(0.0);
+    let has_period = analysis.is_some_and(|a| a.period_s.is_some());
+
+    // Verdict light + headline.
+    let (light, headline, lcolor) = if state.scope.is_none() {
+        ("·", "starting probe…", Color::DarkGray)
+    } else if has_period && conf >= 0.45 {
+        ("●", "RECURRING STUTTER DETECTED", Color::Rgb(235, 80, 40))
+    } else if has_period {
+        ("◐", "possible stutter — keep watching", Color::Rgb(220, 180, 60))
+    } else if analysis.is_some() {
+        ("○", "no recurring stutter detected", Color::Rgb(60, 200, 90))
+    } else {
+        ("·", "gathering data…", Color::DarkGray)
+    };
+
+    let mut y = area.y + 1;
+    buf.set_string(area.x + 2, y, &format!("{light}  {headline}"),
+        Style::default().fg(lcolor).add_modifier(Modifier::BOLD));
+    y += 2;
+
+    if let Some(sh) = shape.filter(|s| s.confidence >= 0.30) {
+        label(buf, y, "every     ", format!("{:.1} s   ({:.2} Hz)", sh.period_s,
+            if sh.period_s > 0.0 { 1.0 / sh.period_s } else { 0.0 }));
+        y += 1;
+        label(buf, y, "duration  ", format!("{:.0}–{:.0} ms  (mean {:.0})",
+            sh.dur_mean_ms.min(sh.dur_max_ms), sh.dur_max_ms, sh.dur_mean_ms));
+        y += 1;
+        let onset = if sh.onset_jitter < 0.06 { "steady onset" } else { "jittery onset" };
+        let length = if sh.dur_cv < 0.25 { "fixed length" } else { "varying length" };
+        label(buf, y, "shape     ", format!("{onset} · {length}"));
+        y += 2;
+
+        // Confidence bar.
+        let pct = (conf * 100.0).round() as u32;
+        let cells = (conf * 16.0).round() as usize;
+        let bar: String = (0..16).map(|i| if i < cells { '█' } else { '░' }).collect();
+        let x = buf.set_string(area.x + 4, y, "confidence ", faint);
+        let x = buf.set_string(x, y, &bar, Style::default().fg(heat_color(conf)));
+        buf.set_string(x, y, &format!(" {pct}%"), gray);
+        y += 2;
+    }
+
+    // Likely cause (the offender "who"), if any.
+    if let Some(o) = state.offender_report.as_ref().and_then(|r| r.offenders.first()) {
+        let what = match (o.kind, o.child.as_deref()) {
+            (crate::diag::OffenderKind::Spawns, Some(c)) => format!("spawning {c}"),
+            (crate::diag::OffenderKind::Spawns, None) => "spawning helpers".to_string(),
+            (crate::diag::OffenderKind::CpuBurst, _) => "CPU bursts".to_string(),
+        };
+        let x = buf.set_string(area.x + 4, y, "likely    ", faint);
+        let x = buf.set_string(x, y, &o.group,
+            Style::default().fg(Color::Rgb(235, 120, 40)).add_modifier(Modifier::BOLD));
+        buf.set_string(x, y, &format!(" — {what} every {:.1} s", o.period_s), gray);
+    }
+
+    buf.set_string(area.x + 2, area.bottom().saturating_sub(1),
+        "[Tab] live traces   [d]/[Esc] close", faint);
+}
+
+/// Render the latency scope: a live braille trace of the wakeup-jitter probe.
+///
+/// The probe ([`crate::diag::LatencyProbe`]) measures how late each of its own
+/// timed wakeups is; that overshoot series is the system scheduling jitter that
+/// stutters every realtime UI on the machine. The trace fills from the bottom and
+/// is coloured by height (green calm → red stall); the readout row gives the
+/// honest magnitudes so a flat-but-tall-looking trace can be read as "all fine,
+/// peak 0.2 ms" rather than misread off the normalised shape.
+fn render_scope(buf: &mut Buffer, area: Rect, state: &AppState) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let faint = Style::default().fg(Color::Rgb(90, 90, 90));
+
+    let Some(probe) = state.scope.as_ref() else {
+        buf.set_string(area.x, area.y, "  starting latency probe…", dim);
+        return;
+    };
+    if area.height < 4 || area.width < 12 {
+        buf.set_string(area.x, area.y, " (resize)", dim);
+        return;
+    }
+
+    let samples = probe.snapshot();
+    let st = crate::diag::stats(&samples, probe.tick_ms());
+
+    // ── Header rows ───────────────────────────────────────────────────────
+    let hz = if st.tick_ms > 0.0 { 1000.0 / st.tick_ms } else { 0.0 };
+    let title = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let mut x = buf.set_string(area.x, area.y, " latency scope", title);
+    x = buf.set_string(x, area.y,
+        &format!("   tick {:.1} ms ({:.0} Hz)   window {:.0} s   n={}",
+            st.tick_ms, hz, st.window_s, st.count),
+        dim);
+    let _ = x;
+
+    // Readout row: honest magnitudes (max coloured by severity).
+    let max_style = Style::default()
+        .fg(if st.max_ms >= 10.0 { Color::Rgb(235, 60, 40) }
+            else if st.max_ms >= 3.0 { Color::Rgb(220, 200, 40) }
+            else { Color::Rgb(40, 200, 60) })
+        .add_modifier(Modifier::BOLD);
+    let mut x = buf.set_string(area.x, area.y + 1, " now ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.last_ms),
+        Style::default().fg(Color::Gray));
+    x = buf.set_string(x, area.y + 1, "   mean ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.mean_ms),
+        Style::default().fg(Color::Gray));
+    x = buf.set_string(x, area.y + 1, "   p99 ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.p99_ms),
+        Style::default().fg(Color::Gray));
+    x = buf.set_string(x, area.y + 1, "   max ", faint);
+    x = buf.set_string(x, area.y + 1, &format!("{:.2} ms", st.max_ms), max_style);
+    let _ = x;
+
+    // ── Periodicity headline (row y+2) ────────────────────────────────────
+    let headline_y = area.y + 2;
+    match state.scope_analysis.as_ref() {
+        Some(a) if a.period_s.is_some() => {
+            let period = a.period_s.unwrap();
+            let f = a.freq_hz.unwrap_or(0.0);
+            let conf = (a.confidence * 100.0).round() as u32;
+            let strong = a.confidence > 0.4;
+            let verdict = if strong { "strong" } else { "weak / quasi-periodic" };
+            let col = if strong { Color::Rgb(235, 120, 40) } else { Color::Rgb(190, 190, 70) };
+            let mut x = buf.set_string(area.x, headline_y, " recurring stall ≈ every ", faint);
+            x = buf.set_string(x, headline_y, &format!("{period:.2} s"),
+                Style::default().fg(col).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, headline_y,
+                &format!("  ({f:.2} Hz)  ·  confidence {conf}% ({verdict})"), faint);
+            // Stutter shape: separate the onset-timing axis from the duration axis
+            // (the two vary independently — see docs/rim-latency.md §5).
+            if let Some(sh) = state.stutter_shape.as_ref() {
+                let onset = if sh.onset_jitter < 0.06 { "steady onset" } else { "jittery onset" };
+                let length = if sh.dur_cv < 0.25 { "fixed length" } else { "varying length" };
+                x = buf.set_string(x, headline_y,
+                    &format!("  ·  {onset}, {length} (~{:.0}–{:.0} ms)",
+                        sh.dur_mean_ms, sh.dur_max_ms), faint);
+            }
+            let _ = x;
+        }
+        Some(_) => {
+            buf.set_string(area.x, headline_y,
+                " no clear periodicity yet — keep the scope open while the stutter happens", dim);
+        }
+        None => {
+            buf.set_string(area.x, headline_y, " analysing…", dim);
+        }
+    }
+
+    // ── Attribution line (row y+3): what co-occurs with the stalls ────────
+    let attrib_y = area.y + 3;
+    match state.scope_report.as_ref() {
+        Some(r) if !r.suspects.is_empty() => {
+            let top = &r.suspects[0];
+            let mut x = buf.set_string(area.x, attrib_y, " likely cause: ", faint);
+            x = buf.set_string(x, attrib_y, top.name,
+                Style::default().fg(Color::Rgb(235, 120, 40)).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, attrib_y,
+                &format!(" ({:.0}{} during stalls vs {:.0} calm)", top.spike_mean, top.unit, top.base_mean),
+                Style::default().fg(Color::Gray));
+            x = buf.set_string(x, attrib_y, &format!("  ·  {}", top.hint), faint);
+            if r.suspects.len() > 1 {
+                let also: Vec<&str> = r.suspects[1..].iter().take(2).map(|s| s.name).collect();
+                buf.set_string(x, attrib_y, &format!("   also: {}", also.join(", ")), faint);
+            }
+        }
+        Some(r) if r.spike_count < 3 => {
+            buf.set_string(area.x, attrib_y,
+                &format!(" attribution: only {} stall(s) seen — waiting for more", r.spike_count), dim);
+        }
+        Some(_) => {
+            buf.set_string(area.x, attrib_y,
+                " attribution: no system signal clearly tracks the stalls", dim);
+        }
+        None => {
+            buf.set_string(area.x, attrib_y, " gathering attribution…", dim);
+        }
+    }
+
+    // ── Periodic offenders (row y+4): groups acting on a clock ────────────
+    let off_y = area.y + 4;
+    match state.offender_report.as_ref() {
+        Some(r) if !r.offenders.is_empty() => {
+            let o = &r.offenders[0];
+            let what = match (o.kind, o.child.as_deref()) {
+                (crate::diag::OffenderKind::Spawns, Some(c)) => format!("spawning {c}"),
+                (crate::diag::OffenderKind::Spawns, None) => "spawning helpers".to_string(),
+                (crate::diag::OffenderKind::CpuBurst, _) => "CPU bursts".to_string(),
+            };
+            let mut x = buf.set_string(area.x, off_y, " periodic offender: ", faint);
+            x = buf.set_string(x, off_y, &o.group,
+                Style::default().fg(Color::Rgb(235, 120, 40)).add_modifier(Modifier::BOLD));
+            x = buf.set_string(x, off_y,
+                &format!(" every {:.1} s — {} (conf {:.0}%)", o.period_s, what, o.confidence * 100.0),
+                Style::default().fg(Color::Gray));
+            if r.offenders.len() > 1 {
+                let also: Vec<&str> = r.offenders[1..].iter().take(2).map(|o| o.group.as_str()).collect();
+                buf.set_string(x, off_y, &format!("   also: {}", also.join(", ")), faint);
+            }
+        }
+        Some(_) => {
+            buf.set_string(area.x, off_y,
+                " periodic offenders: none — no process group is acting on a clock", dim);
+        }
+        None => { buf.set_string(area.x, off_y, " scanning for periodic offenders…", dim); }
+    }
+
+    if samples.len() < 2 {
+        buf.set_string(area.x, area.y + 5, "  collecting latency samples…", dim);
+        return;
+    }
+
+    // ── Layout: latency trace (top) + system-pressure trace (bottom) ──────
+    // The two instruments answer different questions: the CPU-wakeup trace shows
+    // scheduling jitter; the pressure trace shows run-queue / PSI stall, which
+    // catches compositor- and memory-bound freezes the wakeup probe is blind to.
+    let body_top = area.y + 5;
+    let body_h = area.height.saturating_sub(5);
+    if body_h == 0 { return; }
+
+    let two = body_h >= 8 && state.pressure.is_some();
+    let lat_h = if two { (body_h - 1) / 2 } else { body_h };
+
+    let lat_ceil = st.max_ms.max(1e-3);
+    draw_series_trace(buf, Rect::new(area.x, body_top, area.width, lat_h),
+        &samples, lat_ceil, &format!("{lat_ceil:.1} ms ┐  wakeup latency"));
+
+    if two {
+        let head_y = body_top + lat_h;
+        let pres_rect = Rect::new(area.x, head_y + 1, area.width, body_h - lat_h - 1);
+        let ch = state.pressure_analysis.as_ref().map(|(c, _)| *c)
+            .unwrap_or(crate::diag::PressureChannel::MemStall);
+
+        // Pressure periodicity headline — the key contrast with the latency one.
+        match state.pressure_analysis.as_ref() {
+            Some((c, p)) if p.period_s.is_some() => {
+                let strong = p.confidence > 0.4;
+                let col = if strong { Color::Rgb(235, 120, 40) } else { Color::Rgb(190, 190, 70) };
+                let mut x = buf.set_string(area.x, head_y,
+                    &format!(" system pressure [{}]: recurring ≈ every ", c.label()), faint);
+                x = buf.set_string(x, head_y, &format!("{:.2} s", p.period_s.unwrap()),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD));
+                buf.set_string(x, head_y,
+                    &format!("  ({:.2} Hz)  ·  confidence {:.0}% ({})",
+                        p.freq_hz.unwrap_or(0.0), p.confidence * 100.0,
+                        if strong { "strong" } else { "weak / quasi-periodic" }), faint);
+            }
+            Some((c, _)) => {
+                buf.set_string(area.x, head_y, &format!(
+                    " system pressure [{}]: no clear period (showing the most active channel)",
+                    c.label()), dim);
+            }
+            None => { buf.set_string(area.x, head_y, " system pressure: gathering…", dim); }
+        }
+
+        let ps = state.pressure.as_ref().map(|p| p.snapshot()).unwrap_or_default();
+        let series = crate::diag::pressure_channel_series(&ps, ch);
+        let ceil = series.iter().map(|s| s.overshoot_ms).fold(0.0f32, f32::max).max(1e-6);
+        draw_series_trace(buf, pres_rect, &series, ceil,
+            &format!("{:.0} {} ┐  {}", ceil, ch.unit(), ch.label()));
     }
 }
 
@@ -1391,6 +2126,7 @@ fn manual_lines() -> Vec<String> {
         "NAVIGATION".into(),
         "  [↑] [↓]  or  [j] [k]    move cursor up / down through the group list".into(),
         "  [Enter]                  open thread heatmap for the selected group".into(),
+        "  [d]                      toggle the latency scope (diagnostics)".into(),
         "  [Esc]                    return from thread view or manual to group list".into(),
         "  [q]  [Ctrl-C]            quit".into(),
         "".into(),
@@ -1461,6 +2197,26 @@ fn manual_lines() -> Vec<String> {
         "  Fired when a group's load concentration drops below the alert threshold.".into(),
         "  Args: GROUP_LABEL ANOMALY_KIND BALANCE_FRACTION".into(),
         "  Rate-limited to once per 60 seconds per group.".into(),
+        "".into(),
+        "LATENCY SCOPE (DIAGNOSTICS)".into(),
+        "  Press [d] to open a built-in cyclictest: a dedicated thread measures how".into(),
+        "  late its own timed wakeups are. That overshoot is the system scheduling".into(),
+        "  jitter that makes every realtime UI (TUIs, video, audio) stutter at the".into(),
+        "  same cadence — so it isolates a system-wide cause from a per-app one.".into(),
+        "  Two stacked traces: wakeup latency (CPU scheduling jitter) and system".into(),
+        "  pressure (run-queue + PSI stall) — the latter catches compositor- and".into(),
+        "  memory-bound freezes that delay rendering without delaying CPU threads.".into(),
+        "  Each carries a periodicity readout (the recurring stall's period); a".into(),
+        "  ranked list names the system signals (IRQ/softirq, I/O & memory pressure,".into(),
+        "  power) that co-occur with the latency stalls; and a periodic-offender line".into(),
+        "  names any process group acting on a clock — CPU bursts or spawning helpers".into(),
+        "  on a timer (the pattern that lets one app periodically stall the desktop).".into(),
+        "".into(),
+        "  --scope-log FILE      capture diagnostics to FILE (line-delimited JSON)".into(),
+        "                        for the whole session, even without opening the view.".into(),
+        "  --scope-analyze FILE  print an offline report from a captured log and exit.".into(),
+        "  Tip: run  aerie --scope-log run.jsonl  during a session that stutters (e.g.".into(),
+        "  a DAW), then  aerie --scope-analyze run.jsonl  to inspect it afterwards.".into(),
     ]
 }
 
@@ -1481,6 +2237,41 @@ pub fn manual_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comet_mask_full_and_empty() {
+        // Solid comet head lights every dot (⣿ = U+28FF); no intensity → no dots.
+        assert_eq!(comet_braille_mask(1.0, 0), 0xFF);
+        assert_eq!(comet_braille_mask(1.0, 7), 0xFF);
+        assert_eq!(comet_braille_mask(0.0, 0), 0x00);
+        assert_eq!(comet_braille_mask(-1.0, 3), 0x00);
+    }
+
+    #[test]
+    fn comet_mask_fills_from_the_bottom() {
+        // A faint tail lights some dots but not the full cell, and never lights
+        // the top row (dots 1 & 4) before the bottom row (dots 7 & 8).
+        let m = comet_braille_mask(0.35, 0);
+        assert!(m != 0x00 && m != 0xFF, "partial fill expected, got {m:#04x}");
+        let top_row = 0b0000_1001u8; // dots 1 (0x01) + 4 (0x08): the top sub-row
+        let bot_row = 0b1100_0000u8; // dots 7 (0x40) + 8 (0x80): the bottom sub-row
+        assert!(m & top_row == 0, "top row must stay dark at low amp");
+        assert!(m & bot_row != 0, "bottom row must light first");
+    }
+
+    #[test]
+    fn comet_mask_brighter_lights_at_least_as_many_dots() {
+        // Monotonic: raising intensity never removes a dot (per fixed cell).
+        for col in 0..8 {
+            let mut prev = 0u32;
+            for step in 0..=10 {
+                let amp = step as f32 / 10.0;
+                let n = comet_braille_mask(amp, col).count_ones();
+                assert!(n >= prev, "dots dropped as amp rose at col {col}");
+                prev = n;
+            }
+        }
+    }
 
     /// Return the index of the bin with the highest value.
     fn hot_bin(bins: &[f64]) -> usize {

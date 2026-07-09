@@ -2,6 +2,7 @@
 name = "aerie"
 version = "1.0.3"
 edition = "2021"
+default-run = "aerie"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
 description = "Process-group performance monitor with Proxmox VM support and SSH drill-down"

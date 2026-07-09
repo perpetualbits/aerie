@@ -29,6 +29,9 @@ Press `m` for the full built-in manual, or `aerie -m | less` from the shell.
   metrics, drill into any pod with `kubectl exec`
 - **Replay / scrub** — `p` to pause, `←`/`→` to scrub through buffered history
   (default 4 minutes at 2 s interval)
+- **Latency scope** (`d`) — built-in cyclictest that finds *system-wide* scheduling
+  jitter, the recurring stall that stutters TUIs, video, and audio alike; periodicity
+  analysis + ranked culprit attribution, with optional capture log (`--scope-log`)
 - **Anomaly detection** — load-concentration alerts with optional shell hook
   (`--alert-cmd`)
 - **Built-in manual** — `m` in the TUI or `aerie -m` at the shell
@@ -108,6 +111,7 @@ aerie -m | less
 | `r` | Force immediate refresh |
 | `p` | Pause / resume (frozen display) |
 | `[` / `]` | Cycle GPU device (with `--enable-gpu`) |
+| `d` | Toggle latency scope (diagnostics) |
 | `Enter` | Drill into VM / host / pod |
 | `Esc` | Return to group list |
 | `m` | Toggle built-in manual |
@@ -147,6 +151,10 @@ GPU:
 History / Alerts:
       --history-depth <N>     Ring-buffer depth in snapshots (default: 120)
       --alert-cmd <CMD>       Shell command fired on anomaly detection
+
+Diagnostics:
+      --scope-log <FILE>      Capture latency-scope diagnostics to FILE (JSONL)
+      --scope-analyze <FILE>  Print an offline report from a capture log and exit
 ```
 
 ## GPU support
@@ -182,6 +190,69 @@ aerie --enable-remote --hosts web1,web2,db1
 
 Each host appears as a row; metrics are the busiest process group on that host.
 Press Enter to drill in. Use `--thin` for hosts without aerie installed.
+
+## Latency scope / stutter mode
+
+Run `aerie --stutter` to launch straight into **stutter mode** — the latency
+instrument as a front door. It opens on a plain-language **detection** verdict
+(*is* there a recurring desktop stutter, and what's its fingerprint — period,
+duration, onset/length shape, likely cause); press **Tab** to switch to the live
+**observation** traces. The same instrument is one keypress (`d`) away from any
+view.
+
+Press `d` for the latency scope — a built-in [cyclictest](https://wiki.linuxfoundation.org/realtime/documentation/howto/tools/cyclictest/start).
+A dedicated thread asks the OS to wake it on a fixed interval and records how
+*late* each wakeup actually is. That overshoot series is the system-wide
+scheduling jitter that makes realtime UIs stutter — and because it is measured
+independently of any application, it tells a *system* cause (a periodic kernel
+task, an IRQ storm, a CPU C-state/frequency transition, memory reclaim) apart
+from a per-app one. If TUIs, video playback, and audio all hitch at the same
+cadence, this is the instrument that finds it.
+
+The view shows:
+
+- two **live traces** (green calm → red stall): **wakeup latency** (CPU scheduling
+  jitter) on top, **system pressure** (run-queue depth + PSI stall time) below.
+  The pressure trace is the one that catches compositor- and memory-bound freezes
+  — stalls that delay *rendering* without delaying a CPU thread, so the latency
+  probe alone is blind to them;
+- a **periodicity readout** per trace — the recurring stall's period and frequency,
+  via autocorrelation (central-lobe-skipping) + a narrow-band DFT;
+- a **ranked culprit list** — which system signals (IRQ/softirq, I/O & memory
+  pressure, kernel CPU, power draw) are reliably elevated during the stalls
+  versus calm periods;
+- a **periodic-offender list** — process groups acting *on a clock*: periodic CPU
+  bursts or periodically spawning short-lived helpers (poll-on-a-timer). This is
+  the pattern behind a single-threaded compositor freezing every few seconds
+  because one extension/app blocks its main loop on a timer.
+
+For intermittent stalls you can't sit and watch, capture a whole session and
+inspect it later:
+
+```bash
+# Record during a session that stutters (e.g. a DAW), even without opening the view:
+aerie --scope-log ~/jitter.jsonl
+
+# Afterwards, print an offline report (period, magnitudes, logged suspects):
+aerie --scope-analyze ~/jitter.jsonl
+```
+
+### The border glow is a latency gauge
+
+The two Gaussian blobs orbiting aerie's outer border double as an *ambient*
+latency display: each is driven by wall-clock time but only painted when the
+draw loop runs, sweeping continuously around the whole rim (tinting the legend
+text as they pass). When the system stalls, no frame is painted — so a blob
+visibly **freezes and then jumps ahead**, and the size of that jump is the
+stall. A recurring stutter folds into a **braille knot** that blinks up while the
+lag is felt: its **angle** is *when* in the cycle the stall starts (narrow =
+steady, smeared = jittery onset), its **height** is *how long* the stall lasts,
+and its colour attributes it to a periodic process when the scope probes are
+running (`d`; cyan = spawns, violet = CPU bursts). The fold works from aerie's own
+frame cadence with no probe, and sharpens to sub-millisecond once the latency
+probe is alive. See
+[`docs/rim-latency.md`](docs/rim-latency.md) for the mechanism, calibration, and
+the planned per-offender strobe orbiters.
 
 ## Anomaly alerts
 

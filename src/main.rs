@@ -14,6 +14,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+mod diag;
 mod local;
 mod proxmox;
 mod remote;
@@ -33,6 +34,7 @@ use mullion::{
 use std::{
     collections::HashMap,
     io,
+    io::Write,
     sync::{
         mpsc,
         Arc,
@@ -121,6 +123,27 @@ struct Cli {
     /// Print the built-in manual and exit
     #[arg(short = 'm', long)]
     manual: bool,
+
+    /// Stream latency-scope diagnostics to FILE as line-delimited JSON while aerie
+    /// runs. Spawns the wakeup-jitter probe at startup so a whole session is
+    /// captured even if you never open the scope view (press 'd'). Inspect later
+    /// with --scope-analyze. Ideal for catching intermittent stalls (e.g. during
+    /// a Bitwig session) you are not watching live.
+    #[arg(long)]
+    scope_log: Option<String>,
+
+    /// Analyze a previously captured --scope-log FILE offline and print a report
+    /// (period, magnitudes, dominant frequency, logged suspects), then exit.
+    /// Runs without a TUI and does not read /proc.
+    #[arg(long)]
+    scope_analyze: Option<String>,
+
+    /// Start in stutter mode: open the latency scope at launch (probes running)
+    /// in its detection view — a verdict on whether the desktop has a recurring
+    /// stutter, with its fingerprint. Press Tab to switch to the live observation
+    /// traces. (Same instrument the `d` key toggles from any view.)
+    #[arg(long)]
+    stutter: bool,
 
     /// [EXPERIMENTAL] Monitor Kubernetes pods via kubectl exec.
     /// Accepts NAMESPACE or NAMESPACE/SELECTOR (label selector).
@@ -352,6 +375,9 @@ pub enum AppView {
     Connecting { label: String },
     /// Showing live process data from a remote VM over SSH.
     Remote { label: String },
+    /// Latency scope: the wakeup-jitter diagnostic (Instruments subsystem).
+    /// Full-body view driven by the `diag::LatencyProbe`; toggled with `d`.
+    Scope,
 }
 
 /// Grouping strategy for local /proc scanning.
@@ -968,6 +994,44 @@ pub struct AppState {
     /// When true, display uses EWMA-smoothed values instead of raw tick values.
     /// Useful at sub-second refresh rates where raw values are too noisy to read.
     pub smooth_display: bool,
+    // ── diagnostics (Instruments subsystem) ───────────────────────────────
+    /// Wakeup-latency probe. `None` until the scope view is first opened with
+    /// `d`; once spawned it keeps running so history accumulates across toggles.
+    pub scope: Option<diag::LatencyProbe>,
+    /// Cached periodicity analysis of the probe series, recomputed ~once/sec
+    /// while the scope view is open (the analysis is too heavy for every frame).
+    pub scope_analysis: Option<diag::Periodicity>,
+    /// When the periodicity analysis was last recomputed.
+    pub last_scope_analysis: Option<Instant>,
+    /// Spike attributor: correlates latency stalls with system-counter deltas.
+    /// Sampled every main-loop tick while the scope is open.
+    pub scope_attrib: diag::Attributor,
+    /// Wall-clock time of the last attributor sample (for the interval delta).
+    pub scope_attrib_at: Option<Instant>,
+    /// Cached ranked-suspect report, recomputed with the periodicity analysis.
+    pub scope_report: Option<diag::AttribReport>,
+    /// Open capture-log writer when --scope-log is set; receives JSONL records.
+    pub scope_log: Option<std::io::BufWriter<std::fs::File>>,
+    /// System-pressure probe (instrument #2): run-queue + PSI stall time. Catches
+    /// compositor/memory-bound freezes the CPU-wakeup probe can't see. Spawned
+    /// together with the latency probe.
+    pub pressure: Option<diag::PressureProbe>,
+    /// Most-periodic pressure channel and its cached analysis (recomputed at 1 Hz).
+    pub pressure_analysis: Option<(diag::PressureChannel, diag::Periodicity)>,
+    /// Periodic-offender detector (instrument #3): per-group CPU/spawn periodicity.
+    pub offenders: Option<diag::OffenderProbe>,
+    /// Cached ranked offender report (recomputed at 1 Hz).
+    pub offender_report: Option<diag::OffenderReport>,
+    /// Last time the offender report was recomputed (throttles the ambient
+    /// rim-knot refresh that runs even when the scope view is closed).
+    pub last_offender_analysis: Option<Instant>,
+    /// Probe-derived stutter fingerprint (onset phase + duration fold) for the
+    /// rim. Computed from the latency probe when it is alive; `None` falls the
+    /// rim back to its own frame-cadence characterisation.
+    pub stutter_shape: Option<diag::StutterShape>,
+    /// In the scope view: `true` shows the detection verdict, `false` the live
+    /// observation traces. Toggled with Tab; set by `--stutter` at launch.
+    pub scope_detect: bool,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1497,6 +1561,20 @@ impl AppState {
             theme: Theme::default(),
             ewma_vals: HashMap::new(),
             smooth_display: Duration::from_secs_f64(cli.interval) < Duration::from_millis(400),
+            scope: None,
+            scope_analysis: None,
+            last_scope_analysis: None,
+            scope_attrib: diag::Attributor::new(),
+            scope_attrib_at: None,
+            scope_report: None,
+            scope_log: None,
+            pressure: None,
+            pressure_analysis: None,
+            offenders: None,
+            last_offender_analysis: None,
+            stutter_shape: None,
+            scope_detect: false,
+            offender_report: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
                 orientation: Orientation::Vertical,
@@ -2225,7 +2303,8 @@ impl AppState {
             AppView::Groups
             | AppView::Manual
             | AppView::Connecting { .. }
-            | AppView::Remote { .. } => None,
+            | AppView::Remote { .. }
+            | AppView::Scope => None,
         };
         if let (Some(label), AppMode::Local) = (thread_label, &self.mode) {
             let pids = self
@@ -2468,6 +2547,235 @@ fn run_daemon(interval: Duration) -> Result<()> {
 }
 
 /// Entry point: parse CLI, enter daemon mode or run the TUI event loop.
+/// Seconds since the Unix epoch as an f64 (for capture-log timestamps).
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Write the once-per-second capture-log records: a `summary` line and one
+/// `suspect` line per ranked suspect, all JSONL.
+fn log_scope_summary(
+    w: &mut impl Write,
+    st: &diag::ProbeStats,
+    p: &diag::Periodicity,
+    report: &diag::AttribReport,
+) {
+    let ts = unix_secs();
+    let period = p.period_s.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let freq = p.freq_hz.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let _ = writeln!(
+        w,
+        "{{\"type\":\"summary\",\"ts\":{:.3},\"window_s\":{:.1},\"n\":{},\
+         \"mean_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\
+         \"period_s\":{},\"freq_hz\":{},\"confidence\":{:.3},\
+         \"stalls\":{},\"calm\":{}}}",
+        ts, st.window_s, st.count, st.mean_ms, st.p99_ms, st.max_ms,
+        period, freq, p.confidence, report.spike_count, report.base_count
+    );
+    for s in &report.suspects {
+        let _ = writeln!(
+            w,
+            "{{\"type\":\"suspect\",\"ts\":{:.3},\"name\":{},\"unit\":{},\
+             \"spike_mean\":{:.3},\"base_mean\":{:.3},\"score\":{:.3}}}",
+            ts, json_str(s.name), json_str(s.unit), s.spike_mean, s.base_mean, s.score
+        );
+    }
+}
+
+/// Minimal JSON string escaper for the small, known label set we log.
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Pick the pressure channel that best explains a periodic stall: prefer one with
+/// a detected period (highest confidence); otherwise fall back to the most active
+/// channel (largest peak-above-mean) so the scope always shows something useful.
+fn best_pressure_channel(
+    samples: &[diag::PressureSample],
+) -> Option<(diag::PressureChannel, diag::Periodicity)> {
+    if samples.len() < 16 {
+        return None;
+    }
+    let mut scored: Vec<(f32, diag::PressureChannel, diag::Periodicity)> = Vec::new();
+    for ch in diag::PressureChannel::ALL {
+        let series = diag::pressure_channel_series(samples, ch);
+        let p = diag::analyze_periodicity(&series, diag::AnalysisConfig::default());
+        let mean = series.iter().map(|s| s.overshoot_ms).sum::<f32>() / series.len().max(1) as f32;
+        let max = series.iter().map(|s| s.overshoot_ms).fold(0.0f32, f32::max);
+        let activity = (max - mean).clamp(0.0, 999.0);
+        // A detected period (1000 + confidence) always outranks mere activity.
+        let key = if p.period_s.is_some() { 1000.0 + p.confidence } else { activity };
+        scored.push((key, ch, p));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().next().map(|(_, ch, p)| (ch, p))
+}
+
+/// Write the once-per-second pressure-periodicity record (instrument #2).
+fn log_pressure_summary(w: &mut impl Write, ch: diag::PressureChannel, p: &diag::Periodicity) {
+    let period = p.period_s.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let freq = p.freq_hz.map(|v| format!("{v:.4}")).unwrap_or_else(|| "null".into());
+    let _ = writeln!(
+        w,
+        "{{\"type\":\"pressure_summary\",\"ts\":{:.3},\"channel\":{},\
+         \"period_s\":{},\"freq_hz\":{},\"confidence\":{:.3}}}",
+        unix_secs(), json_str(ch.label()), period, freq, p.confidence
+    );
+}
+
+/// Write one `offender` record per detected periodic offender (instrument #3).
+fn log_offenders(w: &mut impl Write, report: &diag::OffenderReport) {
+    let ts = unix_secs();
+    for o in &report.offenders {
+        let kind = match o.kind {
+            diag::OffenderKind::Spawns => "spawns",
+            diag::OffenderKind::CpuBurst => "cpu",
+        };
+        let child = o.child.as_deref().map(json_str).unwrap_or_else(|| "null".into());
+        let _ = writeln!(
+            w,
+            "{{\"type\":\"offender\",\"ts\":{:.3},\"group\":{},\"kind\":\"{}\",\
+             \"period_s\":{:.4},\"freq_hz\":{:.4},\"confidence\":{:.3},\"child\":{}}}",
+            ts, json_str(&o.group), kind, o.period_s, o.freq_hz, o.confidence, child
+        );
+    }
+}
+
+/// Analyze a captured --scope-log file offline and print a text report.
+///
+/// Reconstructs the latency series from `sample` records, reruns the same
+/// periodicity analysis used live, and summarises the suspects that were logged
+/// during the session (attribution itself needs live /proc and is not recomputed).
+fn run_scope_analyze(path: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read scope log: {path}"))?;
+
+    let mut samples: Vec<diag::Sample> = Vec::new();
+    let mut first_ts: Option<f64> = None;
+    let mut pressure: Vec<diag::PressureSample> = Vec::new();
+    let mut first_pts: Option<f64> = None;
+    // Tally how often each signal was the top suspect across summary windows.
+    let mut suspect_tally: HashMap<String, usize> = HashMap::new();
+    let mut last_summary: Option<serde_json::Value> = None;
+    // Best (highest-confidence) offender record seen per group.
+    let mut offenders: HashMap<String, (f64, f64, String, Option<String>)> = HashMap::new();
+
+    for line in content.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v["type"].as_str() {
+            Some("sample") => {
+                if let (Some(ts), Some(ms)) = (v["ts"].as_f64(), v["ms"].as_f64()) {
+                    let f0 = *first_ts.get_or_insert(ts);
+                    samples.push(diag::Sample { t: ts - f0, overshoot_ms: ms as f32 });
+                }
+            }
+            Some("pressure") => {
+                if let Some(ts) = v["ts"].as_f64() {
+                    let f0 = *first_pts.get_or_insert(ts);
+                    pressure.push(diag::PressureSample {
+                        t: ts - f0,
+                        run_q: v["run_q"].as_f64().unwrap_or(0.0) as f32,
+                        cpu_us_s: v["cpu_us_s"].as_f64().unwrap_or(0.0) as f32,
+                        mem_us_s: v["mem_us_s"].as_f64().unwrap_or(0.0) as f32,
+                        io_us_s: v["io_us_s"].as_f64().unwrap_or(0.0) as f32,
+                    });
+                }
+            }
+            Some("summary") => last_summary = Some(v),
+            Some("suspect") => {
+                if let Some(name) = v["name"].as_str() {
+                    *suspect_tally.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+            Some("offender") => {
+                if let Some(group) = v["group"].as_str() {
+                    let conf = v["confidence"].as_f64().unwrap_or(0.0);
+                    let entry = offenders.entry(group.to_string()).or_insert((0.0, 0.0, String::new(), None));
+                    if conf >= entry.0 {
+                        *entry = (
+                            conf,
+                            v["period_s"].as_f64().unwrap_or(0.0),
+                            v["kind"].as_str().unwrap_or("").to_string(),
+                            v["child"].as_str().map(|s| s.to_string()),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if samples.len() < 8 {
+        anyhow::bail!("only {} latency samples in {path} — not enough to analyze", samples.len());
+    }
+
+    let st = diag::stats(&samples, 0.0);
+    let p = diag::analyze_periodicity(&samples, diag::AnalysisConfig::default());
+
+    println!("aerie latency-scope offline report — {path}");
+    println!("  samples (downsampled): {}", st.count);
+    println!("  window:                {:.1} s", st.window_s);
+    println!("  latency  mean {:.2} ms · p99 {:.2} ms · max {:.2} ms",
+        st.mean_ms, st.p99_ms, st.max_ms);
+    match p.period_s {
+        Some(period) => {
+            let strong = p.confidence > 0.4;
+            println!("  periodicity: recurring stall ≈ every {:.2} s ({:.2} Hz), confidence {:.0}% ({})",
+                period, p.freq_hz.unwrap_or(0.0), p.confidence * 100.0,
+                if strong { "strong" } else { "weak / quasi-periodic" });
+        }
+        None => println!("  periodicity: no clear period detected"),
+    }
+    if !suspect_tally.is_empty() {
+        let mut ranked: Vec<(&String, &usize)> = suspect_tally.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1));
+        let names: Vec<String> = ranked.iter().take(3).map(|(n, c)| format!("{n} (×{c})")).collect();
+        println!("  suspects logged during session: {}", names.join(", "));
+    } else if let Some(s) = last_summary {
+        let stalls = s["stalls"].as_u64().unwrap_or(0);
+        println!("  no suspects were logged ({stalls} stall intervals in the last window)");
+    }
+
+    // Instrument #2: pressure periodicity (the channel that catches compositor /
+    // memory-bound freezes the CPU-wakeup probe cannot see).
+    if pressure.len() >= 16 {
+        match best_pressure_channel(&pressure) {
+            Some((ch, p)) if p.period_s.is_some() => {
+                let strong = p.confidence > 0.4;
+                println!("  system pressure ({}): recurring ≈ every {:.2} s ({:.2} Hz), confidence {:.0}% ({})",
+                    ch.label(), p.period_s.unwrap(), p.freq_hz.unwrap_or(0.0),
+                    p.confidence * 100.0, if strong { "strong" } else { "weak / quasi-periodic" });
+            }
+            _ => println!("  system pressure: no clear period in run-queue / PSI channels"),
+        }
+    }
+
+    // Instrument #3: periodic offenders (process groups behaving on a clock).
+    if !offenders.is_empty() {
+        let mut ranked: Vec<_> = offenders.iter().collect();
+        ranked.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+        println!("  periodic offenders (process groups acting on a clock):");
+        for (group, (conf, period, kind, child)) in ranked.into_iter().take(5) {
+            let what = if kind == "spawns" {
+                match child {
+                    Some(c) => format!("spawning {c}"),
+                    None => "spawning helpers".to_string(),
+                }
+            } else {
+                "CPU bursts".to_string()
+            };
+            println!("     {group}: every {period:.2} s — {what} (confidence {:.0}%)", conf * 100.0);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -2480,7 +2788,34 @@ fn main() -> Result<()> {
         return run_daemon(Duration::from_secs_f64(cli.interval));
     }
 
+    if let Some(path) = &cli.scope_analyze {
+        return run_scope_analyze(path);
+    }
+
     let mut state = AppState::new(&cli)?;
+
+    // --scope-log: spawn the probe at startup and open the capture log so the
+    // whole session is recorded regardless of which view is showing.
+    if let Some(path) = &cli.scope_log {
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("cannot create scope log: {path}"))?;
+        state.scope_log = Some(std::io::BufWriter::new(file));
+        state.scope = Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+        state.pressure = Some(diag::PressureProbe::spawn(Duration::from_millis(20), 12_000));
+        state.offenders = Some(diag::OffenderProbe::spawn(Duration::from_millis(200)));
+    }
+
+    // --stutter: launch straight into the scope's detection view, probes running.
+    if cli.stutter {
+        if state.scope.is_none() {
+            state.scope = Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+            state.pressure = Some(diag::PressureProbe::spawn(Duration::from_millis(20), 12_000));
+            state.offenders = Some(diag::OffenderProbe::spawn(Duration::from_millis(200)));
+        }
+        state.view = AppView::Scope;
+        state.scope_detect = true;
+    }
+
     // Do an initial refresh before entering the TUI so the first frame shows data.
     state.refresh();
 
@@ -2540,6 +2875,119 @@ fn main() -> Result<()> {
         {
             state.last_hist_sample = Some(Instant::now());
             state.sample_histograms();
+        }
+
+        // The scope subsystem runs when its probe exists AND we are either viewing
+        // it or capturing a log. (The probe persists across view toggles, so guard
+        // on actual need rather than just probe existence.)
+        let scope_active = state.scope.is_some()
+            && (state.scope_log.is_some() || matches!(state.view, AppView::Scope));
+
+        // Drive spike attribution every tick: read cheap /proc counters and tag the
+        // interval with the worst probe overshoot since last tick. Kept on the
+        // (non-realtime) main thread so the probe stays pure.
+        if scope_active {
+            if let Some(probe) = state.scope.as_ref() {
+                let now = Instant::now();
+                let dt = state
+                    .scope_attrib_at
+                    .map(|t| now.duration_since(t).as_secs_f64())
+                    .unwrap_or(0.0);
+                // A long gap means the scope was idle and resumed; pass 0 to
+                // re-prime the counters rather than record one giant bogus interval.
+                let dt = if dt > 1.0 { 0.0 } else { dt };
+                state.scope_attrib_at = Some(now);
+                let recorded = state.scope_attrib.sample(probe, dt);
+                // Capture log: one downsampled latency sample per tick.
+                if let (Some(ms), Some(w)) = (recorded, state.scope_log.as_mut()) {
+                    let _ = writeln!(w, "{{\"type\":\"sample\",\"ts\":{:.3},\"ms\":{:.3}}}",
+                        unix_secs(), ms);
+                }
+            }
+            // Capture log: the latest pressure sample per tick (run-queue + PSI).
+            if let (Some(probe), true) = (state.pressure.as_ref(), state.scope_log.is_some()) {
+                if let Some(s) = probe.snapshot().last().copied() {
+                    if let Some(w) = state.scope_log.as_mut() {
+                        let _ = writeln!(w,
+                            "{{\"type\":\"pressure\",\"ts\":{:.3},\"run_q\":{:.2},\
+                             \"cpu_us_s\":{:.0},\"mem_us_s\":{:.0},\"io_us_s\":{:.0}}}",
+                            unix_secs(), s.run_q, s.cpu_us_s, s.mem_us_s, s.io_us_s);
+                    }
+                }
+            }
+        }
+
+        // Recompute the latency-scope periodicity analysis and attribution report
+        // ~once/sec. Both are too heavy to run every render frame, and their
+        // results are stable second-to-second.
+        if scope_active
+            && state
+                .last_scope_analysis
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            if let Some(samples) = state.scope.as_ref().map(|p| p.snapshot()) {
+                let tick_ms = state.scope.as_ref().map(|p| p.tick_ms()).unwrap_or(0.0);
+                let analysis = diag::analyze_periodicity(&samples, diag::AnalysisConfig::default());
+                // Stall threshold for attribution: a few × the typical overshoot,
+                // floored at 5 ms so we never accuse anyone on a calm machine.
+                let st = diag::stats(&samples, tick_ms);
+                let threshold = (st.mean_ms * 4.0).max(5.0);
+                let report = state.scope_attrib.rank(threshold);
+                // Instrument #2: find the most-periodic pressure channel.
+                let pressure_samples = state.pressure.as_ref().map(|p| p.snapshot());
+                let best_pressure = pressure_samples.as_ref().and_then(|ps| best_pressure_channel(ps));
+
+                // Instrument #3: find process groups behaving on a clock.
+                let offender_report = state.offenders.as_ref().map(|o| {
+                    let (groups, children) = o.snapshot();
+                    diag::analyze_offenders(&groups, &children)
+                });
+
+                if let Some(w) = state.scope_log.as_mut() {
+                    log_scope_summary(w, &st, &analysis, &report);
+                    if let Some((ch, ref pp)) = best_pressure {
+                        log_pressure_summary(w, ch, pp);
+                    }
+                    if let Some(ref orep) = offender_report {
+                        log_offenders(w, orep);
+                    }
+                    let _ = w.flush();
+                }
+                // Probe-grade stutter fingerprint for the rim (onset + duration).
+                state.stutter_shape = diag::characterise_stutter(&samples, threshold);
+                state.scope_analysis = Some(analysis);
+                state.scope_report = Some(report);
+                state.pressure_analysis = best_pressure;
+                state.offender_report = offender_report;
+                state.last_scope_analysis = Some(Instant::now());
+                state.last_offender_analysis = Some(Instant::now());
+            }
+        }
+
+        // Keep the rim's offender knots (Design 2) live even outside the scope
+        // view, as long as the offender probe is running — it is spawned the first
+        // time the scope is opened, then keeps scanning. Throttled to ~1 Hz like
+        // the in-scope path. When the scope is open the block above already does
+        // this (and also logs/attributes), so only run here when it is closed.
+        if !scope_active
+            && state.offenders.is_some()
+            && state
+                .last_offender_analysis
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            if let Some(o) = state.offenders.as_ref() {
+                let (groups, children) = o.snapshot();
+                state.offender_report = Some(diag::analyze_offenders(&groups, &children));
+                state.last_offender_analysis = Some(Instant::now());
+            }
+            // Refresh the probe-grade stutter fingerprint too (the latency probe
+            // keeps running once spawned, even outside the scope view).
+            if let Some(probe) = state.scope.as_ref() {
+                let samples = probe.snapshot();
+                let st = diag::stats(&samples, probe.tick_ms());
+                let threshold = (st.mean_ms * 4.0).max(5.0);
+                state.stutter_shape = diag::characterise_stutter(&samples, threshold);
+            }
         }
 
         terminal.draw(|buf| {
@@ -2614,6 +3062,8 @@ fn main() -> Result<()> {
                                 // is up-to-date after disconnecting.
                                 state.last_refresh = None;
                             }
+                            // Esc closes the scope and returns to the group list.
+                            AppView::Scope => state.view = AppView::Groups,
                             // Pressing Esc on the top-level group list exits the app.
                             AppView::Groups => break 'main,
                         }
@@ -2639,6 +3089,26 @@ fn main() -> Result<()> {
                     }
                     KeyCode::Char('v') => {
                         state.smooth_display = !state.smooth_display;
+                    }
+                    // Toggle the latency scope (diagnostics). Spawns the probe on
+                    // first use; the probe then keeps running so history persists.
+                    KeyCode::Char('d') => {
+                        if matches!(state.view, AppView::Scope) {
+                            state.view = AppView::Groups;
+                        } else if matches!(
+                            state.view,
+                            AppView::Groups | AppView::Threads { .. } | AppView::Manual
+                        ) {
+                            if state.scope.is_none() {
+                                state.scope =
+                                    Some(diag::LatencyProbe::spawn(diag::ProbeConfig::default()));
+                                state.pressure = Some(diag::PressureProbe::spawn(
+                                    Duration::from_millis(20), 12_000));
+                                state.offenders = Some(diag::OffenderProbe::spawn(
+                                    Duration::from_millis(200)));
+                            }
+                            state.view = AppView::Scope;
+                        }
                     }
                     // Cycle grouping strategy (Groups view, local or Proxmox mode)
                     KeyCode::Char('g') if matches!(state.view, AppView::Groups) => {
@@ -2748,6 +3218,9 @@ fn main() -> Result<()> {
                                 Side::Left => Side::Right,
                                 Side::Right => Side::Left,
                             };
+                        } else if matches!(state.view, AppView::Scope) {
+                            // Switch between the detection verdict and the live traces.
+                            state.scope_detect = !state.scope_detect;
                         }
                     }
                     // Sort by the active side's metric
