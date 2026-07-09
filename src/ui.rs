@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
 use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
+use mullion::border::{draw_box, render_rim, Borders, BorderStyle, CornerStyle, LineWeight};
 use mullion::field::Field;
 use mullion::layout::TileId;
 use mullion::label::Align;
@@ -118,13 +119,14 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
     let x1 = area.x + area.width - 1;
     let y1 = area.y + area.height - 1;
 
-    // Pass 1 — structural glyphs only.
-    for y in y0 + 1..y1 {
-        buf.set_string(x0, y, "│", dim);
-        buf.set_string(x1, y, "│", dim);
-    }
-    draw_top_border_structure(buf, y0, x0, x1, dim);
-    draw_bottom_border_structure(buf, y1, x0, x1, dim);
+    // Pass 1 — structural glyphs: one rounded box drawn by mullion (corners
+    // ╭╮╰╯, side │ bars, top/bottom ─ fills). Content (pass 2) and the rim glow
+    // (pass 3) overwrite the gap cells afterwards.
+    draw_box(buf, area, Borders::ALL, &BorderStyle {
+        weight: LineWeight::Light,
+        corners: CornerStyle::Rounded,
+        style: dim,
+    });
 
     // Offender fallback positions (banded by period) when no confident fingerprint.
     let offenders: Vec<RimOffender> = state
@@ -167,20 +169,6 @@ fn draw_outer_border(buf: &mut Buffer, area: Rect, state: &AppState) {
 struct RimOffender {
     phase: f32,
     period: f64,
-}
-
-// ── Border structure (pass 1) ──────────────────────────────────────────────────
-
-fn draw_top_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim: Style) {
-    buf.set_string(x0, y, "╭", dim);
-    buf.set_string(x1, y, "╮", dim);
-    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
-}
-
-fn draw_bottom_border_structure(buf: &mut Buffer, y: u16, x0: u16, x1: u16, dim: Style) {
-    buf.set_string(x0, y, "╰", dim);
-    buf.set_string(x1, y, "╯", dim);
-    for x in x0 + 1..x1 { buf.set_string(x, y, "─", dim); }
 }
 
 // ── Gap declarations (between passes 1 and 2) ─────────────────────────────────
@@ -659,13 +647,12 @@ fn compute_rim(
 }
 
 /// Draw the four orbiters around the perimeter, skipping protected content gaps.
+///
+/// `render_rim` (mullion §3.11) does the clockwise perimeter walk, the non-glow
+/// gap skip, and the `border_pos` lookup, and preserves each cell's glyph while
+/// re-styling it — so all that is left here is the additive Gaussian colour mix.
 fn draw_orbiters(buf: &mut Buffer, area: Rect, gaps: &[BorderGap], orbit_pos: [f32; 4]) {
-    let perim = Field::perimeter(area);
-    for &(x, y) in perim.cells().iter() {
-        if gaps.iter().any(|g| !g.rim_glow && g.contains(x, y)) {
-            continue;
-        }
-        let p = area.border_pos(x, y);
+    render_rim(buf, area, gaps, |p, cur| {
         let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
         for i in 0..4 {
             let d = { let d = (p - orbit_pos[i]).abs(); d.min(1.0 - d) };
@@ -676,13 +663,8 @@ fn draw_orbiters(buf: &mut Buffer, area: Rect, gaps: &[BorderGap], orbit_pos: [f
             b += cb * inten;
         }
         let (r, g, b) = (r.min(255.0) as u8, g.min(255.0) as u8, b.min(255.0) as u8);
-        if r > 12 || g > 12 || b > 12 {
-            let prev = buf.get(x, y);
-            let symbol = prev.symbol.clone();
-            let style = prev.style.fg(Color::Rgb(r, g, b));
-            buf.set_grapheme(x, y, &symbol, style);
-        }
-    }
+        (r > 12 || g > 12 || b > 12).then(|| cur.fg(Color::Rgb(r, g, b)))
+    });
 }
 
 /// Draw the stutter segments (braille + `┤ ├` bookends), brightness floored and
@@ -1041,18 +1023,6 @@ fn bar_color(m: Metric, frac: f64) -> Color {
 /// All characters are assumed to occupy one cell (no CJK wide-char support).
 /// If the label fits, it is left-padded to exactly `width` characters with spaces
 /// so column widths are consistent across all rows.
-fn truncate_label(label: &str, width: usize) -> String {
-    let chars: Vec<char> = label.chars().collect();
-    if chars.len() <= width {
-        format!("{label:<width$}")
-    } else {
-        // Truncate to width-1 chars and append the ellipsis character.
-        let mut s: String = chars[..width.saturating_sub(1)].iter().collect();
-        s.push('…');
-        s
-    }
-}
-
 /// Dim a colour toward dark gray when a metric is incomplete (EACCES).
 ///
 /// Applied to bar fill and value text when `entry_complete` returns false.
@@ -1357,7 +1327,7 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         Some(|buf: &mut Buffer, cols: &[Rect]| {
             let hy = cols[0].y;
             ColumnGrid::write_text(buf, cols[0], hy,
-                &truncate_label(&group_by_label, label_w as usize),
+                &group_by_label,
                 Align::Start, Style::default().fg(Color::Rgb(60, 60, 60)));
             buf.set_string(cols[4].x, hy, lname, left_hdr_style);
             let rname_x = cols[4].x + cols[4].width.saturating_sub(rname.len() as u16);
@@ -1424,9 +1394,9 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
             };
 
             let display_label = if is_anomaly && !e.fading && !is_selected {
-                truncate_label(&format!("! {}", e.label), label_w as usize)
+                format!("! {}", e.label)
             } else {
-                truncate_label(&e.label, label_w as usize)
+                e.label.clone()
             };
 
             let l_str = metric_display_str(e, lm, total_ram_bytes);
@@ -1451,6 +1421,10 @@ fn render_body(buf: &mut Buffer, area: Rect, state: &mut AppState) {
                 ("   ", "   ", Style::default())
             };
 
+            // Fill the label cell first so a selection/anomaly highlight spans the
+            // whole column, then overlay the label — write_text elides it
+            // grapheme/width-correctly (mullion §3.13), so no manual truncation.
+            buf.set_string(cols[0].x, ey, &" ".repeat(cols[0].width as usize), label_style);
             ColumnGrid::write_text(buf, cols[0], ey, &display_label, Align::Start, label_style);
             buf.set_string(cols[2].x, ey, l_arrow, a_style);
             ColumnGrid::write_text(buf, cols[3], ey, &l_str, Align::End, Style::default().fg(lc));
