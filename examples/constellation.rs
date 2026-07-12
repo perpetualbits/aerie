@@ -36,24 +36,170 @@ USAGE: constellation [--stall]
 
 KEYS: q/Esc quit\n";
 
+const SAMPLE_EVERY: f32 = 1.0;
+
 struct State {
     stall: bool,
     t: f32, // seconds since start
+    since_sample: f32,
+    ids: CommIds,
+    prev_cpu: HashMap<TileId, u64>, // last cumulative jiffies per node id
+    cons: Constellation,
+    canvas: GraphCanvas,
+    cpu_frac: HashMap<TileId, f32>, // per-frame normalized deltas
+    mem_frac: HashMap<TileId, f32>,
+    injector: Injector,
 }
 
 impl State {
     fn new(stall: bool) -> Self {
-        State { stall, t: 0.0 }
+        let mut state = State {
+            stall,
+            t: 0.0,
+            since_sample: 0.0,
+            ids: CommIds::new(),
+            prev_cpu: HashMap::new(),
+            cons: Constellation { nodes: Vec::new(), edges: Vec::new() },
+            canvas: GraphCanvas::new(1, 1),
+            cpu_frac: HashMap::new(),
+            mem_frac: HashMap::new(),
+            injector: Injector::new(),
+        };
+        state.resample(); // populate the first frame immediately
+        state
     }
 
     fn advance(&mut self, dt: f32) {
         self.t += dt;
+        self.since_sample += dt;
+        if self.since_sample >= SAMPLE_EVERY {
+            self.resample();
+        }
+    }
+
+    fn resample(&mut self) {
+        let samples = sample_procs();
+        let cons = build_graph(&samples, &mut self.ids);
+
+        // CPU deltas vs previous cumulative jiffies.
+        let mut deltas: HashMap<TileId, u64> = HashMap::new();
+        for n in &cons.nodes {
+            let prev = self.prev_cpu.get(&n.id).copied().unwrap_or(n.cpu_jiffies);
+            deltas.insert(n.id, n.cpu_jiffies.saturating_sub(prev));
+        }
+        self.prev_cpu = cons.nodes.iter().map(|n| (n.id, n.cpu_jiffies)).collect();
+
+        let dmax = deltas.values().copied().max().unwrap_or(1).max(1);
+        let mmax = cons.nodes.iter().map(|n| n.rss_pages).max().unwrap_or(1).max(1);
+        self.cpu_frac = deltas.iter().map(|(&id, &d)| (id, d as f32 / dmax as f32)).collect();
+        self.mem_frac = cons
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.rss_pages as f32 / mmax as f32))
+            .collect();
+
+        // Node size follows CPU delta; lay out with the same metric so sizes match.
+        let cpu_max_for_size = dmax;
+        // Build canvas using delta-based sizes: temporarily map jiffies->delta.
+        let sized = Constellation {
+            nodes: cons
+                .nodes
+                .iter()
+                .map(|n| GNode { cpu_jiffies: *deltas.get(&n.id).unwrap_or(&0), ..n.clone() })
+                .collect(),
+            edges: cons.edges.clone(),
+        };
+        self.canvas = build_canvas(&sized, cpu_max_for_size);
+        self.cons = cons;
+        self.since_sample = 0.0;
     }
 
     fn render(&self, buf: &mut Buffer) {
+        use mullion::border::{draw_box, BorderStyle, Borders, CornerStyle, LineWeight};
         let area = buf.area;
-        let msg = format!("constellation spike — t={:.1}s stall={}", self.t, self.stall);
+        let (cw, ch) = self.canvas.size();
+        let vp = mullion::Viewport::new(area, cw, ch);
+        let placed = placed_rects(&self.canvas, Rect::new(0, 0, cw, ch)); // canvas-space rects
+
+        // Nodes.
+        for (id, crect) in &placed {
+            if let Some(screen) = vp.project(*crect) {
+                let cpu = self.cpu_frac.get(id).copied().unwrap_or(0.0);
+                let mem = self.mem_frac.get(id).copied().unwrap_or(0.0);
+                let strain = 0.0; // wired in Task 9
+                let vis = encode_node(cpu, mem, strain);
+                draw_box(
+                    buf,
+                    screen,
+                    Borders::ALL,
+                    &BorderStyle {
+                        weight: LineWeight::Light,
+                        corners: CornerStyle::Rounded,
+                        style: Style::default().fg(vis.color),
+                    },
+                );
+                // Neutral label: the comm, elided to the box interior.
+                if let Some(n) = self.cons.nodes.iter().find(|n| n.id == *id) {
+                    if screen.width > 2 {
+                        buf.set_string(
+                            screen.x + 1,
+                            screen.y,
+                            n.comm.chars().take((screen.width - 2) as usize).collect::<String>().as_str(),
+                            Style::default().fg(vis.color),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Backbone edges (structural). Overlay edges are added in Task 9.
+        self.render_edges(buf, area, &placed, &vp, &self.cons.edges, Color::Rgb(90, 90, 110));
+
+        // Corner readout: keep the injector state visible during the spike.
+        let strain = self.injector.intensity(self.t);
+        let msg = format!(
+            "constellation — t={:.1}s stall={} nodes={} strain={:.2}",
+            self.t,
+            self.stall,
+            self.cons.nodes.len(),
+            strain
+        );
         buf.set_string(area.x + 1, area.y, &msg, Style::default().fg(Color::White));
+    }
+
+    fn render_edges(
+        &self,
+        buf: &mut Buffer,
+        _area: Rect,
+        placed: &[(TileId, Rect)],
+        vp: &mullion::Viewport,
+        edges: &[(TileId, TileId)],
+        color: Color,
+    ) {
+        use mullion::border::LineWeight;
+        use mullion::float::free_cells_in_window;
+        use mullion::label::Side;
+        use mullion::route::{render as render_connectors, route_all, RouteRequest};
+        use mullion::socket::{Flow, Socket};
+
+        let rect_of = |id: TileId| placed.iter().find(|(i, _)| *i == id).map(|(_, r)| *r);
+        let node_rects: Vec<Rect> = placed.iter().map(|(_, r)| *r).collect();
+        let (cw, ch) = self.canvas.size();
+        let canvas = Rect::new(0, 0, cw, ch);
+        let free: HashSet<(u16, u16)> =
+            free_cells_in_window(canvas, &node_rects, 0, canvas).into_iter().collect();
+
+        let mut reqs = Vec::new();
+        for (a, b) in edges {
+            let (Some(ra), Some(rb)) = (rect_of(*a), rect_of(*b)) else { continue };
+            let src = Socket::new(Side::Right, (ra.height / 2).max(1), Flow::Out, 0);
+            let dst = Socket::new(Side::Left, (rb.height / 2).max(1), Flow::In, 0);
+            let (Some(s), Some(d)) = (src.attach(ra), dst.attach(rb)) else { continue };
+            reqs.push(RouteRequest::new(s, d, src.outward().opposite(), dst.outward().opposite()));
+        }
+        let wires: Vec<_> = route_all(&free, &reqs, 4, 8).into_iter().flatten().collect();
+        let styles = vec![Style::default().fg(color); wires.len()];
+        render_connectors(buf, vp.visible(), vp.origin(), &wires, &styles, &node_rects, LineWeight::Light);
     }
 }
 
@@ -295,6 +441,7 @@ fn placed_rects(canvas: &GraphCanvas, window: Rect) -> Vec<(TileId, Rect)> {
 struct Injector {
     period_s: f32,
     sigma: f32,
+    #[allow(dead_code)] // wired in Task 9 (notice -> materialize -> dive)
     culprit: Option<TileId>,
 }
 
