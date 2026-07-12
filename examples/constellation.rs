@@ -16,8 +16,10 @@ use crossterm::event::Event;
 use mullion::backend::CrosstermBackend;
 use mullion::capabilities::Capabilities;
 use mullion::input::{KeyCode, KeyModifiers};
+use mullion::layout::TileId;
 use mullion::style::{Color, Style};
 use mullion::{Buffer, EventReader, Rect, Terminal};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -168,9 +170,84 @@ fn sample_procs() -> Vec<ProcSample> {
     out
 }
 
+struct CommIds {
+    map: HashMap<String, TileId>,
+    next: TileId,
+}
+
+impl CommIds {
+    fn new() -> Self {
+        CommIds { map: HashMap::new(), next: 1 }
+    }
+    fn id(&mut self, comm: &str) -> TileId {
+        if let Some(&id) = self.map.get(comm) {
+            return id;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.map.insert(comm.to_string(), id);
+        id
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GNode {
+    id: TileId,
+    comm: String,
+    cpu_jiffies: u64,
+    rss_pages: u64,
+}
+
+struct Constellation {
+    nodes: Vec<GNode>,
+    edges: Vec<(TileId, TileId)>,
+}
+
+fn build_graph(samples: &[ProcSample], ids: &mut CommIds) -> Constellation {
+    // pid -> comm, so a child can look up its parent's comm.
+    let pid_comm: HashMap<u32, &str> =
+        samples.iter().map(|s| (s.pid, s.comm.as_str())).collect();
+
+    // Aggregate per comm.
+    let mut agg: HashMap<String, GNode> = HashMap::new();
+    for s in samples {
+        let id = ids.id(&s.comm);
+        let n = agg.entry(s.comm.clone()).or_insert(GNode {
+            id,
+            comm: s.comm.clone(),
+            cpu_jiffies: 0,
+            rss_pages: 0,
+        });
+        n.cpu_jiffies += s.cpu_jiffies;
+        n.rss_pages += s.rss_pages;
+    }
+
+    // Lineage edges parent-comm -> child-comm, deduped, self-edges dropped.
+    let mut edge_set: HashSet<(TileId, TileId)> = HashSet::new();
+    for s in samples {
+        let Some(parent_comm) = pid_comm.get(&s.ppid) else { continue };
+        if *parent_comm == s.comm.as_str() {
+            continue; // self-edge
+        }
+        let p = ids.id(parent_comm);
+        let c = ids.id(&s.comm);
+        edge_set.insert((p, c));
+    }
+
+    let mut nodes: Vec<GNode> = agg.into_values().collect();
+    nodes.sort_by_key(|n| n.id); // deterministic order for stable layout
+    let mut edges: Vec<(TileId, TileId)> = edge_set.into_iter().collect();
+    edges.sort();
+    Constellation { nodes, edges }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(pid: u32, ppid: u32, comm: &str, cpu: u64, rss: u64) -> ProcSample {
+        ProcSample { pid, ppid, comm: comm.into(), cpu_jiffies: cpu, rss_pages: rss }
+    }
 
     #[test]
     fn parses_stat_with_parens_in_comm() {
@@ -194,5 +271,44 @@ mod tests {
         // size resident shared ... — we want the 2nd field.
         assert_eq!(parse_statm_resident("5000 1234 200 10 0 300 0"), Some(1234));
         assert_eq!(parse_statm_resident("bad"), None);
+    }
+
+    #[test]
+    fn comm_ids_are_stable() {
+        let mut ids = CommIds::new();
+        let a1 = ids.id("bash");
+        let b = ids.id("cat");
+        let a2 = ids.id("bash");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+    }
+
+    #[test]
+    fn build_graph_groups_and_edges() {
+        // shell(1) -> worker(2), worker(2) -> worker(3) [self-edge dropped],
+        // worker(3) -> tool(4). Two "worker" procs merge into one node.
+        let samples = vec![
+            sample(1, 0, "shell", 10, 100),
+            sample(2, 1, "worker", 20, 200),
+            sample(3, 2, "worker", 5, 50),
+            sample(4, 3, "tool", 7, 70),
+        ];
+        let mut ids = CommIds::new();
+        let g = build_graph(&samples, &mut ids);
+
+        // 3 distinct comms -> 3 nodes; worker aggregates cpu 20+5, rss 200+50.
+        assert_eq!(g.nodes.len(), 3);
+        let worker = g.nodes.iter().find(|n| n.comm == "worker").unwrap();
+        assert_eq!(worker.cpu_jiffies, 25);
+        assert_eq!(worker.rss_pages, 250);
+
+        let shell = ids.id("shell");
+        let worker_id = ids.id("worker");
+        let tool = ids.id("tool");
+        // Edges: shell->worker and worker->tool; the worker->worker self-edge is gone.
+        assert!(g.edges.contains(&(shell, worker_id)));
+        assert!(g.edges.contains(&(worker_id, tool)));
+        assert!(!g.edges.iter().any(|&(a, b)| a == b));
+        assert_eq!(g.edges.len(), 2);
     }
 }
