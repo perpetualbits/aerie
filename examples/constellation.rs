@@ -19,7 +19,8 @@ use mullion::ease::gaussian;
 use mullion::input::{KeyCode, KeyModifiers};
 use mullion::layout::TileId;
 use mullion::style::{Color, Style};
-use mullion::{Buffer, EventReader, Rect, Terminal};
+use mullion::sugiyama::{auto_layout, LayerDir, SugiyamaParams};
+use mullion::{Buffer, EventReader, FloatRect, GraphCanvas, Rect, Terminal};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
@@ -265,6 +266,32 @@ fn encode_node(cpu_frac: f32, mem_frac: f32, strain: f32) -> NodeVisual {
     NodeVisual { cells, color, pulse: strain.clamp(0.0, 1.0) }
 }
 
+fn node_side(cpu_jiffies: u64, cpu_max: u64) -> u16 {
+    let frac = if cpu_max == 0 { 0.0 } else { cpu_jiffies as f32 / cpu_max as f32 };
+    encode_node(frac, 0.0, 0.0).cells
+}
+
+fn build_canvas(cons: &Constellation, cpu_max: u64) -> GraphCanvas {
+    // Canvas is generously larger than the screen; auto_layout resizes to fit.
+    let mut canvas = GraphCanvas::new(200, 80).with_grid(2);
+    for n in &cons.nodes {
+        let side = node_side(n.cpu_jiffies, cpu_max);
+        // Nodes are boxes; height a bit shorter than width reads better in cells.
+        let h = (side / 2).max(3);
+        canvas.add(n.id, FloatRect::new(0, 0, side.max(3), h));
+    }
+    auto_layout(
+        &mut canvas,
+        &cons.edges,
+        &SugiyamaParams { dir: LayerDir::LeftRight, layer_gap: 8, node_gap: 3, grid: 2 },
+    );
+    canvas
+}
+
+fn placed_rects(canvas: &GraphCanvas, window: Rect) -> Vec<(TileId, Rect)> {
+    canvas.solve(window)
+}
+
 struct Injector {
     period_s: f32,
     sigma: f32,
@@ -397,5 +424,32 @@ mod tests {
             let v = inj.intensity(i as f32 * 0.05);
             assert!((0.0..=1.0).contains(&v));
         }
+    }
+
+    use mullion::Rect as MRect;
+
+    fn tiny_constellation() -> (Constellation, u64) {
+        // shell -> worker -> tool, plus an isolated daemon.
+        let samples = vec![
+            sample(1, 0, "shell", 10, 100),
+            sample(2, 1, "worker", 30, 200),
+            sample(3, 2, "tool", 5, 40),
+            sample(9, 0, "daemon", 8, 60),
+        ];
+        let mut ids = CommIds::new();
+        let g = build_graph(&samples, &mut ids);
+        let cpu_max = g.nodes.iter().map(|n| n.cpu_jiffies).max().unwrap_or(1);
+        (g, cpu_max)
+    }
+
+    #[test]
+    fn layout_is_stable_across_identical_frames() {
+        let (g, cpu_max) = tiny_constellation();
+        let window = MRect::new(0, 0, 120, 40);
+        let a = placed_rects(&build_canvas(&g, cpu_max), window);
+        let b = placed_rects(&build_canvas(&g, cpu_max), window);
+        // Same ids, sizes, edges -> identical placement (auto_layout is idempotent).
+        assert_eq!(a, b, "an unchanged graph must not move between frames");
+        assert_eq!(a.len(), 4);
     }
 }
