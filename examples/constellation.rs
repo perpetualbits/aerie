@@ -11,8 +11,8 @@
 // Run:  cargo run --bin constellation [--stall]
 // Keys: q / Ctrl-C  quit
 //       arrows      move focus
-//       Enter / +   dive into the focused node
-//       Esc / -     surface back to the overview
+//       Enter / + / = dive into the focused node
+//       Esc / - / _  surface back to the overview
 //       space       pause / resume the sampling + animation clock
 
 use anyhow::Result;
@@ -39,7 +39,7 @@ USAGE: constellation [--stall]
   --stall   drive the fake periodic-stall injector on startup
   -h,--help show this help
 
-KEYS: q/Ctrl-C quit; arrows move focus; Enter/+ dive; Esc/- surface;
+KEYS: q/Ctrl-C quit; arrows move focus; Enter/+/= dive; Esc/-/_ surface;
       space pause/resume clock\n";
 
 /// Seconds for a full dive (zoom_t: 0 -> 1) or surface (1 -> 0) ease.

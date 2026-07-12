@@ -138,7 +138,7 @@ to aerie's app loop, fastest iteration, no blast radius on the shipping binary.
 
 ### Controls
 
-`↑↓←→` / mouse — move focus · `Enter` / `+` — dive · `Esc` / `-` — surface · `q` — quit ·
+`↑↓←→` / mouse — move focus · `Enter` / `+` / `=` — dive · `Esc` / `-` / `_` — surface · `q` — quit ·
 `--stall` flag toggles the injector (test calm vs. strained feel).
 
 ### Build shape
@@ -179,8 +179,8 @@ cargo run --bin constellation          # calm path — no injector
 cargo run --bin constellation -- --stall   # stall arc — weather/materialize/bedrock
 ```
 
-Controls: `↑↓←→` move focus · `Enter` / `+` dive into the focused node ·
-`Esc` / `-` surface back to the overview · `space` pause/resume the sampling +
+Controls: `↑↓←→` move focus · `Enter` / `+` / `=` dive into the focused node ·
+`Esc` / `-` / `_` surface back to the overview · `space` pause/resume the sampling +
 animation clock · `q` / `Ctrl-C` quit. The footer line shows node count, seconds
 since the last resample, and (under `--stall`) the injector's live intensity value.
 
@@ -196,6 +196,8 @@ _(awaiting live-terminal verification)_
 Start or stop a process (e.g. `sleep 30 &`, or open/close a program) while the
 constellation is running; existing nodes should hold their position while the new
 one appears elsewhere.
+
+Note: node sizes and the layout are normalized to the busiest process-group each sample, so when the busiest group changes the whole map rescales — distinguish that expected rescale from actual position reshuffling (a real instability) when judging this goal.
 
 _(awaiting live-terminal verification)_
 
