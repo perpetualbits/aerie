@@ -176,6 +176,9 @@ impl State {
     /// Dive into the focused node: it grows to fill the screen over ~ZOOM_SECS.
     fn dive(&mut self) {
         if let Some(f) = self.focus {
+            if self.zoom_target != Some(f) {
+                self.zoom_t = 0.0;
+            }
             self.zoom_target = Some(f);
             self.zoom_goal = 1.0;
         }
