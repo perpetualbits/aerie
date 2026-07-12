@@ -24,7 +24,7 @@ use mullion::layout::TileId;
 use mullion::style::{Color, Modifier, Style};
 use mullion::sugiyama::{auto_layout, LayerDir, SugiyamaParams};
 use mullion::zoom::{lerp_rect, Lod, LodScale};
-use mullion::{Buffer, EventReader, FloatRect, GraphCanvas, Rect, Terminal, Viewport};
+use mullion::{Buffer, Cell, EventReader, Field, FloatRect, GraphCanvas, Rect, Terminal, Viewport};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
@@ -202,6 +202,22 @@ impl State {
         }
         self.prev_cpu = cons.nodes.iter().map(|n| (n.id, n.cpu_jiffies)).collect();
 
+        // Task 9: under --stall, pin the injector's culprit to the
+        // highest-CPU-delta node the first time we see one, and re-elect if
+        // that comm's process disappears out from under us later. A no-op
+        // when --stall is off, so the calm (Task 8) path is unaffected.
+        if self.stall {
+            if let Some(cid) = self.injector.culprit {
+                if !cons.nodes.iter().any(|n| n.id == cid) {
+                    self.injector.culprit = None;
+                }
+            }
+            if self.injector.culprit.is_none() {
+                self.injector.culprit =
+                    cons.nodes.iter().max_by_key(|n| deltas.get(&n.id).copied().unwrap_or(0)).map(|n| n.id);
+            }
+        }
+
         let dmax = deltas.values().copied().max().unwrap_or(1).max(1);
         let mmax = cons.nodes.iter().map(|n| n.rss_pages).max().unwrap_or(1).max(1);
         self.cpu_frac = deltas.iter().map(|(&id, &d)| (id, d as f32 / dmax as f32)).collect();
@@ -256,12 +272,41 @@ impl State {
         // surface, so there is no visible pop when the overlay first appears.
         let dim_amt = if self.zoom_target.is_some() { smoothstep(self.zoom_t.clamp(0.0, 1.0)) } else { 0.0 };
 
+        // Task 9: the injector's stall pulse, 0..1, peaking every period_s.
+        // Only ever fed to visuals when `self.stall` is set — with it off the
+        // map stays exactly as calm as it was at the end of Task 8.
+        let s = self.injector.intensity(self.t);
+
+        // Weather: a faint full-screen wash + perimeter rim, both scaled by
+        // `s`, so the whole map visibly breathes on the stall clock. Drawn
+        // before the nodes so it reads as background, not an overlay on top
+        // of them.
+        if self.stall {
+            let wash = Color::Rgb((25.0 * s) as u8, (10.0 * s) as u8, (10.0 * s) as u8);
+            buf.fill(area, Cell::new(" ", Style::default().bg(wash)));
+            let rim_col =
+                Color::Rgb((30.0 + 180.0 * s) as u8, (20.0 + 40.0 * s) as u8, (40.0 * (1.0 - s)) as u8);
+            draw_box(
+                buf,
+                area,
+                Borders::ALL,
+                &BorderStyle {
+                    weight: LineWeight::Light,
+                    corners: CornerStyle::Rounded,
+                    style: Style::default().fg(rim_col),
+                },
+            );
+        }
+
         // Nodes.
         for (id, crect) in &placed {
             if let Some(screen) = vp.project(*crect) {
                 let cpu = self.cpu_frac.get(id).copied().unwrap_or(0.0);
                 let mem = self.mem_frac.get(id).copied().unwrap_or(0.0);
-                let strain = 0.0; // wired in Task 9
+                // Task 9: only the stall culprit pulses, and only under
+                // --stall; every other node (and every node when --stall is
+                // off) gets zero strain, same as the Task-7 placeholder.
+                let strain = if self.stall && self.injector.culprit == Some(*id) { s } else { 0.0 };
                 let vis = encode_node(cpu, mem, strain);
                 let is_focus = self.zoom_target.is_none() && self.focus == Some(*id);
                 let color = dim_color(vis.color, dim_amt);
@@ -289,7 +334,7 @@ impl State {
             }
         }
 
-        // Backbone edges (structural). Overlay edges are added in Task 9.
+        // Backbone edges (structural).
         render_edges(
             buf,
             &placed,
@@ -299,19 +344,31 @@ impl State {
             self.canvas.size(),
         );
 
+        // Materialize: while the stall pulse is high, light up the culprit's
+        // lineage edges in a hot hue — a second overlay edge set atop the
+        // backbone, appearing only during a stall and fading between.
+        if self.stall && s > 0.5 {
+            if let Some(cid) = self.injector.culprit {
+                let hot_edges: Vec<(TileId, TileId)> =
+                    self.cons.edges.iter().copied().filter(|(a, b)| *a == cid || *b == cid).collect();
+                if !hot_edges.is_empty() {
+                    render_edges(buf, &placed, &vp, &hot_edges, Color::Rgb(230, 80, 60), self.canvas.size());
+                }
+            }
+        }
+
         // The dive overlay itself: the focused node grown toward fullscreen.
         if let Some(tid) = self.zoom_target {
             self.render_zoom_overlay(buf, area, tid, &placed, &vp);
         }
 
         // Corner readout: keep the injector state visible during the spike.
-        let strain = self.injector.intensity(self.t);
         let msg = format!(
             "constellation — t={:.1}s stall={} nodes={} strain={:.2} zoom={:.2}",
             self.t,
             self.stall,
             self.cons.nodes.len(),
-            strain,
+            s,
             self.zoom_t,
         );
         buf.set_string(area.x + 1, area.y, &msg, Style::default().fg(Color::White));
@@ -364,6 +421,11 @@ impl State {
             Lod::Full => {
                 self.render_interior(buf, grown, tid, comm, members);
                 title_line(buf, grown, &format!(" {comm} "), Color::Cyan);
+                // Bedrock: diving into the stall culprit itself, at Full LoD,
+                // reveals the injected latency timeline underneath its interior.
+                if self.stall && self.injector.culprit == Some(tid) {
+                    self.render_stall_timeline(buf, grown);
+                }
             }
         }
     }
@@ -439,6 +501,40 @@ impl State {
             }
         }
         render_edges(buf, &inner_placed, &inner_vp, &child_cons.edges, Color::Rgb(100, 100, 150), inner_canvas.size());
+    }
+
+    /// Bedrock: a bottom strip inside the culprit's `Lod::Full` rect, rendered
+    /// as a latency timeline — the injector's own pulse train swept across a
+    /// small time window via `Field::render_braille`, so the peaks the map has
+    /// been breathing to are visible as a trace. Labeled only in neutral
+    /// period-seconds terms; no product names or remediation hints.
+    fn render_stall_timeline(&self, buf: &mut Buffer, outer: Rect) {
+        let strip_h = 3u16.min(outer.height.saturating_sub(2));
+        if outer.width < 12 || strip_h < 2 {
+            return; // too small to show a timeline
+        }
+        let strip = Rect::new(
+            outer.x + 2,
+            outer.bottom().saturating_sub(strip_h + 1),
+            outer.width.saturating_sub(4),
+            strip_h,
+        );
+
+        // Sweep a window a few periods wide across the strip so the peaks
+        // read as a train, and slide it with the clock so it keeps moving.
+        let window = (self.injector.period_s * 3.0).max(1.0);
+        let window_start = self.t - window;
+        let field = Field::rect(strip);
+        field.render_braille(
+            buf,
+            |u, _v| self.injector.intensity(window_start + u * window),
+            |mean| Style::default().fg(Color::Rgb((60.0 + 195.0 * mean) as u8, 90, 70)),
+        );
+
+        let label = format!("period {:.1}s", self.injector.period_s);
+        if (label.len() as u16) < strip.width {
+            buf.set_string(strip.x, strip.y.saturating_sub(1), &label, Style::default().fg(Color::Gray));
+        }
     }
 }
 
@@ -746,7 +842,6 @@ fn placed_rects(canvas: &GraphCanvas, window: Rect) -> Vec<(TileId, Rect)> {
 struct Injector {
     period_s: f32,
     sigma: f32,
-    #[allow(dead_code)] // wired in Task 9 (notice -> materialize -> dive)
     culprit: Option<TileId>,
 }
 
