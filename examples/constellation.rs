@@ -97,3 +97,102 @@ fn main() -> Result<()> {
     terminal.leave()?;
     result
 }
+
+#[derive(Debug, Clone)]
+struct ProcStat {
+    pid: u32,
+    ppid: u32,
+    comm: String,
+    cpu_jiffies: u64,
+}
+
+fn parse_stat(line: &str) -> Option<ProcStat> {
+    let open = line.find('(')?;
+    let close = line.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let pid: u32 = line[..open].trim().parse().ok()?;
+    let comm = line[open + 1..close].to_string();
+    // Remainder starts at field 3 (state). 0-based within remainder:
+    //   state=0, ppid=1, ... utime=10, stime=11
+    let rest: Vec<&str> = line[close + 1..].split_whitespace().collect();
+    if rest.len() < 12 {
+        return None;
+    }
+    let ppid: u32 = rest[1].parse().ok()?;
+    let utime: u64 = rest[10].parse().ok()?;
+    let stime: u64 = rest[11].parse().ok()?;
+    Some(ProcStat { pid, ppid, comm, cpu_jiffies: utime + stime })
+}
+
+fn parse_statm_resident(line: &str) -> Option<u64> {
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[derive(Debug, Clone)]
+struct ProcSample {
+    pid: u32,
+    ppid: u32,
+    comm: String,
+    cpu_jiffies: u64,
+    rss_pages: u64,
+}
+
+fn sample_procs() -> Vec<ProcSample> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let base = entry.path();
+        let Ok(stat_line) = std::fs::read_to_string(base.join("stat")) else { continue };
+        let Some(st) = parse_stat(&stat_line) else { continue };
+        let rss_pages = std::fs::read_to_string(base.join("statm"))
+            .ok()
+            .and_then(|s| parse_statm_resident(&s))
+            .unwrap_or(0);
+        out.push(ProcSample {
+            pid: st.pid,
+            ppid: st.ppid,
+            comm: st.comm,
+            cpu_jiffies: st.cpu_jiffies,
+            rss_pages,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_stat_with_parens_in_comm() {
+        // Real-shaped line: comm "(a b)c" contains spaces and parens.
+        // fields: 1 pid, 2 comm, 3 state, 4 ppid, ... 14 utime, 15 stime
+        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 40 60 0 0 20 0 1 0";
+        let s = parse_stat(line).expect("should parse");
+        assert_eq!(s.pid, 1234);
+        assert_eq!(s.ppid, 1000);
+        assert_eq!(s.comm, "(a b)c");
+        assert_eq!(s.cpu_jiffies, 100); // utime 40 + stime 60
+    }
+
+    #[test]
+    fn rejects_garbage_stat() {
+        assert!(parse_stat("not a stat line").is_none());
+    }
+
+    #[test]
+    fn parses_statm_resident() {
+        // size resident shared ... — we want the 2nd field.
+        assert_eq!(parse_statm_resident("5000 1234 200 10 0 300 0"), Some(1234));
+        assert_eq!(parse_statm_resident("bad"), None);
+    }
+}
