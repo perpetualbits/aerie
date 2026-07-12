@@ -241,6 +241,29 @@ fn build_graph(samples: &[ProcSample], ids: &mut CommIds) -> Constellation {
     Constellation { nodes, edges }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct NodeVisual {
+    cells: u16,
+    color: Color,
+    pulse: f32,
+}
+
+fn encode_node(cpu_frac: f32, mem_frac: f32, strain: f32) -> NodeVisual {
+    const MIN_CELLS: f32 = 3.0;
+    const MAX_CELLS: f32 = 14.0;
+    let cpu = cpu_frac.clamp(0.0, 1.0);
+    let cells = (MIN_CELLS + (MAX_CELLS - MIN_CELLS) * cpu).round() as u16;
+
+    // Cool (blue) -> hot (red) ramp on memory.
+    let m = mem_frac.clamp(0.0, 1.0);
+    let r = (40.0 + 215.0 * m) as u8;
+    let g = (60.0 * (1.0 - m)) as u8;
+    let b = (200.0 * (1.0 - m)) as u8;
+    let color = Color::Rgb(r, g, b);
+
+    NodeVisual { cells, color, pulse: strain.clamp(0.0, 1.0) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +333,28 @@ mod tests {
         assert!(g.edges.contains(&(worker_id, tool)));
         assert!(!g.edges.iter().any(|&(a, b)| a == b));
         assert_eq!(g.edges.len(), 2);
+    }
+
+    #[test]
+    fn encode_size_is_monotonic_in_cpu() {
+        let lo = encode_node(0.0, 0.0, 0.0);
+        let mid = encode_node(0.5, 0.0, 0.0);
+        let hi = encode_node(1.0, 0.0, 0.0);
+        assert!(lo.cells >= 3, "min node stays legible");
+        assert!(mid.cells > lo.cells);
+        assert!(hi.cells > mid.cells);
+    }
+
+    #[test]
+    fn encode_heat_endpoints_differ() {
+        let cool = encode_node(0.0, 0.0, 0.0).color;
+        let hot = encode_node(0.0, 1.0, 0.0).color;
+        assert_ne!(cool, hot);
+    }
+
+    #[test]
+    fn encode_pulse_is_clamped() {
+        assert_eq!(encode_node(0.0, 0.0, -1.0).pulse, 0.0);
+        assert_eq!(encode_node(0.0, 0.0, 2.0).pulse, 1.0);
     }
 }
