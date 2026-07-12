@@ -13,6 +13,7 @@
 //       arrows      move focus
 //       Enter / +   dive into the focused node
 //       Esc / -     surface back to the overview
+//       space       pause / resume the sampling + animation clock
 
 use anyhow::Result;
 use crossterm::event::Event;
@@ -38,7 +39,8 @@ USAGE: constellation [--stall]
   --stall   drive the fake periodic-stall injector on startup
   -h,--help show this help
 
-KEYS: q/Ctrl-C quit; arrows move focus; Enter/+ dive; Esc/- surface\n";
+KEYS: q/Ctrl-C quit; arrows move focus; Enter/+ dive; Esc/- surface;
+      space pause/resume clock\n";
 
 /// Seconds for a full dive (zoom_t: 0 -> 1) or surface (1 -> 0) ease.
 const ZOOM_SECS: f32 = 0.3;
@@ -56,7 +58,8 @@ const SAMPLE_EVERY: f32 = 1.0;
 
 struct State {
     stall: bool,
-    t: f32, // seconds since start
+    paused: bool, // space toggles; while true, advance() freezes the clock
+    t: f32,       // seconds since start
     since_sample: f32,
     ids: CommIds,
     prev_cpu: HashMap<TileId, u64>, // last cumulative jiffies per node id
@@ -78,6 +81,7 @@ impl State {
     fn new(stall: bool) -> Self {
         let mut state = State {
             stall,
+            paused: false,
             t: 0.0,
             since_sample: 0.0,
             ids: CommIds::new(),
@@ -99,6 +103,13 @@ impl State {
     }
 
     fn advance(&mut self, dt: f32) {
+        if self.paused {
+            // Freeze the view entirely: no clock, no resample, no zoom
+            // easing. Dive/surface key presses still update zoom_goal (set
+            // directly by dive()/surface(), not here), so the intent is
+            // recorded and simply resumes easing once unpaused.
+            return;
+        }
         self.t += dt;
         self.since_sample += dt;
         if self.since_sample >= SAMPLE_EVERY {
@@ -368,16 +379,21 @@ impl State {
             self.render_zoom_overlay(buf, area, tid, &placed, &vp);
         }
 
-        // Corner readout: keep the injector state visible during the spike.
-        let msg = format!(
-            "constellation — t={:.1}s stall={} nodes={} strain={:.2} zoom={:.2}",
-            self.t,
-            self.stall,
-            self.cons.nodes.len(),
-            s,
-            self.zoom_t,
-        );
-        buf.set_string(area.x + 1, area.y, &msg, Style::default().fg(Color::White));
+        // HUD footer: node count, sample age (seconds since last resample),
+        // and — under --stall — the live injector intensity, so manual
+        // verification of the spike proof-goals is legible at a glance.
+        // Domain-agnostic: counts/seconds/numbers only, no product names.
+        let mut footer = format!("nodes={} age={:.1}s", self.cons.nodes.len(), self.since_sample);
+        if self.paused {
+            footer.push_str(" paused");
+        }
+        if self.stall {
+            footer.push_str(&format!(" intensity={s:.2}"));
+        }
+        if area.height > 0 {
+            let y = area.bottom().saturating_sub(1);
+            buf.set_string(area.x + 1, y, &footer, Style::default().fg(Color::White));
+        }
     }
 
     /// Draw the dived-into node's rect eased from its overview position toward
@@ -659,6 +675,7 @@ fn main() -> Result<()> {
                         KeyCode::Right => state.move_focus(ArrowDir::Right),
                         KeyCode::Enter | KeyCode::Char('+') | KeyCode::Char('=') => state.dive(),
                         KeyCode::Esc | KeyCode::Char('-') | KeyCode::Char('_') => state.surface(),
+                        KeyCode::Char(' ') => state.paused = !state.paused,
                         _ => {}
                     }
                 }

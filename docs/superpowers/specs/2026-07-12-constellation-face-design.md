@@ -162,3 +162,57 @@ After the spike, we can answer one question with a felt, not theoretical, answer
 aerie?** If yes, the follow-on work is real contention edges, the scope axis
 (fleet/Proxmox/kube populating the top layer), and wiring the real Instruments readout
 into bedrock. If no, we learned it cheaply and the shipping binary was never touched.
+
+## Spike findings (2026-07-13)
+
+Tasks 1–10 are implemented and committed. Unit tests (11) cover the pure logic:
+`/proc` parsing, comm aggregation/edges, size/heat/pulse encoding, the injector's
+intensity curve, and layout stability across identical frames. The four proof-goals
+below, however, assess *felt* quality at a live terminal and cannot be answered from
+a non-interactive environment — this section is a template for the human running the
+spike to fill in after an actual session.
+
+To run the spike:
+
+```bash
+cargo run --bin constellation          # calm path — no injector
+cargo run --bin constellation -- --stall   # stall arc — weather/materialize/bedrock
+```
+
+Controls: `↑↓←→` move focus · `Enter` / `+` dive into the focused node ·
+`Esc` / `-` surface back to the overview · `space` pause/resume the sampling +
+animation clock · `q` / `Ctrl-C` quit. The footer line shows node count, seconds
+since the last resample, and (under `--stall`) the injector's live intensity value.
+
+### 1. Semantic zoom feels continuous & oriented
+
+Dive (`Enter`/`+`) and surface (`Esc`/`-`) should land you back where you left off,
+not lost.
+
+_(awaiting live-terminal verification)_
+
+### 2. Layout stable under live churn
+
+Start or stop a process (e.g. `sleep 30 &`, or open/close a program) while the
+constellation is running; existing nodes should hold their position while the new
+one appears elsewhere.
+
+_(awaiting live-terminal verification)_
+
+### 3. Nodes readable at a glance
+
+You should be able to read "who's busy / who's big" off node size (CPU) and heat
+(memory) alone, without a bar chart or numeric readout.
+
+_(awaiting live-terminal verification)_
+
+### 4. Stall arc reads as one gesture
+
+Under `--stall`, the sequence — notice the weather (wash + rim pulse) → follow it to
+the materializing culprit node (hot overlay edges) → dive for the bedrock proof
+(latency timeline) — should read as one continuous gesture, not three disconnected
+effects.
+
+_(awaiting live-terminal verification)_
+
+**Recommendation:** _(pending human verdict)_
