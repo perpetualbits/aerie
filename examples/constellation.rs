@@ -115,14 +115,14 @@ fn parse_stat(line: &str) -> Option<ProcStat> {
     let pid: u32 = line[..open].trim().parse().ok()?;
     let comm = line[open + 1..close].to_string();
     // Remainder starts at field 3 (state). 0-based within remainder:
-    //   state=0, ppid=1, ... utime=10, stime=11
+    //   state=0, ppid=1, ... utime=11, stime=12
     let rest: Vec<&str> = line[close + 1..].split_whitespace().collect();
-    if rest.len() < 12 {
+    if rest.len() < 13 {
         return None;
     }
     let ppid: u32 = rest[1].parse().ok()?;
-    let utime: u64 = rest[10].parse().ok()?;
-    let stime: u64 = rest[11].parse().ok()?;
+    let utime: u64 = rest[11].parse().ok()?;
+    let stime: u64 = rest[12].parse().ok()?;
     Some(ProcStat { pid, ppid, comm, cpu_jiffies: utime + stime })
 }
 
@@ -176,7 +176,7 @@ mod tests {
     fn parses_stat_with_parens_in_comm() {
         // Real-shaped line: comm "(a b)c" contains spaces and parens.
         // fields: 1 pid, 2 comm, 3 state, 4 ppid, ... 14 utime, 15 stime
-        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 40 60 0 0 20 0 1 0";
+        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 0 40 60 0 0 20 0 1 0";
         let s = parse_stat(line).expect("should parse");
         assert_eq!(s.pid, 1234);
         assert_eq!(s.ppid, 1000);
