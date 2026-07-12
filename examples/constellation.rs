@@ -310,6 +310,12 @@ impl State {
                 let vis = encode_node(cpu, mem, strain);
                 let is_focus = self.zoom_target.is_none() && self.focus == Some(*id);
                 let color = dim_color(vis.color, dim_amt);
+                // Task 9 fix: consume `vis.pulse` (0 for every node except the
+                // stall culprit under --stall) to blend the border toward a
+                // hot hue, so the culprit itself visibly breathes on the
+                // stall clock — not just the map-wide wash/rim. At pulse=0
+                // this is a no-op: blend_color returns `color` unchanged.
+                let border_color = blend_color(color, Color::Rgb(230, 80, 60), vis.pulse);
                 draw_box(
                     buf,
                     screen,
@@ -317,7 +323,7 @@ impl State {
                     &BorderStyle {
                         weight: if is_focus { LineWeight::Heavy } else { LineWeight::Light },
                         corners: CornerStyle::Rounded,
-                        style: Style::default().fg(if is_focus { Color::White } else { color }),
+                        style: Style::default().fg(if is_focus { Color::White } else { border_color }),
                     },
                 );
                 // Neutral label: the comm, elided to the box interior.
@@ -548,6 +554,26 @@ fn dim_color(c: Color, amt: f32) -> Color {
             Color::Rgb((r as f32 * f) as u8, (g as f32 * f) as u8, (b as f32 * f) as u8)
         }
         other => other,
+    }
+}
+
+/// Blend color `a` toward color `b` by fraction `t` in `[0, 1]` — used to make
+/// the stall culprit's border breathe toward a hot hue proportional to its
+/// pulse. `t <= 0` returns `a` untouched (byte-identical), so callers that
+/// pass a real `0.0` pulse for every non-culprit node see no change at all.
+/// If `a` isn't an `Rgb` color and `t > 0`, falls back to `b` directly since
+/// there are no channels to lerp.
+fn blend_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return a;
+    }
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+            Color::Rgb(lerp(ar, br), lerp(ag, bg), lerp(ab, bb))
+        }
+        _ => b,
     }
 }
 
