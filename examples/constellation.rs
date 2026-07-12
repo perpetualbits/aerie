@@ -15,6 +15,7 @@ use anyhow::Result;
 use crossterm::event::Event;
 use mullion::backend::CrosstermBackend;
 use mullion::capabilities::Capabilities;
+use mullion::ease::gaussian;
 use mullion::input::{KeyCode, KeyModifiers};
 use mullion::layout::TileId;
 use mullion::style::{Color, Style};
@@ -264,6 +265,28 @@ fn encode_node(cpu_frac: f32, mem_frac: f32, strain: f32) -> NodeVisual {
     NodeVisual { cells, color, pulse: strain.clamp(0.0, 1.0) }
 }
 
+struct Injector {
+    period_s: f32,
+    sigma: f32,
+    culprit: Option<TileId>,
+}
+
+impl Injector {
+    fn new() -> Self {
+        Injector { period_s: 3.0, sigma: 0.10, culprit: None }
+    }
+
+    fn intensity(&self, t_s: f32) -> f32 {
+        if self.period_s <= 0.0 {
+            return 0.0;
+        }
+        // phase in 0..1, distance to nearest whole period (wrap-aware).
+        let phase = (t_s / self.period_s).fract();
+        let d = phase.min(1.0 - phase); // 0 at a peak, 0.5 at the trough
+        gaussian(d, self.sigma).clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +379,23 @@ mod tests {
     fn encode_pulse_is_clamped() {
         assert_eq!(encode_node(0.0, 0.0, -1.0).pulse, 0.0);
         assert_eq!(encode_node(0.0, 0.0, 2.0).pulse, 1.0);
+    }
+
+    #[test]
+    fn injector_peaks_on_period() {
+        let inj = Injector::new(); // period 3s
+        let at_peak = inj.intensity(6.0);   // exact multiple
+        let between = inj.intensity(7.5);    // half a period away
+        assert!(at_peak > 0.9, "peak near a multiple of the period");
+        assert!(between < 0.1, "quiet between peaks");
+    }
+
+    #[test]
+    fn injector_intensity_in_unit_range() {
+        let inj = Injector::new();
+        for i in 0..200 {
+            let v = inj.intensity(i as f32 * 0.05);
+            assert!((0.0..=1.0).contains(&v));
+        }
     }
 }
