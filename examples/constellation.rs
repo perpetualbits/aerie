@@ -4,11 +4,16 @@
 //
 // Live /proc process-groups become nodes in one semantically-zoomable graph:
 // backbone edges are lineage (parent comm -> child comm), node size = CPU,
-// heat = memory, pulse = strain. A --stall injector fakes a periodic system
-// stall so we can feel the notice -> materialize -> dive arc before wiring the
-// real Instruments subsystem. Standalone: mullion + crossterm only.
+// heat = memory, pulse = strain. By default the pulse/banner/culprit are
+// driven by a REAL stall detector (`mod detect`: a background latency probe +
+// PSI + periodicity/offender analysis) — the map only ever shows a red stall
+// banner when a real stall is actually detected; otherwise a quiet
+// "monitoring" status. Pass `--demo` to drive the same visuals from a
+// synthetic periodic-stall injector instead (clearly labeled DEMO), useful
+// when there's no real stall around to feel the notice -> materialize -> dive
+// arc. Standalone: mullion + crossterm only.
 //
-// Run:  cargo run --bin constellation [--stall]
+// Run:  cargo run --bin constellation [--demo]
 // Keys: q / Ctrl-C  quit
 //       arrows      move focus
 //       Enter / + / = dive into the focused node
@@ -35,9 +40,15 @@ const FRAME: Duration = Duration::from_millis(33); // ~30 fps
 const HELP: &str = "\
 constellation — aerie unifying-face spike
 
-USAGE: constellation [--stall]
-  --stall   drive the fake periodic-stall injector on startup
+USAGE: constellation [--demo]
+  --demo    drive a synthetic periodic-stall injector instead of the real
+            detector; the banner reads DEMO so it's never mistaken for a
+            real detection
   -h,--help show this help
+
+Default (no flag): real stall detection — a background latency probe + PSI
++ periodicity/offender analysis. Shows a red stall banner only when a real
+stall is detected; otherwise a quiet monitoring status.
 
 KEYS: q/Ctrl-C quit; arrows move focus; Enter/+/= dive; Esc/-/_ surface;
       space pause/resume clock\n";
@@ -67,20 +78,48 @@ const SAMPLE_EVERY: f32 = 1.0;
 /// crowd — still comfortably under the render budget.
 const MAX_NODES: usize = 12;
 
+/// How long (in `t` seconds) a detected stall stays displayed after the
+/// probe's reading momentarily drops below the active threshold — a single
+/// quiet sample shouldn't flicker the whole readout off (brief item 3).
+const STALL_HOLD_SECS: f32 = 1.5;
+
+/// Time constant for easing the shown weather pulse toward the cached real
+/// report's `pulse` between resamples, so a once-a-second report update
+/// doesn't read as a jerky step function.
+const PULSE_EASE_TAU: f32 = 0.4;
+
 struct State {
-    stall: bool,
+    demo: bool,   // --demo: synthetic injector, clearly labeled, instead of real detection
     paused: bool, // space toggles; while true, advance() freezes the clock
     t: f32,       // seconds since start
     since_sample: f32,
     ids: CommIds,
     prev_cpu: HashMap<TileId, u64>, // last cumulative jiffies per node id
     prev_io: HashMap<TileId, u64>,  // last cumulative blkio ticks per node id
+    prev_cpu_by_comm: HashMap<String, u64>, // last cumulative jiffies per comm, uncapped (feeds the detector)
     cons: Constellation,
     canvas: GraphCanvas,
     cpu_frac: HashMap<TileId, f32>, // per-frame normalized deltas
     mem_frac: HashMap<TileId, f32>,
     io_frac: HashMap<TileId, f32>, // per-frame normalized blkio (disk-wait) deltas
     injector: Injector,
+    // Iteration 4b: the real detector (`None` under --demo). Spawned once in
+    // `main` before entering the TUI; `epoch` is the single `Instant` shared
+    // between its latency-probe clock and every `now_secs` we pass it, so the
+    // probe's own sample timestamps and our window queries stay aligned.
+    detector: Option<detect::Detector>,
+    epoch: Instant,
+    cached_report: Option<detect::DetectionReport>, // latest raw report (recomputed only on resample)
+    pulse_shown: f32,                                // eased weather pulse, real mode only
+    // Honest, held (hysteresis) display state — updated on resample, kept
+    // through a short `STALL_HOLD_SECS` dip so a single quiet sample doesn't
+    // flicker the banner/flare/culprit off.
+    held_active: bool,
+    held_resource: Option<Resource>,
+    held_period_s: Option<f32>,
+    held_culprit_comm: Option<String>,
+    held_culprit_id: Option<TileId>,
+    last_active_at: Option<f32>,
     // Task 8: semantic zoom (dive/surface) + spatial breadcrumb.
     last_samples: Vec<ProcSample>, // for the interior fallback (member PIDs)
     last_area: Rect,               // most recent screen area rendered into
@@ -91,21 +130,32 @@ struct State {
 }
 
 impl State {
-    fn new(stall: bool) -> Self {
+    fn new(demo: bool, detector: Option<detect::Detector>, epoch: Instant) -> Self {
         let mut state = State {
-            stall,
+            demo,
             paused: false,
             t: 0.0,
             since_sample: 0.0,
             ids: CommIds::new(),
             prev_cpu: HashMap::new(),
             prev_io: HashMap::new(),
+            prev_cpu_by_comm: HashMap::new(),
             cons: Constellation { nodes: Vec::new(), edges: Vec::new() },
             canvas: GraphCanvas::new(1, 1),
             cpu_frac: HashMap::new(),
             mem_frac: HashMap::new(),
             io_frac: HashMap::new(),
             injector: Injector::new(),
+            detector,
+            epoch,
+            cached_report: None,
+            pulse_shown: 0.0,
+            held_active: false,
+            held_resource: None,
+            held_period_s: None,
+            held_culprit_comm: None,
+            held_culprit_id: None,
+            last_active_at: None,
             last_samples: Vec::new(),
             last_area: Rect::new(0, 0, 80, 24),
             focus: None,
@@ -115,6 +165,24 @@ impl State {
         };
         state.resample(); // populate the first frame immediately
         state
+    }
+
+    /// Whether the stall visuals (banner/flare/wash/dim) should be "on" this
+    /// frame: always true under `--demo` (the synthetic clock never stops),
+    /// else the held (hysteresis) real-detection active flag.
+    fn stall_on(&self) -> bool {
+        self.demo || self.held_active
+    }
+
+    /// The node currently playing "culprit": the injector's pinned node under
+    /// `--demo`, else the real detector's held culprit mapped to a shown node
+    /// id (see `force_include_culprit`).
+    fn culprit(&self) -> Option<TileId> {
+        if self.demo {
+            self.injector.culprit
+        } else {
+            self.held_culprit_id
+        }
     }
 
     fn advance(&mut self, dt: f32) {
@@ -129,6 +197,16 @@ impl State {
         self.since_sample += dt;
         if self.since_sample >= SAMPLE_EVERY {
             self.resample();
+        }
+
+        // Ease the shown weather pulse toward the cached real report's pulse
+        // every frame (not just on resample) so it breathes smoothly rather
+        // than stepping once a second. No-op under --demo, which drives its
+        // pulse straight from the continuous injector formula instead.
+        if !self.demo {
+            let target = self.cached_report.as_ref().map(|r| r.pulse).unwrap_or(0.0);
+            let k = (dt / PULSE_EASE_TAU).clamp(0.0, 1.0);
+            self.pulse_shown += (target - self.pulse_shown) * k;
         }
 
         // Ease zoom_t toward zoom_goal over ~ZOOM_SECS, in either direction.
@@ -147,12 +225,13 @@ impl State {
     }
 
     /// The node the viewport should be panned to keep on-screen: the stall
-    /// culprit under `--stall`, else the focused node, else the
-    /// highest-significance (first, since `cons.nodes` is kept sorted) node
-    /// so startup lands on content rather than an empty canvas corner.
+    /// culprit while a stall is on-screen (real or `--demo`), else the
+    /// focused node, else the highest-significance (first, since
+    /// `cons.nodes` is kept sorted) node so startup lands on content rather
+    /// than an empty canvas corner.
     fn pan_target(&self) -> Option<TileId> {
-        if self.stall {
-            self.injector.culprit
+        if self.stall_on() {
+            self.culprit().or(self.focus).or_else(|| self.cons.nodes.first().map(|n| n.id))
         } else if let Some(f) = self.focus {
             Some(f)
         } else {
@@ -233,8 +312,7 @@ impl State {
 
     fn resample(&mut self) {
         let samples = sample_procs();
-        let cons = build_graph(&samples, &mut self.ids);
-        self.last_samples = samples; // kept for the Task 8 interior fallback
+        let mut cons = build_graph(&samples, &mut self.ids);
 
         // CPU deltas vs previous cumulative jiffies.
         let mut deltas: HashMap<TileId, u64> = HashMap::new();
@@ -244,14 +322,14 @@ impl State {
         }
         self.prev_cpu = cons.nodes.iter().map(|n| (n.id, n.cpu_jiffies)).collect();
 
-        // Task 9: under --stall, pin the injector's culprit to a real, stable
+        // Task 9: under --demo, pin the injector's culprit to a real, stable
         // app node the first time we see one — the SHOWN node (kernel threads
         // already excluded in build_graph) with the highest cumulative
         // cpu_jiffies, so it reads as a believable, recognizable culprit
         // rather than an arbitrary first-frame pick. Re-elect only if that
         // comm's process disappears out from under us later. A no-op when
-        // --stall is off, so the calm (Task 8) path is unaffected.
-        if self.stall {
+        // --demo is off, so the real-detection path below is unaffected.
+        if self.demo {
             if let Some(cid) = self.injector.culprit {
                 if !cons.nodes.iter().any(|n| n.id == cid) {
                     self.injector.culprit = None;
@@ -261,6 +339,60 @@ impl State {
                 self.injector.culprit = cons.nodes.iter().max_by_key(|n| n.cpu_jiffies).map(|n| n.id);
             }
         }
+
+        // Iteration 4b: feed the real detector this resample's per-comm CPU
+        // deltas — UNCAPPED (every comm this sample saw), not just the
+        // MAX_NODES currently shown, so a periodic offender outside the
+        // top-12 can still be identified and then forced on-screen below.
+        if let Some(detector) = &mut self.detector {
+            let comm_cpu = cpu_by_comm(&samples);
+            let group_cpu_deltas: Vec<(String, u64)> = comm_cpu
+                .iter()
+                .map(|(comm, &total)| {
+                    let prev = self.prev_cpu_by_comm.get(comm).copied().unwrap_or(total);
+                    (comm.clone(), total.saturating_sub(prev))
+                })
+                .collect();
+            self.prev_cpu_by_comm = comm_cpu;
+
+            let now_secs = self.epoch.elapsed().as_secs_f64();
+            detector.observe(now_secs, &group_cpu_deltas);
+            let report = detector.report(now_secs);
+
+            // Hold (hysteresis): only refresh the displayed active/resource/
+            // period/culprit while genuinely active, or within a short hold
+            // window after the last active reading — a single quiet sample
+            // must not flicker the whole readout off (brief item 3).
+            if report.active {
+                self.held_active = true;
+                self.last_active_at = Some(self.t);
+                self.held_resource = report.resource;
+                self.held_period_s = report.period_s;
+                self.held_culprit_comm = report.culprit_comm.clone();
+            } else if !(self.held_active
+                && self.last_active_at.is_some_and(|at| self.t - at < STALL_HOLD_SECS))
+            {
+                self.held_active = false;
+                self.held_resource = None;
+                self.held_period_s = None;
+                self.held_culprit_comm = None;
+            }
+
+            // Force-include: if the held culprit isn't among the shown
+            // top-12 nodes, swap it in so it's visible, can flare, and can
+            // be dived (same principle as the earlier culprit-on-screen fix).
+            if let Some(name) = self.held_culprit_comm.clone() {
+                force_include_culprit(&mut cons, &mut self.ids, &samples, &name);
+            }
+            self.held_culprit_id = self
+                .held_culprit_comm
+                .as_deref()
+                .and_then(|name| cons.nodes.iter().find(|n| n.comm == name).map(|n| n.id));
+
+            self.cached_report = Some(report);
+        }
+
+        self.last_samples = samples; // kept for the Task 8 interior fallback
 
         let dmax = deltas.values().copied().max().unwrap_or(1).max(1);
         let mmax = cons.nodes.iter().map(|n| n.rss_pages).max().unwrap_or(1).max(1);
@@ -334,23 +466,30 @@ impl State {
         // surface, so there is no visible pop when the overlay first appears.
         let dim_amt = if self.zoom_target.is_some() { smoothstep(self.zoom_t.clamp(0.0, 1.0)) } else { 0.0 };
 
-        // Task 9: the injector's stall pulse, 0..1, peaking every period_s.
-        // Only ever fed to visuals when `self.stall` is set — with it off the
-        // map stays exactly as calm as it was at the end of Task 8.
-        let s = self.injector.intensity(self.t);
+        // Iteration 4b: `s` is the weather pulse driving every stall visual,
+        // 0..1. Under `--demo` it's the continuous synthetic injector
+        // formula; by default it's the real detector's cached report pulse,
+        // eased frame-to-frame by `advance` (see `pulse_shown`) since the
+        // report itself is only recomputed once a resample.
+        let s = if self.demo { self.injector.intensity(self.t) } else { self.pulse_shown };
+        // `stall_on`: whether the stall visuals are "on" this frame at all —
+        // always true under `--demo`, else the held (hysteresis) real
+        // detection active flag. With it off the map stays exactly as calm
+        // as it was at the end of Task 8.
+        let stall_on = self.stall_on();
 
         // FOLLOW: how hard to dim every non-culprit node/edge toward
         // near-black this frame. Zero below s=0.35 and rising continuously to
         // 1.0 at a pulse peak — the zero-crossing at the threshold means
         // there's no pop where the effect switches on, only the smooth ramp
-        // `s` already gives. Never set when --stall is off.
-        let stall_dim = if self.stall { ((s - 0.35) / 0.65).clamp(0.0, 1.0) } else { 0.0 };
+        // `s` already gives. Never set when no stall is on-screen.
+        let stall_dim = if stall_on { ((s - 0.35) / 0.65).clamp(0.0, 1.0) } else { 0.0 };
 
         // Weather: a faint full-screen wash + perimeter rim, both scaled by
         // `s`, so the whole map visibly breathes on the stall clock. Drawn
         // before edges/nodes so it reads as background, not an overlay on
         // top of them.
-        if self.stall {
+        if stall_on {
             let wash = Color::Rgb((25.0 * s) as u8, (10.0 * s) as u8, (10.0 * s) as u8);
             buf.fill(area, Cell::new(" ", Style::default().bg(wash)));
             let rim_col =
@@ -377,7 +516,7 @@ impl State {
         // the whole duration (not just at a pulse peak), so they don't add
         // to the tangle while the culprit's resource star (below) is meant
         // to be the only thing competing for ink.
-        let backbone_dim = if self.stall { stall_dim.max(0.6) } else { stall_dim };
+        let backbone_dim = if stall_on { stall_dim.max(0.6) } else { stall_dim };
         render_edges(
             buf,
             &placed,
@@ -396,7 +535,7 @@ impl State {
         // are the culprit's own hot star below, so the stall view reads as a
         // clean hub-and-spoke instead of a tangle (item 2).
         let node_ids: Vec<TileId> = self.cons.nodes.iter().map(|n| n.id).collect();
-        if !self.stall {
+        if !stall_on {
             let contention = contention_edges(&node_ids, &self.cpu_frac, &self.mem_frac, &self.io_frac);
             let mut activity = [
                 (Resource::Cpu, resource_activity(&node_ids, &self.cpu_frac)),
@@ -436,9 +575,19 @@ impl State {
         // flares whenever the culprit has any qualifying partner on its
         // dominant axis, independent of whether the culprit happens to also
         // be that axis's top-ranked node overall.
-        if self.stall && s > 0.5 {
-            if let Some(cid) = self.injector.culprit {
-                let dom = dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+        if stall_on && s > 0.5 {
+            if let Some(cid) = self.culprit() {
+                // Prefer the real detector's own held resource reading when
+                // we have one (item 4: "use the REAL report values"); fall
+                // back to the frac-derived dominant axis under --demo or
+                // when the resource is momentarily unattributed.
+                let dom = if !self.demo {
+                    self.held_resource.unwrap_or_else(|| {
+                        dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac)
+                    })
+                } else {
+                    dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac)
+                };
                 let frac = match dom {
                     Resource::Cpu => &self.cpu_frac,
                     Resource::Mem => &self.mem_frac,
@@ -456,17 +605,19 @@ impl State {
         // Nodes (boxes), drawn after every edge set so a box's fill/outline
         // always sits on top of a routed wire rather than being crossed by
         // one (item 5).
+        let culprit_id = self.culprit();
         for (id, crect) in &placed {
             if let Some(screen) = vp.project(*crect) {
                 let cpu = self.cpu_frac.get(id).copied().unwrap_or(0.0);
                 let mem = self.mem_frac.get(id).copied().unwrap_or(0.0);
-                // Task 9: only the stall culprit pulses, and only under
-                // --stall; every other node (and every node when --stall is
-                // off) gets zero strain, same as the Task-7 placeholder.
-                let strain = if self.stall && self.injector.culprit == Some(*id) { s } else { 0.0 };
+                // Task 9: only the stall culprit pulses, and only while a
+                // stall is on-screen; every other node (and every node when
+                // no stall is on-screen) gets zero strain, same as the
+                // Task-7 placeholder.
+                let strain = if stall_on && culprit_id == Some(*id) { s } else { 0.0 };
                 let vis = encode_node(cpu, mem, strain);
                 let is_focus = self.zoom_target.is_none() && self.focus == Some(*id);
-                let is_culprit = self.stall && self.injector.culprit == Some(*id);
+                let is_culprit = stall_on && culprit_id == Some(*id);
                 // FOLLOW: every node except the culprit recedes toward
                 // near-black on the stall clock, so at a pulse peak the eye
                 // has nowhere else to go. The culprit is exempt here — its
@@ -515,48 +666,76 @@ impl State {
         // to "what do I do with this". Spans the top rim row; brightness
         // scales with the pulse so it, too, breathes on the stall clock.
         // Domain-agnostic: period/clock + resource-category language only.
-        // The named resource is the culprit's own dominant axis: whichever
-        // of cpu/mem/disk it's currently heaviest on. Drawn after every edge
-        // and box this frame (item 5) so a routed wire can never paint over
-        // it.
-        if self.stall {
-            let contended = self
-                .injector
-                .culprit
-                .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
-                .unwrap_or(Resource::Cpu);
-            let banner = format!(
-                "⚠ stall detected — contention on {} — acting on a ~{:.1}s clock",
-                resource_label(contended),
-                self.injector.period_s
-            );
+        // Drawn after every edge and box this frame (item 5) so a routed
+        // wire can never paint over it. Honest states (item 3): a red banner
+        // ONLY while a stall is on-screen; otherwise (real mode only) a
+        // quiet, non-alarming monitoring status — never a red banner when
+        // the real probe hasn't detected anything.
+        if stall_on {
+            let banner = if self.demo {
+                let contended = self
+                    .injector
+                    .culprit
+                    .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
+                    .unwrap_or(Resource::Cpu);
+                format!(
+                    "⚠ DEMO stall (synthetic) — contention on {} — acting on a ~{:.1}s clock",
+                    resource_label(contended),
+                    self.injector.period_s
+                )
+            } else {
+                let mut b = String::from("⚠ stall detected");
+                if let Some(r) = self.held_resource {
+                    b.push_str(&format!(" — contention on {}", resource_label(r)));
+                }
+                match self.held_period_s {
+                    Some(p) => b.push_str(&format!(" — ~{p:.1}s clock")),
+                    None => b.push_str(" — irregular"),
+                }
+                if self.held_culprit_comm.is_none() {
+                    b.push_str(" — unattributed");
+                }
+                b
+            };
             if area.width as usize > banner.chars().count() {
                 let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
                 let x = area.x + (area.width - banner.chars().count() as u16) / 2;
                 buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
             }
+        } else if !self.demo {
+            // Calm (real mode only): honest default on a healthy system —
+            // quiet, no red, but still legible that monitoring is live and
+            // shows the probe's current peak so "nothing to see" is
+            // distinguishable from "not running".
+            let peak = self.cached_report.as_ref().map(|r| r.magnitude_ms).unwrap_or(0.0);
+            let status = format!("monitoring — no stall detected (peak {peak:.0}ms)");
+            if area.width as usize > status.chars().count() {
+                let x = area.x + (area.width - status.chars().count() as u16) / 2;
+                buf.set_string(x, area.y, &status, Style::default().fg(Color::Gray));
+            }
         }
 
-        // Legibility baseline (both modes): the focused (or, under --stall,
-        // culprit) node gets a full readout — its whole comm plus live
-        // cpu%/mem% — since its box label is elided to a 2-char stump at
+        // Legibility baseline (both modes): the focused (or, while a stall is
+        // on-screen, culprit) node gets a full readout — its whole comm plus
+        // live cpu%/mem% — since its box label is elided to a 2-char stump at
         // small sizes. A header line at top-left, one row below the rim.
-        // Under `--stall` this line also carries the dive invitation (item
-        // 4): appended here instead of drawn under the culprit box, it's
-        // permanently out of the edge band, so no routed wire can ever clip
-        // it. Drawn last (after nodes/edges) so routed wires never paint
-        // over it, and only in the overview (the dive overlay has its own
-        // title_line once zoomed in).
+        // While a stall is on-screen this line also carries the dive
+        // invitation (item 4): appended here instead of drawn under the
+        // culprit box, it's permanently out of the edge band, so no routed
+        // wire can ever clip it. Drawn last (after nodes/edges) so routed
+        // wires never paint over it, and only in the overview (the dive
+        // overlay has its own title_line once zoomed in).
         if self.zoom_target.is_none() {
-            // Under --stall, the culprit takes priority over plain focus so
-            // its full comm/cpu/mem readout is always on-screen — the
-            // "unmistakable" requirement doesn't stop at the border color.
-            let readout_id = if self.stall { self.injector.culprit.or(self.focus) } else { self.focus };
+            // While a stall is on-screen, the culprit takes priority over
+            // plain focus so its full comm/cpu/mem readout is always
+            // on-screen — the "unmistakable" requirement doesn't stop at the
+            // border color.
+            let readout_id = if stall_on { culprit_id.or(self.focus) } else { self.focus };
             if let Some(readout_id) = readout_id {
                 if let Some(n) = self.cons.nodes.iter().find(|n| n.id == readout_id) {
                     let cpu = self.cpu_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
                     let mem = self.mem_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
-                    let is_readout_culprit = self.stall && self.injector.culprit == Some(readout_id);
+                    let is_readout_culprit = stall_on && culprit_id == Some(readout_id);
                     let tag = if is_readout_culprit { " [culprit]" } else { "" };
                     let dive_hint = if is_readout_culprit { "   ↵ dive to inspect" } else { "" };
                     let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%{dive_hint}", n.comm);
@@ -574,14 +753,15 @@ impl State {
         }
 
         // HUD footer: node count, sample age (seconds since last resample),
-        // and — under --stall — the live injector intensity, so manual
-        // verification of the spike proof-goals is legible at a glance.
-        // Domain-agnostic: counts/seconds/numbers only, no product names.
+        // and — while a stall is on-screen — the live pulse intensity, so
+        // manual verification of the spike proof-goals is legible at a
+        // glance. Domain-agnostic: counts/seconds/numbers only, no product
+        // names.
         let mut footer = format!("nodes={} age={:.1}s", self.cons.nodes.len(), self.since_sample);
         if self.paused {
             footer.push_str(" paused");
         }
-        if self.stall {
+        if stall_on {
             footer.push_str(&format!(" intensity={s:.2}"));
         }
         // Legibility baseline (both modes): a one-line legend so the visual
@@ -641,8 +821,10 @@ impl State {
                 self.render_interior(buf, grown, tid, comm, members);
                 title_line(buf, grown, &format!(" {comm} "), Color::Cyan);
                 // Bedrock: diving into the stall culprit itself, at Full LoD,
-                // reveals the injected latency timeline underneath its interior.
-                if self.stall && self.injector.culprit == Some(tid) {
+                // reveals the latency timeline underneath its interior — the
+                // real detector's overshoot series by default, or the
+                // synthetic injector's own pulse train under --demo.
+                if self.stall_on() && self.culprit() == Some(tid) {
                     self.render_stall_timeline(buf, grown);
                 }
             }
@@ -723,11 +905,23 @@ impl State {
     }
 
     /// Bedrock: a bottom strip inside the culprit's `Lod::Full` rect, rendered
-    /// as a latency timeline — the injector's own pulse train swept across a
-    /// small time window via `Field::render_braille`, so the peaks the map has
-    /// been breathing to are visible as a trace. Labeled only in neutral
-    /// period-seconds terms; no product names or remediation hints.
+    /// as a latency timeline via `Field::render_braille`. Dispatches to the
+    /// real detector's own overshoot series by default, or the synthetic
+    /// injector's pulse train under `--demo` (item 4/5: no synthetic values
+    /// mixed into the real story, and vice versa).
     fn render_stall_timeline(&self, buf: &mut Buffer, outer: Rect) {
+        if self.demo {
+            self.render_demo_timeline(buf, outer);
+        } else {
+            self.render_real_timeline(buf, outer);
+        }
+    }
+
+    /// `--demo` bedrock: the injector's own pulse train swept across a small
+    /// time window, so the peaks the map has been breathing to are visible
+    /// as a trace. Labeled only in neutral period-seconds terms; no product
+    /// names or remediation hints.
+    fn render_demo_timeline(&self, buf: &mut Buffer, outer: Rect) {
         let strip_h = 3u16.min(outer.height.saturating_sub(2));
         if outer.width < 12 || strip_h < 2 {
             return; // too small to show a timeline
@@ -785,6 +979,58 @@ impl State {
     /// of the story rather than an unrelated made-up number.
     fn duration_ms(&self) -> i64 {
         (self.injector.sigma * self.injector.period_s * 1000.0).round() as i64
+    }
+
+    /// Real bedrock (item 4): the detector's own recent `overshoot_series`
+    /// swept across the strip as a braille trace — no synthetic values. The
+    /// readout is `period {p:.1}s · magnitude {m:.0}ms` from the cached
+    /// report, or `irregular · magnitude {m:.0}ms` when there's no clear
+    /// period.
+    fn render_real_timeline(&self, buf: &mut Buffer, outer: Rect) {
+        let strip_h = 3u16.min(outer.height.saturating_sub(2));
+        if outer.width < 12 || strip_h < 2 {
+            return; // too small to show a timeline
+        }
+        let strip = Rect::new(
+            outer.x + 2,
+            outer.bottom().saturating_sub(strip_h + 1),
+            outer.width.saturating_sub(4),
+            strip_h,
+        );
+
+        let Some(report) = self.cached_report.as_ref() else { return };
+        let series = &report.overshoot_series;
+        if series.len() >= 2 {
+            let t0 = series[0].0;
+            let t1 = series[series.len() - 1].0;
+            let span = (t1 - t0).max(1e-3);
+            let max_ms = series.iter().map(|&(_, m)| m).fold(0.0f32, f32::max).max(1.0);
+            let field = Field::rect(strip);
+            field.render_braille(
+                buf,
+                |u, _v| {
+                    let target_t = t0 + u as f64 * span;
+                    // Nearest sample to this point in the swept window —
+                    // the series is irregularly spaced (probe ticks), so a
+                    // simple nearest-neighbour lookup is enough for a strip
+                    // a few dozen cells wide.
+                    let nearest = series.iter().min_by(|a, b| {
+                        (a.0 - target_t).abs().partial_cmp(&(b.0 - target_t).abs()).unwrap()
+                    });
+                    nearest.map(|&(_, m)| (m / max_ms).clamp(0.0, 1.0)).unwrap_or(0.0)
+                },
+                |mean| Style::default().fg(Color::Rgb((60.0 + 195.0 * mean) as u8, 90, 70)),
+            );
+        }
+
+        let readout = match report.period_s {
+            Some(p) => format!("period {p:.1}s · magnitude {:.0}ms", report.magnitude_ms),
+            None => format!("irregular · magnitude {:.0}ms", report.magnitude_ms),
+        };
+        let gap = strip.y.saturating_sub(outer.y + 1);
+        if gap >= 1 && (readout.len() as u16) < strip.width {
+            buf.set_string(strip.x, strip.y.saturating_sub(1), &readout, Style::default().fg(Color::Gray));
+        }
     }
 }
 
@@ -1015,15 +1261,89 @@ fn resource_activity(node_ids: &[TileId], frac: &HashMap<TileId, f32>) -> f32 {
     node_ids.iter().filter_map(|id| frac.get(id).copied()).filter(|&v| v > CONTENTION_THRESHOLD).sum()
 }
 
+/// Sum of `cpu_jiffies` per comm over EVERY sample this resample saw —
+/// deliberately uncapped (unlike `build_graph`'s MAX_NODES-limited nodes),
+/// so the real detector (iteration 4b) can be fed activity for comms that
+/// don't currently make the shown top-12, and still name one as the culprit.
+fn cpu_by_comm(samples: &[ProcSample]) -> HashMap<String, u64> {
+    let mut out: HashMap<String, u64> = HashMap::new();
+    for s in samples {
+        *out.entry(s.comm.clone()).or_insert(0) += s.cpu_jiffies;
+    }
+    out
+}
+
+/// Iteration 4b, item 2: if the real detector's culprit isn't among the
+/// shown (MAX_NODES-capped) nodes, force it on-screen so it's visible, can
+/// flare, and can be dived — same principle as the earlier "culprit must be
+/// on-screen" fix for the synthetic injector. Aggregates the culprit's own
+/// `GNode` straight from this resample's raw `samples` (same aggregation
+/// `build_graph` does internally), then either fills a free slot or swaps out
+/// the current lowest-significance node to keep the shown set at MAX_NODES.
+/// A no-op if the culprit is already shown, or if it vanished from this
+/// sample (its process(es) exited between the detector's analysis and now).
+fn force_include_culprit(cons: &mut Constellation, ids: &mut CommIds, samples: &[ProcSample], culprit_comm: &str) {
+    if cons.nodes.iter().any(|n| n.comm == culprit_comm) {
+        return; // already on-screen
+    }
+    let mut cpu_jiffies = 0u64;
+    let mut rss_pages = 0u64;
+    let mut blkio_ticks = 0u64;
+    let mut found = false;
+    for s in samples {
+        if s.comm == culprit_comm {
+            cpu_jiffies += s.cpu_jiffies;
+            rss_pages += s.rss_pages;
+            blkio_ticks += s.blkio_ticks;
+            found = true;
+        }
+    }
+    if !found {
+        return; // culprit's process(es) are gone this sample; nothing to force
+    }
+    let id = ids.id(culprit_comm);
+    let culprit_node = GNode { id, comm: culprit_comm.to_string(), cpu_jiffies, rss_pages, blkio_ticks };
+
+    if cons.nodes.len() < MAX_NODES {
+        cons.nodes.push(culprit_node);
+    } else {
+        // Swap out the current lowest-significance node (min cpu_jiffies,
+        // then min rss_pages as a tiebreak — the mirror of build_graph's own
+        // significance ordering) so the shown set stays at MAX_NODES.
+        let lo_idx = cons
+            .nodes
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.cpu_jiffies.cmp(&b.1.cpu_jiffies).then(a.1.rss_pages.cmp(&b.1.rss_pages)))
+            .map(|(i, _)| i)
+            .expect("cons.nodes is non-empty (len >= MAX_NODES > 0)");
+        cons.nodes[lo_idx] = culprit_node;
+    }
+    cons.nodes.sort_by_key(|n| n.id); // deterministic order for stable layout
+
+    // Drop any edges that no longer have both endpoints among the survivors
+    // (mirrors build_graph's own post-cap edge filter).
+    let survivors: HashSet<TileId> = cons.nodes.iter().map(|n| n.id).collect();
+    cons.edges.retain(|&(a, b)| survivors.contains(&a) && survivors.contains(&b));
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
         return Ok(());
     }
-    let stall = args.iter().any(|a| a == "--stall");
+    let demo = args.iter().any(|a| a == "--demo");
 
-    let mut state = State::new(stall);
+    // Iteration 4b: the real detector spawns its background latency-probe
+    // thread here, before entering the TUI, under a single shared `epoch` so
+    // its own sample timestamps and every `now_secs` we later pass it stay
+    // aligned. Skipped entirely under --demo, which drives its visuals from
+    // the synthetic injector instead.
+    let epoch = Instant::now();
+    let detector = if demo { None } else { Some(detect::Detector::spawn()) };
+
+    let mut state = State::new(demo, detector, epoch);
     let mut backend = CrosstermBackend::new(io::stdout());
     backend.apply_capabilities(&Capabilities::detect());
     let mut terminal = Terminal::new(backend)?;
@@ -1346,7 +1666,7 @@ impl Injector {
     }
 }
 
-// ── Detector: a real, self-contained stall detector (Iteration 4a) ─────────
+// ── Detector: a real, self-contained stall detector (Iteration 4a/4b) ──────
 //
 // Ported (not imported — this example is standalone and cannot `use
 // crate::diag`) from aerie's `src/diag.rs`: `LatencyProbe` (a background
@@ -1354,12 +1674,13 @@ impl Injector {
 // autocorrelation/DFT periodicity analyzer, and a simplified periodic-
 // offender attributor built on the same analyzer.
 //
-// This task (4a) builds and unit-tests the detection core and exposes the
-// `Detector`/`DetectionReport` interface; it is NOT wired into `main`'s loop
-// or the render path yet (that's 4b). Nothing in this module is called from
-// `main`, so the whole cluster is unreachable dead code for now — hence the
-// blanket `#[allow(dead_code)]` on the module, per the brief.
-#[allow(dead_code)]
+// Iteration 4a built and unit-tested the detection core (`Detector` /
+// `DetectionReport`); iteration 4b wires it into `main`'s loop and the
+// render path (see `State::detector`/`resample`/`render`), so the module is
+// no longer dead code and no longer carries a blanket allow. The one
+// remaining genuinely-unused pair of fields (`Periodicity::freq_lo`/`freq_hi`,
+// echoed from the analysis config for a spectrum display this example never
+// draws) keeps its own narrow `#[allow(dead_code)]` instead.
 mod detect {
     use super::Resource;
     use std::collections::{HashMap, VecDeque};
@@ -1523,7 +1844,13 @@ mod detect {
         pub freq_hz: Option<f64>,
         pub confidence: f32,
         pub spectrum: Vec<f32>,
+        // Echoed from the analysis config for a would-be spectrum display
+        // (axis labeling); this example never renders `spectrum`, so these
+        // two are legitimately write-only here — narrow allow rather than
+        // the whole module losing dead-code visibility for it.
+        #[allow(dead_code)]
         pub freq_lo: f64,
+        #[allow(dead_code)]
         pub freq_hi: f64,
         pub bin_dt: f64,
     }
