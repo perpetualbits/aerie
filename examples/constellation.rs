@@ -74,10 +74,12 @@ struct State {
     since_sample: f32,
     ids: CommIds,
     prev_cpu: HashMap<TileId, u64>, // last cumulative jiffies per node id
+    prev_io: HashMap<TileId, u64>,  // last cumulative blkio ticks per node id
     cons: Constellation,
     canvas: GraphCanvas,
     cpu_frac: HashMap<TileId, f32>, // per-frame normalized deltas
     mem_frac: HashMap<TileId, f32>,
+    io_frac: HashMap<TileId, f32>, // per-frame normalized blkio (disk-wait) deltas
     injector: Injector,
     // Task 8: semantic zoom (dive/surface) + spatial breadcrumb.
     last_samples: Vec<ProcSample>, // for the interior fallback (member PIDs)
@@ -97,10 +99,12 @@ impl State {
             since_sample: 0.0,
             ids: CommIds::new(),
             prev_cpu: HashMap::new(),
+            prev_io: HashMap::new(),
             cons: Constellation { nodes: Vec::new(), edges: Vec::new() },
             canvas: GraphCanvas::new(1, 1),
             cpu_frac: HashMap::new(),
             mem_frac: HashMap::new(),
+            io_frac: HashMap::new(),
             injector: Injector::new(),
             last_samples: Vec::new(),
             last_area: Rect::new(0, 0, 80, 24),
@@ -267,6 +271,18 @@ impl State {
             .map(|n| (n.id, n.rss_pages as f32 / mmax as f32))
             .collect();
 
+        // Disk (block-I/O wait) deltas vs previous cumulative blkio ticks —
+        // same delta-normalization pattern as CPU: seed prev=current on first
+        // sight, saturating_sub, divisor floored at 1.
+        let mut io_deltas: HashMap<TileId, u64> = HashMap::new();
+        for n in &cons.nodes {
+            let prev = self.prev_io.get(&n.id).copied().unwrap_or(n.blkio_ticks);
+            io_deltas.insert(n.id, n.blkio_ticks.saturating_sub(prev));
+        }
+        self.prev_io = cons.nodes.iter().map(|n| (n.id, n.blkio_ticks)).collect();
+        let imax = io_deltas.values().copied().max().unwrap_or(1).max(1);
+        self.io_frac = io_deltas.iter().map(|(&id, &d)| (id, d as f32 / imax as f32)).collect();
+
         // Node size follows CPU delta; lay out with the same metric so sizes match.
         let cpu_max_for_size = dmax;
         // Build canvas using delta-based sizes: temporarily map jiffies->delta.
@@ -353,9 +369,18 @@ impl State {
             // NOTICE: the detection banner — the reason to look and the
             // answer to "what do I do with this". Spans the top rim row;
             // brightness scales with the pulse so it, too, breathes on the
-            // stall clock. Domain-agnostic: period/clock language only.
+            // stall clock. Domain-agnostic: period/clock + resource-category
+            // language only. The named resource is the culprit's own
+            // dominant axis (item 5): whichever of cpu/mem/disk it's
+            // currently heaviest on.
+            let contended = self
+                .injector
+                .culprit
+                .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
+                .unwrap_or(Resource::Cpu);
             let banner = format!(
-                "⚠ stall detected — acting on a ~{:.1}s clock",
+                "⚠ stall detected — contention on {} — acting on a ~{:.1}s clock",
+                resource_label(contended),
                 self.injector.period_s
             );
             if area.width as usize > banner.chars().count() {
@@ -445,6 +470,50 @@ impl State {
             }
         }
 
+        // Contention overlays (iteration 3, items 3-4): draw-only edges
+        // meaning "these groups share a resource axis". Faint + colour-coded
+        // in BOTH modes — this is structure, not a stall effect, so it is
+        // NOT gated on `self.stall`. Drawn after the backbone so it reads as
+        // an overlay on the lineage skeleton, not a replacement for it.
+        let node_ids: Vec<TileId> = self.cons.nodes.iter().map(|n| n.id).collect();
+        let contention = contention_edges(&node_ids, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+        for resource in [Resource::Cpu, Resource::Mem, Resource::Disk] {
+            let subset: Vec<(TileId, TileId)> = contention
+                .iter()
+                .filter(|(_, _, r)| *r == resource)
+                .map(|(a, b, _)| (*a, *b))
+                .collect();
+            if subset.is_empty() {
+                continue;
+            }
+            let faint = dim_color(dim_color(faint_color(resource_color(resource)), dim_amt), stall_dim);
+            render_edges(buf, &placed, &vp, &subset, faint, self.canvas.size());
+        }
+
+        // During a stall pulse, flare the culprit's own dominant resource hot
+        // — edges running FROM the culprit to the other nodes it's currently
+        // contending with on that axis — on top of the faint overlay above.
+        // Anchored explicitly at the culprit (not merely filtered from the
+        // generic star above) so it flares whenever the culprit has any
+        // qualifying partner on its dominant axis, independent of whether the
+        // culprit happens to also be that axis's top-ranked node overall.
+        if self.stall && s > 0.5 {
+            if let Some(cid) = self.injector.culprit {
+                let dom = dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+                let frac = match dom {
+                    Resource::Cpu => &self.cpu_frac,
+                    Resource::Mem => &self.mem_frac,
+                    Resource::Disk => &self.io_frac,
+                };
+                let partners = top_partners(cid, &node_ids, frac, CONTENTION_K - 1);
+                if !partners.is_empty() {
+                    let hot_edges: Vec<(TileId, TileId)> = partners.into_iter().map(|id| (cid, id)).collect();
+                    let hot_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s);
+                    render_edges(buf, &placed, &vp, &hot_edges, hot_color, self.canvas.size());
+                }
+            }
+        }
+
         // FOLLOW: a small invitation right under the culprit, present
         // whenever there's somewhere to dive to (not mid-dive already) — the
         // "what do I do with this" answer made concrete at the node itself.
@@ -510,7 +579,7 @@ impl State {
         }
         // Legibility baseline (both modes): a one-line legend so the visual
         // encoding is never a guessing game.
-        footer.push_str("  size=CPU  heat=memory  red=stall");
+        footer.push_str("  size=CPU  heat=memory  edges=contention");
         if area.height > 0 {
             let y = area.bottom().saturating_sub(1);
             buf.set_string(area.x + 1, y, &footer, Style::default().fg(Color::White));
@@ -753,6 +822,126 @@ fn title_line(buf: &mut Buffer, rect: Rect, label: &str, color: Color) {
     }
 }
 
+/// Iteration 3: a shared resource axis that two groups can be said to
+/// "contend" for. Generic category names only — domain-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resource {
+    Cpu,
+    Mem,
+    Disk,
+}
+
+/// Dim, resource-tinted colour for the faint (both-modes) contention overlay.
+fn resource_color(r: Resource) -> Color {
+    match r {
+        Resource::Cpu => Color::Rgb(220, 170, 40),
+        Resource::Mem => Color::Rgb(150, 110, 230),
+        Resource::Disk => Color::Rgb(60, 190, 180),
+    }
+}
+
+/// Domain-agnostic label for the stall banner.
+fn resource_label(r: Resource) -> &'static str {
+    match r {
+        Resource::Cpu => "CPU",
+        Resource::Mem => "memory",
+        Resource::Disk => "disk",
+    }
+}
+
+/// Scale an RGB colour to a faint fraction of itself — the baseline
+/// brightness for contention edges in BOTH modes (structure, not a stall
+/// effect), distinct from `dim_color`'s dive-recede blend.
+fn faint_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => {
+            Color::Rgb((r as f32 * 0.35) as u8, (g as f32 * 0.35) as u8, (b as f32 * 0.35) as u8)
+        }
+        other => other,
+    }
+}
+
+/// The culprit's own dominant resource axis this frame: whichever of its
+/// cpu/mem/disk normalized values is largest. Memory (RSS) is essentially
+/// never zero for a surviving node, so this always resolves to something
+/// sane even when the culprit's current-frame cpu/disk deltas are both 0.
+fn dominant_resource(
+    cid: TileId,
+    cpu_frac: &HashMap<TileId, f32>,
+    mem_frac: &HashMap<TileId, f32>,
+    io_frac: &HashMap<TileId, f32>,
+) -> Resource {
+    let c = cpu_frac.get(&cid).copied().unwrap_or(0.0);
+    let m = mem_frac.get(&cid).copied().unwrap_or(0.0);
+    let d = io_frac.get(&cid).copied().unwrap_or(0.0);
+    if d >= c && d >= m {
+        Resource::Disk
+    } else if m >= c {
+        Resource::Mem
+    } else {
+        Resource::Cpu
+    }
+}
+
+/// Contention-edge threshold/fan-out: a node's per-resource value must clear
+/// this to count as "contending" at all, and at most this many nodes per
+/// resource enter the star (hub + up to K-1 spokes).
+const CONTENTION_THRESHOLD: f32 = 0.05;
+const CONTENTION_K: usize = 4;
+
+/// Rank `node_ids` by `frac`, excluding `hub`, keeping only values above
+/// `CONTENTION_THRESHOLD`, and return up to `k` ids highest-first. Shared by
+/// `contention_edges` (hub = the top-ranked node overall) and the stall
+/// hot-overlay (hub = the culprit, regardless of whether it happens to be
+/// top-ranked) so both draw the same shape of star.
+fn top_partners(hub: TileId, node_ids: &[TileId], frac: &HashMap<TileId, f32>, k: usize) -> Vec<TileId> {
+    let mut ranked: Vec<(TileId, f32)> = node_ids
+        .iter()
+        .copied()
+        .filter(|&id| id != hub)
+        .filter_map(|id| frac.get(&id).copied().map(|v| (id, v)))
+        .filter(|&(_, v)| v > CONTENTION_THRESHOLD)
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(k);
+    ranked.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Draw-only contention edges (item 3): for each resource axis, rank the
+/// shown nodes by that axis's per-frame value; if at least 2 clear
+/// `CONTENTION_THRESHOLD`, emit a star from the top (hub) node to each other
+/// qualifying node (top `CONTENTION_K`), tagged with the resource. A resource
+/// with fewer than 2 heavy nodes contributes no edges — nothing to contend.
+/// These are separate from lineage (`cons.edges`) and are never fed to
+/// `auto_layout`; they only ever affect what gets drawn on top.
+fn contention_edges(
+    node_ids: &[TileId],
+    cpu_frac: &HashMap<TileId, f32>,
+    mem_frac: &HashMap<TileId, f32>,
+    io_frac: &HashMap<TileId, f32>,
+) -> Vec<(TileId, TileId, Resource)> {
+    let mut edges = Vec::new();
+    for (resource, frac) in
+        [(Resource::Cpu, cpu_frac), (Resource::Mem, mem_frac), (Resource::Disk, io_frac)]
+    {
+        let mut ranked: Vec<(TileId, f32)> = node_ids
+            .iter()
+            .filter_map(|&id| frac.get(&id).copied().map(|v| (id, v)))
+            .filter(|&(_, v)| v > CONTENTION_THRESHOLD)
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(CONTENTION_K);
+        if ranked.len() < 2 {
+            continue; // nothing to contend on this axis this frame
+        }
+        let hub = ranked[0].0;
+        for &(id, _) in &ranked[1..] {
+            edges.push((hub, id, resource));
+        }
+    }
+    edges
+}
+
 /// Route and draw backbone edges between already-placed node rects. Free
 /// function (not a `State` method) so both the outer constellation and an
 /// inner interior sub-constellation (Task 8) can reuse it with their own
@@ -850,6 +1039,7 @@ struct ProcStat {
     ppid: u32,
     comm: String,
     cpu_jiffies: u64,
+    blkio_ticks: u64,
 }
 
 fn parse_stat(line: &str) -> Option<ProcStat> {
@@ -861,7 +1051,7 @@ fn parse_stat(line: &str) -> Option<ProcStat> {
     let pid: u32 = line[..open].trim().parse().ok()?;
     let comm = line[open + 1..close].to_string();
     // Remainder starts at field 3 (state). 0-based within remainder:
-    //   state=0, ppid=1, ... utime=11, stime=12
+    //   state=0, ppid=1, ... utime=11, stime=12, ... delayacct_blkio_ticks=39
     let rest: Vec<&str> = line[close + 1..].split_whitespace().collect();
     if rest.len() < 13 {
         return None;
@@ -869,7 +1059,10 @@ fn parse_stat(line: &str) -> Option<ProcStat> {
     let ppid: u32 = rest[1].parse().ok()?;
     let utime: u64 = rest[11].parse().ok()?;
     let stime: u64 = rest[12].parse().ok()?;
-    Some(ProcStat { pid, ppid, comm, cpu_jiffies: utime + stime })
+    // field 42 (delayacct_blkio_ticks) isn't present on every kernel/proc
+    // snapshot; treat it as 0 rather than failing the whole parse.
+    let blkio_ticks: u64 = if rest.len() >= 40 { rest[39].parse().unwrap_or(0) } else { 0 };
+    Some(ProcStat { pid, ppid, comm, cpu_jiffies: utime + stime, blkio_ticks })
 }
 
 fn parse_statm_resident(line: &str) -> Option<u64> {
@@ -883,6 +1076,7 @@ struct ProcSample {
     comm: String,
     cpu_jiffies: u64,
     rss_pages: u64,
+    blkio_ticks: u64,
 }
 
 fn sample_procs() -> Vec<ProcSample> {
@@ -909,6 +1103,7 @@ fn sample_procs() -> Vec<ProcSample> {
             comm: st.comm,
             cpu_jiffies: st.cpu_jiffies,
             rss_pages,
+            blkio_ticks: st.blkio_ticks,
         });
     }
     out
@@ -940,6 +1135,7 @@ struct GNode {
     comm: String,
     cpu_jiffies: u64,
     rss_pages: u64,
+    blkio_ticks: u64,
 }
 
 struct Constellation {
@@ -961,9 +1157,11 @@ fn build_graph(samples: &[ProcSample], ids: &mut CommIds) -> Constellation {
             comm: s.comm.clone(),
             cpu_jiffies: 0,
             rss_pages: 0,
+            blkio_ticks: 0,
         });
         n.cpu_jiffies += s.cpu_jiffies;
         n.rss_pages += s.rss_pages;
+        n.blkio_ticks += s.blkio_ticks;
     }
 
     // Lineage edges parent-comm -> child-comm, deduped, self-edges dropped.
@@ -1118,19 +1316,32 @@ mod tests {
     use super::*;
 
     fn sample(pid: u32, ppid: u32, comm: &str, cpu: u64, rss: u64) -> ProcSample {
-        ProcSample { pid, ppid, comm: comm.into(), cpu_jiffies: cpu, rss_pages: rss }
+        ProcSample { pid, ppid, comm: comm.into(), cpu_jiffies: cpu, rss_pages: rss, blkio_ticks: 0 }
     }
 
     #[test]
     fn parses_stat_with_parens_in_comm() {
         // Real-shaped line: comm "(a b)c" contains spaces and parens.
-        // fields: 1 pid, 2 comm, 3 state, 4 ppid, ... 14 utime, 15 stime
-        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 0 40 60 0 0 20 0 1 0";
+        // fields: 1 pid, 2 comm, 3 state, 4 ppid, ... 14 utime, 15 stime,
+        // ... 42 delayacct_blkio_ticks (rest[39], padded out with trailing
+        // fields so rest.len() >= 40 and the blkio field is present).
+        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 0 40 60 0 0 20 0 1 \
+                     0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 777";
         let s = parse_stat(line).expect("should parse");
         assert_eq!(s.pid, 1234);
         assert_eq!(s.ppid, 1000);
         assert_eq!(s.comm, "(a b)c");
         assert_eq!(s.cpu_jiffies, 100); // utime 40 + stime 60
+        assert_eq!(s.blkio_ticks, 777);
+    }
+
+    #[test]
+    fn parses_stat_defaults_blkio_when_field_absent() {
+        // Same shape as before iteration 3 (short rest[]): blkio should
+        // default to 0 rather than failing the whole parse.
+        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 0 40 60 0 0 20 0 1 0";
+        let s = parse_stat(line).expect("should parse");
+        assert_eq!(s.blkio_ticks, 0);
     }
 
     #[test]
@@ -1292,5 +1503,31 @@ mod tests {
         // Same ids, sizes, edges -> identical placement (auto_layout is idempotent).
         assert_eq!(a, b, "an unchanged graph must not move between frames");
         assert_eq!(a.len(), 4);
+    }
+
+    #[test]
+    fn contention_edges_star_per_resource_with_threshold() {
+        // Four nodes with known per-resource values:
+        //   cpu:  1=0.9 (hub), 2=0.6, 3=0.4, 4=0.01 (below threshold)
+        //     -> 3 nodes qualify: star from 1 to {2, 3}.
+        //   mem:  1=0.9 only heavy node, everyone else below threshold
+        //     -> fewer than 2 qualify: no mem edges at all.
+        //   disk: all nodes below threshold -> no disk edges at all.
+        let ids: Vec<TileId> = vec![1, 2, 3, 4];
+        let cpu: HashMap<TileId, f32> = [(1, 0.9), (2, 0.6), (3, 0.4), (4, 0.01)].into_iter().collect();
+        let mem: HashMap<TileId, f32> = [(1, 0.9), (2, 0.02), (3, 0.01), (4, 0.0)].into_iter().collect();
+        let disk: HashMap<TileId, f32> = [(1, 0.02), (2, 0.01), (3, 0.0), (4, 0.0)].into_iter().collect();
+
+        let edges = contention_edges(&ids, &cpu, &mem, &disk);
+
+        // Only the CPU axis has >=2 qualifying nodes; hub is node 1 (highest).
+        assert!(!edges.iter().any(|(_, _, r)| *r == Resource::Mem), "mem: <2 heavy nodes -> no edges");
+        assert!(!edges.iter().any(|(_, _, r)| *r == Resource::Disk), "disk: <2 heavy nodes -> no edges");
+        let cpu_edges: Vec<(TileId, TileId)> =
+            edges.iter().filter(|(_, _, r)| *r == Resource::Cpu).map(|(a, b, _)| (*a, *b)).collect();
+        assert_eq!(cpu_edges.len(), 2, "cpu star: hub -> 2 and hub -> 3");
+        assert!(cpu_edges.contains(&(1, 2)));
+        assert!(cpu_edges.contains(&(1, 3)));
+        assert!(!cpu_edges.iter().any(|&(a, b)| a == 4 || b == 4), "below-threshold node excluded");
     }
 }
