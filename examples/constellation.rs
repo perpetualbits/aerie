@@ -62,9 +62,10 @@ const SAMPLE_EVERY: f32 = 1.0;
 /// many nodes blows well past the ~33ms frame budget. Measured on real
 /// `/proc` (~889 procs / 592 comm-groups): 40 nodes => 80-220ms/frame and the
 /// process pins a core; 20 nodes => ~18ms/frame average, comfortably under
-/// budget with the render loop idling between frames. Keep the top-N by
-/// significance so the map stays both readable and renderable.
-const MAX_NODES: usize = 20;
+/// budget with the render loop idling between frames. Lowered further to 12
+/// so the map reads as a legible star (bigger, readable boxes) rather than a
+/// crowd — still comfortably under the render budget.
+const MAX_NODES: usize = 12;
 
 struct State {
     stall: bool,
@@ -141,12 +142,28 @@ impl State {
         }
     }
 
+    /// The node the viewport should be panned to keep on-screen: the stall
+    /// culprit under `--stall`, else the focused node, else the
+    /// highest-significance (first, since `cons.nodes` is kept sorted) node
+    /// so startup lands on content rather than an empty canvas corner.
+    fn pan_target(&self) -> Option<TileId> {
+        if self.stall {
+            self.injector.culprit
+        } else if let Some(f) = self.focus {
+            Some(f)
+        } else {
+            self.cons.nodes.first().map(|n| n.id)
+        }
+    }
+
     /// Move `focus` to the nearest node in `dir`, comparing screen-space rect
     /// centers (matching what the eye sees, not raw canvas coordinates).
     fn move_focus(&mut self, dir: ArrowDir) {
         let (cw, ch) = self.canvas.size();
-        let vp = Viewport::new(self.last_area, cw, ch);
+        let ga = graph_area(self.last_area);
+        let mut vp = Viewport::new(ga, cw, ch);
         let placed = placed_rects(&self.canvas, Rect::new(0, 0, cw, ch));
+        center_pan_on(&mut vp, ga, &placed, self.pan_target());
         let centers: Vec<(TileId, (f32, f32))> = placed
             .iter()
             .filter_map(|(id, crect)| {
@@ -286,8 +303,14 @@ impl State {
         let area = buf.area;
         self.last_area = area; // used by move_focus on the next key press
         let (cw, ch) = self.canvas.size();
-        let vp = Viewport::new(area, cw, ch);
+        // The map itself renders into a 1-cell-inset sub-rect so it never
+        // paints over the perimeter rim, the banner row, or the footer row.
+        let ga = graph_area(area);
+        let mut vp = Viewport::new(ga, cw, ch);
         let placed = placed_rects(&self.canvas, Rect::new(0, 0, cw, ch)); // canvas-space rects
+        // Pan-to-culprit/focus/most-significant: keeps the node that matters
+        // on-screen even when the canvas is wider/taller than the terminal.
+        center_pan_on(&mut vp, ga, &placed, self.pan_target());
 
         // While a dive is in progress (or easing out), the rest of the
         // constellation dims to frame the focused node as a receding scope —
@@ -359,20 +382,29 @@ impl State {
                 // has nowhere else to go. The culprit is exempt here — its
                 // own hot pulse (below) carries its visibility instead.
                 let color = dim_color(dim_color(vis.color, dim_amt), if is_culprit { 0.0 } else { stall_dim });
-                // Task 9 fix: consume `vis.pulse` (0 for every node except the
-                // stall culprit under --stall) to blend the border toward a
-                // hot hue, so the culprit itself visibly breathes on the
-                // stall clock — not just the map-wide wash/rim. At pulse=0
-                // this is a no-op: blend_color returns `color` unchanged.
-                let border_color = blend_color(color, Color::Rgb(230, 80, 60), vis.pulse);
+                // Culprit border: a distinct always-hot hue, independent of
+                // the per-frame dim/pulse phase, so it stays unmistakable
+                // even in the quiet part of the stall clock — not merely
+                // blended in proportion to the instantaneous intensity `s`.
+                // It still brightens further at a pulse peak (vis.pulse), but
+                // never fades back toward the ambient node color like every
+                // other node's border does.
+                let border_color = if is_culprit {
+                    blend_color(Color::Rgb(220, 40, 30), Color::Rgb(255, 140, 60), vis.pulse)
+                } else {
+                    blend_color(color, Color::Rgb(230, 80, 60), vis.pulse)
+                };
                 draw_box(
                     buf,
                     screen,
                     Borders::ALL,
                     &BorderStyle {
-                        weight: if is_focus { LineWeight::Heavy } else { LineWeight::Light },
+                        weight: if is_focus || is_culprit { LineWeight::Heavy } else { LineWeight::Light },
                         corners: CornerStyle::Rounded,
-                        style: Style::default().fg(if is_focus { Color::White } else { border_color }),
+                        // The culprit's hot border always wins (even over the
+                        // focus-ring white) so it stays unmistakable; focus
+                        // still gets the white ring on every other node.
+                        style: Style::default().fg(if is_focus && !is_culprit { Color::White } else { border_color }),
                     },
                 );
                 // Neutral label: the comm, elided to the box interior.
@@ -442,11 +474,16 @@ impl State {
         // over it, and only in the overview (the dive overlay has its own
         // title_line once zoomed in).
         if self.zoom_target.is_none() {
-            if let Some(focus_id) = self.focus {
-                if let Some(n) = self.cons.nodes.iter().find(|n| n.id == focus_id) {
-                    let cpu = self.cpu_frac.get(&focus_id).copied().unwrap_or(0.0) * 100.0;
-                    let mem = self.mem_frac.get(&focus_id).copied().unwrap_or(0.0) * 100.0;
-                    let readout = format!("{}  cpu {cpu:.0}%  mem {mem:.0}%", n.comm);
+            // Under --stall, the culprit takes priority over plain focus so
+            // its full comm/cpu/mem readout is always on-screen — the
+            // "unmistakable" requirement doesn't stop at the border color.
+            let readout_id = if self.stall { self.injector.culprit.or(self.focus) } else { self.focus };
+            if let Some(readout_id) = readout_id {
+                if let Some(n) = self.cons.nodes.iter().find(|n| n.id == readout_id) {
+                    let cpu = self.cpu_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
+                    let mem = self.mem_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
+                    let tag = if self.stall && self.injector.culprit == Some(readout_id) { " [culprit]" } else { "" };
+                    let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%", n.comm);
                     let y = area.y + 1;
                     if y < area.bottom() {
                         buf.set_string(area.x + 1, y, &readout, Style::default().fg(Color::White));
@@ -975,8 +1012,11 @@ struct NodeVisual {
 }
 
 fn encode_node(cpu_frac: f32, mem_frac: f32, strain: f32) -> NodeVisual {
-    const MIN_CELLS: f32 = 3.0;
-    const MAX_CELLS: f32 = 14.0;
+    // Floor raised so every box is wide enough to show ~8-10 chars of the
+    // comm label (interior width = cells - 2 for the borders); still grows
+    // with CPU up to MAX_CELLS for the busiest nodes.
+    const MIN_CELLS: f32 = 12.0;
+    const MAX_CELLS: f32 = 22.0;
     let cpu = cpu_frac.clamp(0.0, 1.0);
     let cells = (MIN_CELLS + (MAX_CELLS - MIN_CELLS) * cpu).round() as u16;
 
@@ -1000,20 +1040,55 @@ fn build_canvas(cons: &Constellation, cpu_max: u64) -> GraphCanvas {
     let mut canvas = GraphCanvas::new(200, 80).with_grid(2);
     for n in &cons.nodes {
         let side = node_side(n.cpu_jiffies, cpu_max);
-        // Nodes are boxes; height a bit shorter than width reads better in cells.
-        let h = (side / 2).max(3);
-        canvas.add(n.id, FloatRect::new(0, 0, side.max(3), h));
+        // Nodes are wide-but-short boxes: width carries the label (comm text),
+        // height only needs to fit the top border (which doubles as the
+        // title row), one interior row, and the bottom border.
+        let h = (side / 4).max(3);
+        canvas.add(n.id, FloatRect::new(0, 0, side, h));
     }
+    // Process lineage is shallow (systemd -> app -> worker, ~2-4 layers), so
+    // laying out TopBottom stacks the few layers vertically and spreads each
+    // layer's many nodes HORIZONTALLY across the wide screen. LeftRight on
+    // this same shallow-wide shape degenerates into one tall column stacked
+    // against the left edge, which is what a real /proc capture showed.
     auto_layout(
         &mut canvas,
         &cons.edges,
-        &SugiyamaParams { dir: LayerDir::LeftRight, layer_gap: 8, node_gap: 3, grid: 2 },
+        &SugiyamaParams { dir: LayerDir::TopDown, layer_gap: 5, node_gap: 3, grid: 2 },
     );
     canvas
 }
 
 fn placed_rects(canvas: &GraphCanvas, window: Rect) -> Vec<(TileId, Rect)> {
     canvas.solve(window)
+}
+
+/// The sub-rect of `area` available for the node/edge map itself: inset so
+/// the graph never paints over the perimeter rim (drawn under `--stall`,
+/// sharing the outermost row/col), the banner text (top row), the
+/// focused/culprit readout line (the row right below the rim), or the
+/// footer/legend text (bottom row) — all of which use `area`'s own
+/// border/near-border rows/cols. Applied unconditionally (not just under
+/// `--stall`) so node positions don't jitter when the stall banner toggles
+/// on/off. Two rows are reserved at the top (rim/banner, then the readout
+/// line) since both are always drawn in the overview.
+fn graph_area(area: Rect) -> Rect {
+    Rect::new(area.x + 1, area.y + 2, area.width.saturating_sub(2), area.height.saturating_sub(3))
+}
+
+/// Pan `vp` so `target`'s canvas-space rect is centered in `window` (clamped
+/// to the valid pan range by `Viewport::set_pan`). This is what keeps the
+/// stall culprit / focused / most-significant node on-screen instead of
+/// stuck at the canvas's top-left corner whenever the canvas is bigger than
+/// the terminal window.
+fn center_pan_on(vp: &mut Viewport, window: Rect, placed: &[(TileId, Rect)], target: Option<TileId>) {
+    let Some(tid) = target else { return };
+    let Some((_, crect)) = placed.iter().find(|(id, _)| *id == tid) else { return };
+    let cx = crect.x as i32 + crect.width as i32 / 2;
+    let cy = crect.y as i32 + crect.height as i32 / 2;
+    let px = (cx - window.width as i32 / 2).max(0) as u16;
+    let py = (cy - window.height as i32 / 2).max(0) as u16;
+    vp.set_pan(px, py);
 }
 
 struct Injector {
