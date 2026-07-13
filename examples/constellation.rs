@@ -1346,6 +1346,602 @@ impl Injector {
     }
 }
 
+// ── Detector: a real, self-contained stall detector (Iteration 4a) ─────────
+//
+// Ported (not imported — this example is standalone and cannot `use
+// crate::diag`) from aerie's `src/diag.rs`: `LatencyProbe` (a background
+// cyclictest measuring its own wakeup overshoot), the PSI reader, the
+// autocorrelation/DFT periodicity analyzer, and a simplified periodic-
+// offender attributor built on the same analyzer.
+//
+// This task (4a) builds and unit-tests the detection core and exposes the
+// `Detector`/`DetectionReport` interface; it is NOT wired into `main`'s loop
+// or the render path yet (that's 4b). Nothing in this module is called from
+// `main`, so the whole cluster is unreachable dead code for now — hence the
+// blanket `#[allow(dead_code)]` on the module, per the brief.
+#[allow(dead_code)]
+mod detect {
+    use super::Resource;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    /// One wakeup-latency sample produced by [`LatencyProbe`]. Ported from
+    /// `diag::Sample`.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Sample {
+        /// Seconds since the probe thread started.
+        pub t: f64,
+        /// How much longer than the requested tick this wakeup actually
+        /// took, in milliseconds. ~0 is on time; spikes are the stalls.
+        pub overshoot_ms: f32,
+    }
+
+    /// Configuration for [`LatencyProbe`]. Ported from `diag::ProbeConfig`.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct ProbeConfig {
+        pub tick: Duration,
+        pub capacity: usize,
+    }
+
+    impl Default for ProbeConfig {
+        fn default() -> Self {
+            // 2 ms tick -> 500 Hz. 60_000 samples ~= 120 s of rolling
+            // history, enough for the analyzer to resolve periods up to
+            // tens of seconds while staying cheap. Same as diag.rs.
+            Self { tick: Duration::from_millis(2), capacity: 60_000 }
+        }
+    }
+
+    struct ProbeShared {
+        ring: VecDeque<Sample>,
+        capacity: usize,
+    }
+
+    /// A built-in `cyclictest`: a thread that measures its own wakeup
+    /// latency. Ported from `diag::LatencyProbe`. Measuring the *probe
+    /// thread's* own scheduling delay is the right signal: it is subject to
+    /// the same system-wide preemption that stalls every other realtime
+    /// thread, independent of any one application.
+    pub(super) struct LatencyProbe {
+        shared: Arc<Mutex<ProbeShared>>,
+        stop: Arc<AtomicBool>,
+        _handle: JoinHandle<()>,
+    }
+
+    impl LatencyProbe {
+        pub fn spawn(cfg: ProbeConfig) -> Self {
+            let shared = Arc::new(Mutex::new(ProbeShared {
+                ring: VecDeque::with_capacity(cfg.capacity.min(4096)),
+                capacity: cfg.capacity.max(1),
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let tick = cfg.tick;
+            let shared_t = Arc::clone(&shared);
+            let stop_t = Arc::clone(&stop);
+            let handle = std::thread::Builder::new()
+                .name("constellation-latency-probe".into())
+                .spawn(move || probe_loop(shared_t, stop_t, tick))
+                .expect("spawn latency probe thread");
+            Self { shared, stop, _handle: handle }
+        }
+
+        /// Copy the current ring contents (oldest -> newest) for analysis.
+        pub fn snapshot(&self) -> Vec<Sample> {
+            let g = self.shared.lock().unwrap();
+            g.ring.iter().copied().collect()
+        }
+    }
+
+    impl Drop for LatencyProbe {
+        fn drop(&mut self) {
+            // Signal the thread to exit; we don't join (it may be mid-sleep
+            // for up to `tick`), letting the process tear it down.
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The probe thread body: sleep `tick`, measure overshoot, record, repeat.
+    fn probe_loop(shared: Arc<Mutex<ProbeShared>>, stop: Arc<AtomicBool>, tick: Duration) {
+        let start = Instant::now();
+        while !stop.load(Ordering::Relaxed) {
+            let t0 = Instant::now();
+            std::thread::sleep(tick);
+            let elapsed = t0.elapsed();
+            let overshoot = elapsed.saturating_sub(tick);
+            let sample = Sample {
+                t: t0.duration_since(start).as_secs_f64(),
+                overshoot_ms: overshoot.as_secs_f32() * 1000.0,
+            };
+            let mut g = shared.lock().unwrap();
+            if g.ring.len() >= g.capacity {
+                g.ring.pop_front();
+            }
+            g.ring.push_back(sample);
+        }
+    }
+
+    // ── PSI reader ─────────────────────────────────────────────────────
+
+    /// Parse the `some ... total=NNN` microsecond counter from a PSI
+    /// pressure file. Ported from `diag::read_psi_some_total`. Returns
+    /// `None` on any missing file/field (older kernels, no PSI mounted) —
+    /// callers must treat that as "unavailable", not "zero".
+    fn read_psi_some_total(path: &str) -> Option<u64> {
+        let data = std::fs::read_to_string(path).ok()?;
+        let line = data.lines().find(|l| l.starts_with("some"))?;
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix("total=").and_then(|v| v.parse::<u64>().ok()))
+    }
+
+    /// Which PSI channel is contended. Ported from `diag::PressureChannel`,
+    /// trimmed to the three PSI resources and mapped onto the example's own
+    /// [`Resource`] (`Io` -> `Disk`) rather than duplicating names.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PressureChannel {
+        Cpu,
+        Mem,
+        Io,
+    }
+
+    impl PressureChannel {
+        fn resource(self) -> Resource {
+            match self {
+                PressureChannel::Cpu => Resource::Cpu,
+                PressureChannel::Mem => Resource::Mem,
+                PressureChannel::Io => Resource::Disk,
+            }
+        }
+    }
+
+    // ── Periodicity analyzer ───────────────────────────────────────────
+
+    /// Configuration for [`analyze_periodicity`]. Ported from
+    /// `diag::AnalysisConfig`.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct AnalysisConfig {
+        pub freq_lo: f64,
+        pub freq_hi: f64,
+        pub freq_bins: usize,
+    }
+
+    impl Default for AnalysisConfig {
+        fn default() -> Self {
+            // 0.05 Hz (20 s period) up to 25 Hz covers the band where a
+            // periodic system stall plausibly lives. Same as diag.rs.
+            Self { freq_lo: 0.05, freq_hi: 25.0, freq_bins: 240 }
+        }
+    }
+
+    /// Result of periodicity analysis over a latency series. Ported from
+    /// `diag::Periodicity`.
+    #[derive(Clone, Debug, Default)]
+    pub(super) struct Periodicity {
+        pub period_s: Option<f64>,
+        pub freq_hz: Option<f64>,
+        pub confidence: f32,
+        pub spectrum: Vec<f32>,
+        pub freq_lo: f64,
+        pub freq_hi: f64,
+        pub bin_dt: f64,
+    }
+
+    /// Resample an (approximately uniform but jittered) sample series onto a
+    /// strictly uniform time grid of step `bin_dt`, taking the **max**
+    /// overshoot in each bin so a single-tick spike is never averaged away.
+    /// Ported from `diag::resample_uniform`.
+    fn resample_uniform(samples: &[Sample], bin_dt: f64) -> Vec<f32> {
+        if samples.len() < 2 || bin_dt <= 0.0 {
+            return Vec::new();
+        }
+        let t0 = samples[0].t;
+        let span = samples[samples.len() - 1].t - t0;
+        let n = ((span / bin_dt).floor() as usize) + 1;
+        if n < 4 {
+            return Vec::new();
+        }
+        let mut grid = vec![0.0f32; n];
+        for s in samples {
+            let b = (((s.t - t0) / bin_dt).floor() as usize).min(n - 1);
+            if s.overshoot_ms > grid[b] {
+                grid[b] = s.overshoot_ms;
+            }
+        }
+        grid
+    }
+
+    /// Find the period of a latency series via autocorrelation, plus a
+    /// narrow-band DFT spectrum for display. Ported ~verbatim from
+    /// `diag::analyze_periodicity` — this is the key correctness gate (see
+    /// the `recovers_known_period` test below), so the algorithm is
+    /// unchanged from the proven original.
+    pub(super) fn analyze_periodicity(samples: &[Sample], cfg: AnalysisConfig) -> Periodicity {
+        let mut out = Periodicity {
+            freq_lo: cfg.freq_lo,
+            freq_hi: cfg.freq_hi,
+            spectrum: vec![0.0; cfg.freq_bins.max(1)],
+            ..Default::default()
+        };
+        if samples.len() < 8 {
+            return out;
+        }
+
+        let span = samples[samples.len() - 1].t - samples[0].t;
+        let mean_spacing = span / (samples.len() - 1) as f64;
+        let bin_dt = (1.0 / (cfg.freq_hi * 4.0)).max(span / 6000.0).max(mean_spacing * 1.5);
+        out.bin_dt = bin_dt;
+
+        let mut grid = resample_uniform(samples, bin_dt);
+        let n = grid.len();
+        if n < 16 {
+            return out;
+        }
+        let mean = grid.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        for v in &mut grid {
+            *v -= mean as f32;
+        }
+        let energy: f64 = grid.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        if energy < 1e-12 {
+            return out; // flat series, nothing periodic
+        }
+
+        // ── Autocorrelation over the feasible lag band ──────────────
+        let lag_min = ((1.0 / cfg.freq_hi) / bin_dt).floor().max(1.0) as usize;
+        let lag_max = (((1.0 / cfg.freq_lo) / bin_dt).floor() as usize).min(n / 3).max(lag_min + 1);
+        let mut corr = vec![0.0f64; lag_max + 1];
+        for (lag, slot) in corr.iter_mut().enumerate().take(lag_max + 1).skip(lag_min) {
+            let mut acc = 0.0f64;
+            for i in 0..(n - lag) {
+                acc += grid[i] as f64 * grid[i + lag] as f64;
+            }
+            *slot = acc / energy;
+        }
+        let search_from = corr
+            .iter()
+            .enumerate()
+            .take(lag_max)
+            .skip(lag_min)
+            .find(|(_, &r)| r <= 0.0)
+            .map(|(lag, _)| lag)
+            .unwrap_or(lag_min);
+        let best_corr = (search_from..=lag_max).map(|l| corr[l]).fold(0.0f64, f64::max);
+        const PERIOD_MIN_CORR: f64 = 0.20;
+        if best_corr > PERIOD_MIN_CORR {
+            let thresh = best_corr * 0.9;
+            let fundamental = (search_from..=lag_max).find(|&lag| corr[lag] >= thresh).unwrap_or(0);
+            if fundamental > 0 {
+                let period = fundamental as f64 * bin_dt;
+                out.period_s = Some(period);
+                out.freq_hz = Some(1.0 / period);
+                out.confidence = best_corr.clamp(0.0, 1.0) as f32;
+            }
+        }
+
+        // ── Log-spaced DFT for the displayed spectrum ───────────────
+        let bins = cfg.freq_bins.max(1);
+        let ln_lo = cfg.freq_lo.ln();
+        let ln_hi = cfg.freq_hi.ln();
+        let mut max_power = 0.0f64;
+        for k in 0..bins {
+            let frac = if bins > 1 { k as f64 / (bins - 1) as f64 } else { 0.0 };
+            let f = (ln_lo + (ln_hi - ln_lo) * frac).exp();
+            let w = 2.0 * std::f64::consts::PI * f * bin_dt;
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &v) in grid.iter().enumerate() {
+                let ang = w * i as f64;
+                re += v as f64 * ang.cos();
+                im -= v as f64 * ang.sin();
+            }
+            let power = re * re + im * im;
+            out.spectrum[k] = power as f32;
+            if power > max_power {
+                max_power = power;
+            }
+        }
+        if max_power > 0.0 {
+            for p in &mut out.spectrum {
+                *p = (*p as f64 / max_power) as f32;
+            }
+        }
+
+        out
+    }
+
+    // ── Offender attribution (simplified) ───────────────────────────────
+    //
+    // Simplified from `diag::OffenderProbe` + `diag::analyze_offenders`:
+    // CPU-jiffy-delta periodicity is the core signal we port; child-spawn
+    // tracking is dropped per the brief ("skip if it bloats") since the
+    // example already computes per-comm CPU deltas each resample and feeding
+    // those in is exactly the cheap, no-second-/proc-scanner path the brief
+    // asks for.
+
+    const MIN_GROUP_SAMPLES: usize = 24; // matches diag.rs's analyze_offenders floor
+    const OFFENDER_MIN_CONFIDENCE: f32 = 0.25; // matches diag.rs's MIN_CONF
+    const PERIOD_MATCH_TOLERANCE: f64 = 0.25; // fractional tolerance vs the stall clock
+
+    /// Find the process group whose CPU-delta activity is both convincingly
+    /// periodic (via [`analyze_periodicity`]) and lands on `clock_period_s`
+    /// — the stall's own clock. `None` when no group is a convincing match
+    /// (honest "unattributed"), matching `diag::analyze_offenders`'s
+    /// `MIN_CONF` gate.
+    fn find_periodic_offender(
+        group_history: &HashMap<String, VecDeque<(f64, u64)>>,
+        clock_period_s: f64,
+    ) -> Option<String> {
+        if clock_period_s <= 0.0 {
+            return None;
+        }
+        group_history
+            .iter()
+            .filter(|(_, hist)| hist.len() >= MIN_GROUP_SAMPLES)
+            .filter_map(|(name, hist)| {
+                let series: Vec<Sample> =
+                    hist.iter().map(|&(t, d)| Sample { t, overshoot_ms: d as f32 }).collect();
+                let p = analyze_periodicity(&series, AnalysisConfig::default());
+                let period = p.period_s?;
+                if p.confidence < OFFENDER_MIN_CONFIDENCE {
+                    return None;
+                }
+                if ((period - clock_period_s).abs() / clock_period_s) > PERIOD_MATCH_TOLERANCE {
+                    return None;
+                }
+                Some((name.clone(), p.confidence))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(name, _)| name)
+    }
+
+    // ── Detector: the interface 4b will consume ─────────────────────────
+
+    /// One frame's worth of stall diagnosis, assembled from the latency
+    /// probe, PSI, and offender attribution above.
+    #[derive(Clone, Debug)]
+    pub(super) struct DetectionReport {
+        /// 0..1 weather intensity from recent max overshoot (decays); 0 when calm.
+        pub pulse: f32,
+        /// True when a stall is currently felt (pulse above a threshold).
+        pub active: bool,
+        /// Detected clock; `None` = irregular / no clear period.
+        pub period_s: Option<f32>,
+        /// Recent max overshoot, in ms.
+        pub magnitude_ms: f32,
+        /// Contended resource from PSI during the stall; `None` if PSI is
+        /// unavailable or nothing is currently elevated.
+        pub resource: Option<Resource>,
+        /// Periodic-offender group name; `None` = unattributed.
+        pub culprit_comm: Option<String>,
+        /// Recent (t_secs, overshoot_ms) pairs for the bedrock timeline.
+        pub overshoot_series: Vec<(f64, f32)>,
+    }
+
+    const PULSE_DECAY_S: f32 = 1.5; // time constant for the weather-intensity decay
+    const PULSE_LOOKBACK_S: f32 = PULSE_DECAY_S * 6.0; // ~7 half-lives; negligible beyond this
+    const PULSE_NORM_MS: f32 = 20.0; // overshoot that saturates pulse to ~1.0
+    const PULSE_ACTIVE_THRESHOLD: f32 = 0.15;
+    const MAGNITUDE_WINDOW_S: f64 = 1.0; // window for "recent max overshoot"
+    const SERIES_WINDOW_S: f64 = 30.0; // bedrock timeline span
+
+    /// Owns the probe thread(s) and the rolling per-group activity history.
+    /// Spawn once; feed it observations each frame; read a report whenever
+    /// the render path wants one (not wired up until 4b).
+    pub(super) struct Detector {
+        probe: LatencyProbe,
+        /// Per-group CPU-jiffy-delta history, fed by [`Detector::observe`]
+        /// from the example's own per-comm deltas — no second /proc scanner.
+        group_history: HashMap<String, VecDeque<(f64, u64)>>,
+        group_cap: usize,
+        /// Previous (cpu, mem, io) cumulative PSI "some" totals + when, to
+        /// derive per-second stall rates on each `observe`.
+        psi_prev: Option<(u64, u64, u64, f64)>,
+        /// Most recently identified contended resource. Sticky across PSI
+        /// reads that come back "nothing elevated" so a brief dip doesn't
+        /// erase the reading mid-stall; only a hard PSI-unavailable clears it.
+        resource: Option<Resource>,
+    }
+
+    impl Detector {
+        /// Start the real latency-probe thread (+ read PSI on demand).
+        pub fn spawn() -> Self {
+            Detector {
+                probe: LatencyProbe::spawn(ProbeConfig::default()),
+                group_history: HashMap::new(),
+                group_cap: 300, // ~5 min at the example's ~1 Hz resample cadence
+                psi_prev: None,
+                resource: None,
+            }
+        }
+
+        /// Feed the latest per-group CPU-jiffy deltas (as the example
+        /// already computes each `resample`) and refresh the PSI reading.
+        pub fn observe(&mut self, now_secs: f64, group_cpu_deltas: &[(String, u64)]) {
+            for (name, delta) in group_cpu_deltas {
+                let ring = self.group_history.entry(name.clone()).or_default();
+                if ring.len() >= self.group_cap {
+                    ring.pop_front();
+                }
+                ring.push_back((now_secs, *delta));
+            }
+
+            // PSI: rate the three channels since the previous observe() and
+            // remember whichever is currently most elevated. A read failure
+            // (any file missing — no PSI on this kernel) clears `resource`
+            // outright rather than reporting a stale one.
+            match (
+                read_psi_some_total("/proc/pressure/cpu"),
+                read_psi_some_total("/proc/pressure/memory"),
+                read_psi_some_total("/proc/pressure/io"),
+            ) {
+                (Some(cpu), Some(mem), Some(io)) => {
+                    if let Some((pc, pm, pi, pt)) = self.psi_prev {
+                        let dt = (now_secs - pt).max(1e-3);
+                        let rate = |c: u64, p: u64| (c.saturating_sub(p) as f64 / dt) as f32;
+                        let candidates = [
+                            (PressureChannel::Cpu, rate(cpu, pc)),
+                            (PressureChannel::Mem, rate(mem, pm)),
+                            (PressureChannel::Io, rate(io, pi)),
+                        ];
+                        let best = candidates
+                            .into_iter()
+                            .fold((PressureChannel::Cpu, 0.0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
+                        self.resource = if best.1 > 0.0 { Some(best.0.resource()) } else { None };
+                    }
+                    self.psi_prev = Some((cpu, mem, io, now_secs));
+                }
+                _ => {
+                    self.psi_prev = None;
+                    self.resource = None;
+                }
+            }
+        }
+
+        /// Assemble the current diagnosis. Pure w.r.t. `self` — recomputes
+        /// pulse/period/culprit from the probe snapshot and group history
+        /// each call rather than caching, since 4a doesn't yet call this
+        /// every render frame.
+        pub fn report(&self, now_secs: f64) -> DetectionReport {
+            let samples = self.probe.snapshot();
+
+            let magnitude_ms = samples
+                .iter()
+                .rev()
+                .take_while(|s| now_secs - s.t <= MAGNITUDE_WINDOW_S)
+                .map(|s| s.overshoot_ms)
+                .fold(0.0f32, f32::max);
+
+            // Pulse: an exponentially-decayed "weather intensity" driven by
+            // every recent overshoot (not just the latest tick), so a spike
+            // is still felt for a moment after it passes.
+            let pulse = samples
+                .iter()
+                .rev()
+                .take_while(|s| now_secs - s.t <= PULSE_LOOKBACK_S as f64)
+                .map(|s| {
+                    let age = (now_secs - s.t).max(0.0) as f32;
+                    (s.overshoot_ms / PULSE_NORM_MS).clamp(0.0, 1.0) * (-age / PULSE_DECAY_S).exp()
+                })
+                .fold(0.0f32, f32::max);
+
+            // The stall's own clock: periodicity of the overshoot series itself.
+            let clock = analyze_periodicity(&samples, AnalysisConfig::default());
+            let culprit_comm =
+                clock.period_s.and_then(|cp| find_periodic_offender(&self.group_history, cp));
+
+            let mut overshoot_series: Vec<(f64, f32)> = samples
+                .iter()
+                .rev()
+                .take_while(|s| now_secs - s.t <= SERIES_WINDOW_S)
+                .map(|s| (s.t, s.overshoot_ms))
+                .collect();
+            overshoot_series.reverse(); // oldest -> newest, for the timeline
+
+            DetectionReport {
+                pulse,
+                active: pulse > PULSE_ACTIVE_THRESHOLD,
+                period_s: clock.period_s.map(|p| p as f32),
+                magnitude_ms,
+                resource: self.resource,
+                culprit_comm,
+                overshoot_series,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn mk(series: &[(f64, f32)]) -> Vec<Sample> {
+            series.iter().map(|&(t, o)| Sample { t, overshoot_ms: o }).collect()
+        }
+
+        /// Build a synthetic spike train: a baseline tick with a tall spike
+        /// every `period_s`, sampled at `tick_s`. Ported from diag.rs's test helper.
+        fn spike_train(tick_s: f64, period_s: f64, dur_s: f64) -> Vec<Sample> {
+            let n = (dur_s / tick_s) as usize;
+            let spike_every = (period_s / tick_s).round() as usize;
+            (0..n)
+                .map(|i| {
+                    let o = if spike_every > 0 && i % spike_every == 0 { 40.0 } else { 0.2 };
+                    Sample { t: i as f64 * tick_s, overshoot_ms: o }
+                })
+                .collect()
+        }
+
+        /// THE key correctness gate: `analyze_periodicity` must recover a
+        /// known period from a synthetic periodic overshoot series. Ported
+        /// verbatim from `diag.rs`'s `recovers_known_period`.
+        #[test]
+        fn recovers_known_period() {
+            // Spike every 2.0 s, 2 ms ticks, 60 s long.
+            let s = spike_train(0.002, 2.0, 60.0);
+            let p = analyze_periodicity(&s, AnalysisConfig::default());
+            let period = p.period_s.expect("should find a period");
+            assert!((period - 2.0).abs() < 0.1, "recovered period {period}");
+            assert!(p.confidence > 0.4, "confidence {} too low", p.confidence);
+        }
+
+        /// Ported verbatim from `diag.rs`'s `recovers_fast_period`.
+        #[test]
+        fn recovers_fast_period() {
+            // Spike every 0.25 s (4 Hz).
+            let s = spike_train(0.002, 0.25, 30.0);
+            let p = analyze_periodicity(&s, AnalysisConfig::default());
+            let f = p.freq_hz.expect("should find a frequency");
+            assert!((f - 4.0).abs() < 0.3, "recovered freq {f} Hz");
+        }
+
+        /// Ported verbatim from `diag.rs`'s `flat_series_has_no_period`.
+        #[test]
+        fn flat_series_has_no_period() {
+            let s: Vec<Sample> =
+                (0..10_000).map(|i| Sample { t: i as f64 * 0.002, overshoot_ms: 0.2 }).collect();
+            let p = analyze_periodicity(&s, AnalysisConfig::default());
+            assert!(p.period_s.is_none(), "flat series should not report a period");
+        }
+
+        /// Ported verbatim from `diag.rs`'s `resample_keeps_spikes`.
+        #[test]
+        fn resample_keeps_spikes() {
+            // A lone spike between two calm samples must survive max-binning.
+            let s = mk(&[(0.0, 0.1), (0.05, 30.0), (0.10, 0.1), (0.15, 0.1), (0.20, 0.1)]);
+            let grid = resample_uniform(&s, 0.05);
+            assert!(grid.len() >= 4);
+            assert_eq!(grid[1], 30.0, "spike must land in its bin");
+            assert_eq!(grid[0], 0.1);
+        }
+
+        /// Offender attribution: a group whose CPU-delta activity is
+        /// periodic at the same period as the stall clock gets flagged.
+        /// Parameters mirror diag.rs's `offender_detects_periodic_spawner`
+        /// (300 samples @ 0.2 s, burst every 15 ticks = 3.0 s).
+        #[test]
+        fn finds_periodic_offender_matching_clock() {
+            let mut groups: HashMap<String, VecDeque<(f64, u64)>> = HashMap::new();
+            let poller: VecDeque<(f64, u64)> =
+                (0..300).map(|i| (i as f64 * 0.2, if i % 15 == 0 { 50 } else { 0 })).collect();
+            let steady: VecDeque<(f64, u64)> = (0..300).map(|i| (i as f64 * 0.2, 5)).collect();
+            groups.insert("poller".to_string(), poller);
+            groups.insert("steady".to_string(), steady);
+
+            let culprit = find_periodic_offender(&groups, 3.0);
+            assert_eq!(culprit.as_deref(), Some("poller"));
+        }
+
+        /// No group periodic at the clock's period -> honest "unattributed".
+        #[test]
+        fn no_offender_when_nothing_matches_clock() {
+            let mut groups: HashMap<String, VecDeque<(f64, u64)>> = HashMap::new();
+            let steady: VecDeque<(f64, u64)> = (0..300).map(|i| (i as f64 * 0.2, 5)).collect();
+            groups.insert("steady".to_string(), steady);
+
+            assert_eq!(find_periodic_offender(&groups, 3.0), None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
