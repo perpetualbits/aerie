@@ -62,9 +62,10 @@ const SAMPLE_EVERY: f32 = 1.0;
 /// many nodes blows well past the ~33ms frame budget. Measured on real
 /// `/proc` (~889 procs / 592 comm-groups): 40 nodes => 80-220ms/frame and the
 /// process pins a core; 20 nodes => ~18ms/frame average, comfortably under
-/// budget with the render loop idling between frames. Keep the top-N by
-/// significance so the map stays both readable and renderable.
-const MAX_NODES: usize = 20;
+/// budget with the render loop idling between frames. Lowered further to 12
+/// so the map reads as a legible star (bigger, readable boxes) rather than a
+/// crowd — still comfortably under the render budget.
+const MAX_NODES: usize = 12;
 
 struct State {
     stall: bool,
@@ -141,12 +142,28 @@ impl State {
         }
     }
 
+    /// The node the viewport should be panned to keep on-screen: the stall
+    /// culprit under `--stall`, else the focused node, else the
+    /// highest-significance (first, since `cons.nodes` is kept sorted) node
+    /// so startup lands on content rather than an empty canvas corner.
+    fn pan_target(&self) -> Option<TileId> {
+        if self.stall {
+            self.injector.culprit
+        } else if let Some(f) = self.focus {
+            Some(f)
+        } else {
+            self.cons.nodes.first().map(|n| n.id)
+        }
+    }
+
     /// Move `focus` to the nearest node in `dir`, comparing screen-space rect
     /// centers (matching what the eye sees, not raw canvas coordinates).
     fn move_focus(&mut self, dir: ArrowDir) {
         let (cw, ch) = self.canvas.size();
-        let vp = Viewport::new(self.last_area, cw, ch);
+        let ga = graph_area(self.last_area);
+        let mut vp = Viewport::new(ga, cw, ch);
         let placed = placed_rects(&self.canvas, Rect::new(0, 0, cw, ch));
+        center_pan_on(&mut vp, ga, &placed, self.pan_target());
         let centers: Vec<(TileId, (f32, f32))> = placed
             .iter()
             .filter_map(|(id, crect)| {
@@ -223,10 +240,13 @@ impl State {
         }
         self.prev_cpu = cons.nodes.iter().map(|n| (n.id, n.cpu_jiffies)).collect();
 
-        // Task 9: under --stall, pin the injector's culprit to the
-        // highest-CPU-delta node the first time we see one, and re-elect if
-        // that comm's process disappears out from under us later. A no-op
-        // when --stall is off, so the calm (Task 8) path is unaffected.
+        // Task 9: under --stall, pin the injector's culprit to a real, stable
+        // app node the first time we see one — the SHOWN node (kernel threads
+        // already excluded in build_graph) with the highest cumulative
+        // cpu_jiffies, so it reads as a believable, recognizable culprit
+        // rather than an arbitrary first-frame pick. Re-elect only if that
+        // comm's process disappears out from under us later. A no-op when
+        // --stall is off, so the calm (Task 8) path is unaffected.
         if self.stall {
             if let Some(cid) = self.injector.culprit {
                 if !cons.nodes.iter().any(|n| n.id == cid) {
@@ -234,8 +254,7 @@ impl State {
                 }
             }
             if self.injector.culprit.is_none() {
-                self.injector.culprit =
-                    cons.nodes.iter().max_by_key(|n| deltas.get(&n.id).copied().unwrap_or(0)).map(|n| n.id);
+                self.injector.culprit = cons.nodes.iter().max_by_key(|n| n.cpu_jiffies).map(|n| n.id);
             }
         }
 
@@ -284,8 +303,14 @@ impl State {
         let area = buf.area;
         self.last_area = area; // used by move_focus on the next key press
         let (cw, ch) = self.canvas.size();
-        let vp = Viewport::new(area, cw, ch);
+        // The map itself renders into a 1-cell-inset sub-rect so it never
+        // paints over the perimeter rim, the banner row, or the footer row.
+        let ga = graph_area(area);
+        let mut vp = Viewport::new(ga, cw, ch);
         let placed = placed_rects(&self.canvas, Rect::new(0, 0, cw, ch)); // canvas-space rects
+        // Pan-to-culprit/focus/most-significant: keeps the node that matters
+        // on-screen even when the canvas is wider/taller than the terminal.
+        center_pan_on(&mut vp, ga, &placed, self.pan_target());
 
         // While a dive is in progress (or easing out), the rest of the
         // constellation dims to frame the focused node as a receding scope —
@@ -297,6 +322,13 @@ impl State {
         // Only ever fed to visuals when `self.stall` is set — with it off the
         // map stays exactly as calm as it was at the end of Task 8.
         let s = self.injector.intensity(self.t);
+
+        // FOLLOW: how hard to dim every non-culprit node/edge toward
+        // near-black this frame. Zero below s=0.35 and rising continuously to
+        // 1.0 at a pulse peak — the zero-crossing at the threshold means
+        // there's no pop where the effect switches on, only the smooth ramp
+        // `s` already gives. Never set when --stall is off.
+        let stall_dim = if self.stall { ((s - 0.35) / 0.65).clamp(0.0, 1.0) } else { 0.0 };
 
         // Weather: a faint full-screen wash + perimeter rim, both scaled by
         // `s`, so the whole map visibly breathes on the stall clock. Drawn
@@ -317,6 +349,20 @@ impl State {
                     style: Style::default().fg(rim_col),
                 },
             );
+
+            // NOTICE: the detection banner — the reason to look and the
+            // answer to "what do I do with this". Spans the top rim row;
+            // brightness scales with the pulse so it, too, breathes on the
+            // stall clock. Domain-agnostic: period/clock language only.
+            let banner = format!(
+                "⚠ stall detected — acting on a ~{:.1}s clock",
+                self.injector.period_s
+            );
+            if area.width as usize > banner.chars().count() {
+                let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
+                let x = area.x + (area.width - banner.chars().count() as u16) / 2;
+                buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
+            }
         }
 
         // Nodes.
@@ -330,21 +376,35 @@ impl State {
                 let strain = if self.stall && self.injector.culprit == Some(*id) { s } else { 0.0 };
                 let vis = encode_node(cpu, mem, strain);
                 let is_focus = self.zoom_target.is_none() && self.focus == Some(*id);
-                let color = dim_color(vis.color, dim_amt);
-                // Task 9 fix: consume `vis.pulse` (0 for every node except the
-                // stall culprit under --stall) to blend the border toward a
-                // hot hue, so the culprit itself visibly breathes on the
-                // stall clock — not just the map-wide wash/rim. At pulse=0
-                // this is a no-op: blend_color returns `color` unchanged.
-                let border_color = blend_color(color, Color::Rgb(230, 80, 60), vis.pulse);
+                let is_culprit = self.stall && self.injector.culprit == Some(*id);
+                // FOLLOW: every node except the culprit recedes toward
+                // near-black on the stall clock, so at a pulse peak the eye
+                // has nowhere else to go. The culprit is exempt here — its
+                // own hot pulse (below) carries its visibility instead.
+                let color = dim_color(dim_color(vis.color, dim_amt), if is_culprit { 0.0 } else { stall_dim });
+                // Culprit border: a distinct always-hot hue, independent of
+                // the per-frame dim/pulse phase, so it stays unmistakable
+                // even in the quiet part of the stall clock — not merely
+                // blended in proportion to the instantaneous intensity `s`.
+                // It still brightens further at a pulse peak (vis.pulse), but
+                // never fades back toward the ambient node color like every
+                // other node's border does.
+                let border_color = if is_culprit {
+                    blend_color(Color::Rgb(220, 40, 30), Color::Rgb(255, 140, 60), vis.pulse)
+                } else {
+                    blend_color(color, Color::Rgb(230, 80, 60), vis.pulse)
+                };
                 draw_box(
                     buf,
                     screen,
                     Borders::ALL,
                     &BorderStyle {
-                        weight: if is_focus { LineWeight::Heavy } else { LineWeight::Light },
+                        weight: if is_focus || is_culprit { LineWeight::Heavy } else { LineWeight::Light },
                         corners: CornerStyle::Rounded,
-                        style: Style::default().fg(if is_focus { Color::White } else { border_color }),
+                        // The culprit's hot border always wins (even over the
+                        // focus-ring white) so it stays unmistakable; focus
+                        // still gets the white ring on every other node.
+                        style: Style::default().fg(if is_focus && !is_culprit { Color::White } else { border_color }),
                     },
                 );
                 // Neutral label: the comm, elided to the box interior.
@@ -361,13 +421,14 @@ impl State {
             }
         }
 
-        // Backbone edges (structural).
+        // Backbone edges (structural). FOLLOW: these recede with everything
+        // else on the stall clock (stall_dim), same rationale as the nodes.
         render_edges(
             buf,
             &placed,
             &vp,
             &self.cons.edges,
-            dim_color(Color::Rgb(90, 90, 110), dim_amt),
+            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), stall_dim),
             self.canvas.size(),
         );
 
@@ -380,6 +441,53 @@ impl State {
                     self.cons.edges.iter().copied().filter(|(a, b)| *a == cid || *b == cid).collect();
                 if !hot_edges.is_empty() {
                     render_edges(buf, &placed, &vp, &hot_edges, Color::Rgb(230, 80, 60), self.canvas.size());
+                }
+            }
+        }
+
+        // FOLLOW: a small invitation right under the culprit, present
+        // whenever there's somewhere to dive to (not mid-dive already) — the
+        // "what do I do with this" answer made concrete at the node itself.
+        // Prefer just below the box; the layout can place a node flush
+        // against the footer row with no room underneath, so fall back to
+        // its right side on the title row rather than silently dropping it.
+        if self.stall && self.zoom_target.is_none() {
+            if let Some(cid) = self.injector.culprit {
+                if let Some(screen) = placed.iter().find(|(id, _)| *id == cid).and_then(|(_, r)| vp.project(*r)) {
+                    let prompt = "↵ dive";
+                    let footer_y = area.bottom().saturating_sub(1);
+                    let prompt_color = Style::default().fg(Color::Rgb(230, 80, 60));
+                    if screen.bottom() < footer_y {
+                        buf.set_string(screen.x + 1, screen.bottom(), prompt, prompt_color);
+                    } else if screen.right() + 1 + prompt.len() as u16 <= area.right() {
+                        buf.set_string(screen.right() + 1, screen.y, prompt, prompt_color);
+                    }
+                }
+            }
+        }
+
+        // Legibility baseline (both modes): the focused (or, under --stall,
+        // culprit) node gets a full readout — its whole comm plus live
+        // cpu%/mem% — since its box label is elided to a 2-char stump at
+        // small sizes. A header line at top-left, one row below the rim.
+        // Drawn last (after nodes/edges/prompt) so routed wires never paint
+        // over it, and only in the overview (the dive overlay has its own
+        // title_line once zoomed in).
+        if self.zoom_target.is_none() {
+            // Under --stall, the culprit takes priority over plain focus so
+            // its full comm/cpu/mem readout is always on-screen — the
+            // "unmistakable" requirement doesn't stop at the border color.
+            let readout_id = if self.stall { self.injector.culprit.or(self.focus) } else { self.focus };
+            if let Some(readout_id) = readout_id {
+                if let Some(n) = self.cons.nodes.iter().find(|n| n.id == readout_id) {
+                    let cpu = self.cpu_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
+                    let mem = self.mem_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
+                    let tag = if self.stall && self.injector.culprit == Some(readout_id) { " [culprit]" } else { "" };
+                    let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%", n.comm);
+                    let y = area.y + 1;
+                    if y < area.bottom() {
+                        buf.set_string(area.x + 1, y, &readout, Style::default().fg(Color::White));
+                    }
                 }
             }
         }
@@ -400,6 +508,9 @@ impl State {
         if self.stall {
             footer.push_str(&format!(" intensity={s:.2}"));
         }
+        // Legibility baseline (both modes): a one-line legend so the visual
+        // encoding is never a guessing game.
+        footer.push_str("  size=CPU  heat=memory  red=stall");
         if area.height > 0 {
             let y = area.bottom().saturating_sub(1);
             buf.set_string(area.x + 1, y, &footer, Style::default().fg(Color::White));
@@ -563,10 +674,41 @@ impl State {
             |mean| Style::default().fg(Color::Rgb((60.0 + 195.0 * mean) as u8, 90, 70)),
         );
 
-        let label = format!("period {:.1}s", self.injector.period_s);
-        if (label.len() as u16) < strip.width {
-            buf.set_string(strip.x, strip.y.saturating_sub(1), &label, Style::default().fg(Color::Gray));
+        // PROVE: the payoff readout — "I found the periodic thing stalling
+        // the system", in domain-agnostic period/clock terms. Stacked right
+        // above the braille strip when there's room for all three lines;
+        // degrades to just the period line (the old behavior) in a squeezed
+        // Lod::Full rect rather than disappearing outright.
+        let duration_ms = self.duration_ms();
+        let lines = [
+            format!("period {:.1}s", self.injector.period_s),
+            format!("duration ~{duration_ms}ms"),
+            "acting on a clock".to_string(),
+        ];
+        let gap = strip.y.saturating_sub(outer.y + 1); // rows free above the strip, below the title
+        if gap >= lines.len() as u16 {
+            for (i, line) in lines.iter().enumerate() {
+                let y = strip.y - lines.len() as u16 + i as u16;
+                if (line.len() as u16) < strip.width {
+                    buf.set_string(strip.x, y, line, Style::default().fg(Color::Gray));
+                }
+            }
+        } else if gap >= 1 {
+            let label = &lines[0];
+            if (label.len() as u16) < strip.width {
+                buf.set_string(strip.x, strip.y.saturating_sub(1), label, Style::default().fg(Color::Gray));
+            }
         }
+    }
+
+    /// A plausible synthetic duration for the injected hiccup, in whole ms:
+    /// the injector's `sigma` is the pulse's std-dev as a fraction of its
+    /// period, so `sigma * period_s * 1000` is the width (in ms) of the
+    /// "busy" portion of one pulse — a stand-in for a measured stall
+    /// duration, honestly derived from the same synthetic clock as the rest
+    /// of the story rather than an unrelated made-up number.
+    fn duration_ms(&self) -> i64 {
+        (self.injector.sigma * self.injector.period_s * 1000.0).round() as i64
     }
 }
 
@@ -836,7 +978,12 @@ fn build_graph(samples: &[ProcSample], ids: &mut CommIds) -> Constellation {
         edge_set.insert((p, c));
     }
 
-    let mut nodes: Vec<GNode> = agg.into_values().collect();
+    // Kernel threads have no user-space memory, so /proc/PID/statm resident
+    // aggregates to 0 for them. Drop those BEFORE the significance cap so the
+    // map shows the user's real apps (kt*/ir*/ksoftirqd/etc. never compete for
+    // one of the MAX_NODES slots). If this ever leaves zero nodes, downstream
+    // code already guards against an empty node set (no panics).
+    let mut nodes: Vec<GNode> = agg.into_values().filter(|n| n.rss_pages > 0).collect();
     if nodes.len() > MAX_NODES {
         // Keep only the top MAX_NODES by significance (cpu_jiffies desc, then
         // rss_pages desc as a tiebreak) so the visible set stays stable
@@ -865,8 +1012,11 @@ struct NodeVisual {
 }
 
 fn encode_node(cpu_frac: f32, mem_frac: f32, strain: f32) -> NodeVisual {
-    const MIN_CELLS: f32 = 3.0;
-    const MAX_CELLS: f32 = 14.0;
+    // Floor raised so every box is wide enough to show ~8-10 chars of the
+    // comm label (interior width = cells - 2 for the borders); still grows
+    // with CPU up to MAX_CELLS for the busiest nodes.
+    const MIN_CELLS: f32 = 12.0;
+    const MAX_CELLS: f32 = 22.0;
     let cpu = cpu_frac.clamp(0.0, 1.0);
     let cells = (MIN_CELLS + (MAX_CELLS - MIN_CELLS) * cpu).round() as u16;
 
@@ -890,20 +1040,55 @@ fn build_canvas(cons: &Constellation, cpu_max: u64) -> GraphCanvas {
     let mut canvas = GraphCanvas::new(200, 80).with_grid(2);
     for n in &cons.nodes {
         let side = node_side(n.cpu_jiffies, cpu_max);
-        // Nodes are boxes; height a bit shorter than width reads better in cells.
-        let h = (side / 2).max(3);
-        canvas.add(n.id, FloatRect::new(0, 0, side.max(3), h));
+        // Nodes are wide-but-short boxes: width carries the label (comm text),
+        // height only needs to fit the top border (which doubles as the
+        // title row), one interior row, and the bottom border.
+        let h = (side / 4).max(3);
+        canvas.add(n.id, FloatRect::new(0, 0, side, h));
     }
+    // Process lineage is shallow (systemd -> app -> worker, ~2-4 layers), so
+    // laying out TopBottom stacks the few layers vertically and spreads each
+    // layer's many nodes HORIZONTALLY across the wide screen. LeftRight on
+    // this same shallow-wide shape degenerates into one tall column stacked
+    // against the left edge, which is what a real /proc capture showed.
     auto_layout(
         &mut canvas,
         &cons.edges,
-        &SugiyamaParams { dir: LayerDir::LeftRight, layer_gap: 8, node_gap: 3, grid: 2 },
+        &SugiyamaParams { dir: LayerDir::TopDown, layer_gap: 5, node_gap: 3, grid: 2 },
     );
     canvas
 }
 
 fn placed_rects(canvas: &GraphCanvas, window: Rect) -> Vec<(TileId, Rect)> {
     canvas.solve(window)
+}
+
+/// The sub-rect of `area` available for the node/edge map itself: inset so
+/// the graph never paints over the perimeter rim (drawn under `--stall`,
+/// sharing the outermost row/col), the banner text (top row), the
+/// focused/culprit readout line (the row right below the rim), or the
+/// footer/legend text (bottom row) — all of which use `area`'s own
+/// border/near-border rows/cols. Applied unconditionally (not just under
+/// `--stall`) so node positions don't jitter when the stall banner toggles
+/// on/off. Two rows are reserved at the top (rim/banner, then the readout
+/// line) since both are always drawn in the overview.
+fn graph_area(area: Rect) -> Rect {
+    Rect::new(area.x + 1, area.y + 2, area.width.saturating_sub(2), area.height.saturating_sub(3))
+}
+
+/// Pan `vp` so `target`'s canvas-space rect is centered in `window` (clamped
+/// to the valid pan range by `Viewport::set_pan`). This is what keeps the
+/// stall culprit / focused / most-significant node on-screen instead of
+/// stuck at the canvas's top-left corner whenever the canvas is bigger than
+/// the terminal window.
+fn center_pan_on(vp: &mut Viewport, window: Rect, placed: &[(TileId, Rect)], target: Option<TileId>) {
+    let Some(tid) = target else { return };
+    let Some((_, crect)) = placed.iter().find(|(id, _)| *id == tid) else { return };
+    let cx = crect.x as i32 + crect.width as i32 / 2;
+    let cy = crect.y as i32 + crect.height as i32 / 2;
+    let px = (cx - window.width as i32 / 2).max(0) as u16;
+    let py = (cy - window.height as i32 / 2).max(0) as u16;
+    vp.set_pan(px, py);
 }
 
 struct Injector {
