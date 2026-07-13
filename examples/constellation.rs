@@ -56,6 +56,16 @@ enum ArrowDir {
 
 const SAMPLE_EVERY: f32 = 1.0;
 
+/// Cap on distinct comm-groups shown as nodes. Real `/proc` can have hundreds
+/// of distinct `comm`s; per-frame edge routing (`render_edges` runs grid-A*
+/// routing over the whole canvas every frame, not just on resample) over that
+/// many nodes blows well past the ~33ms frame budget. Measured on real
+/// `/proc` (~889 procs / 592 comm-groups): 40 nodes => 80-220ms/frame and the
+/// process pins a core; 20 nodes => ~18ms/frame average, comfortably under
+/// budget with the render loop idling between frames. Keep the top-N by
+/// significance so the map stays both readable and renderable.
+const MAX_NODES: usize = 20;
+
 struct State {
     stall: bool,
     paused: bool, // space toggles; while true, advance() freezes the clock
@@ -827,8 +837,22 @@ fn build_graph(samples: &[ProcSample], ids: &mut CommIds) -> Constellation {
     }
 
     let mut nodes: Vec<GNode> = agg.into_values().collect();
+    if nodes.len() > MAX_NODES {
+        // Keep only the top MAX_NODES by significance (cpu_jiffies desc, then
+        // rss_pages desc as a tiebreak) so the visible set stays stable
+        // frame-to-frame; both fields are always present every frame.
+        nodes.sort_by(|a, b| {
+            b.cpu_jiffies.cmp(&a.cpu_jiffies).then_with(|| b.rss_pages.cmp(&a.rss_pages))
+        });
+        nodes.truncate(MAX_NODES);
+    }
     nodes.sort_by_key(|n| n.id); // deterministic order for stable layout
-    let mut edges: Vec<(TileId, TileId)> = edge_set.into_iter().collect();
+
+    let survivors: HashSet<TileId> = nodes.iter().map(|n| n.id).collect();
+    let mut edges: Vec<(TileId, TileId)> = edge_set
+        .into_iter()
+        .filter(|&(p, c)| survivors.contains(&p) && survivors.contains(&c))
+        .collect();
     edges.sort();
     Constellation { nodes, edges }
 }
@@ -973,6 +997,48 @@ mod tests {
         assert!(g.edges.contains(&(worker_id, tool)));
         assert!(!g.edges.iter().any(|&(a, b)| a == b));
         assert_eq!(g.edges.len(), 2);
+    }
+
+    #[test]
+    fn build_graph_caps_to_max_nodes() {
+        // MAX_NODES + 10 distinct comms in a parent -> child chain, each with a
+        // distinct (and strictly decreasing) cpu_jiffies so the top-MAX_NODES
+        // significance cut is unambiguous: p0 (highest cpu) .. p{N-1} (lowest).
+        let total = MAX_NODES + 10;
+        let samples: Vec<ProcSample> = (0..total)
+            .map(|i| {
+                let pid = i as u32 + 1;
+                let ppid = if i == 0 { 0 } else { pid - 1 };
+                sample(pid, ppid, &format!("p{i}"), (total - i) as u64, 10)
+            })
+            .collect();
+        let mut ids = CommIds::new();
+        let g = build_graph(&samples, &mut ids);
+
+        // Capped to MAX_NODES, keeping the highest-cpu comms (p0..p{MAX_NODES-1}).
+        assert_eq!(g.nodes.len(), MAX_NODES);
+        for i in 0..MAX_NODES {
+            assert!(g.nodes.iter().any(|n| n.comm == format!("p{i}")), "p{i} should survive the cut");
+        }
+        for i in MAX_NODES..total {
+            assert!(!g.nodes.iter().any(|n| n.comm == format!("p{i}")), "p{i} should be culled");
+        }
+
+        // Final node order is still by id (deterministic layout order).
+        let ids_seq: Vec<TileId> = g.nodes.iter().map(|n| n.id).collect();
+        let mut sorted_ids = ids_seq.clone();
+        sorted_ids.sort();
+        assert_eq!(ids_seq, sorted_ids, "surviving nodes must stay sorted by id");
+
+        // Edges are filtered to survivors only: the chain has `total - 1` edges,
+        // but the edge crossing from the last survivor to the first culled node
+        // (p{MAX_NODES-1} -> p{MAX_NODES}) must be dropped, along with every
+        // edge further down the chain among culled nodes.
+        assert_eq!(g.edges.len(), MAX_NODES - 1);
+        let survivors: HashSet<TileId> = ids_seq.into_iter().collect();
+        for &(p, c) in &g.edges {
+            assert!(survivors.contains(&p) && survivors.contains(&c), "edge endpoints must both survive");
+        }
     }
 
     #[test]
