@@ -1976,6 +1976,108 @@ mod detect {
         out
     }
 
+    // ── Stall-event clock (fix: lock the inter-burst period) ────────────
+    //
+    // `analyze_periodicity` is proven correct on a clean spike series (see
+    // `recovers_known_period`), but a REAL stall burst isn't a single clean
+    // spike: the probe is ~500 Hz, so one ~250ms scheduler stall shows up as
+    // dozens of densely-elevated samples with their own jittery intra-burst
+    // texture. Autocorrelation over the raw series locks onto that
+    // intra-burst harmonic (recurring ~50x within the recording) rather than
+    // the true inter-burst clock (recurring only a handful of times), so it
+    // reported ~0.1s instead of ~3s. Fix: collapse each burst into a single
+    // EVENT onset first, grid the onsets onto a coarse uniform impulse
+    // series, and run the same proven `analyze_periodicity` on THAT.
+
+    /// Overshoot magnitude that counts as "stalled" for event-extraction: a
+    /// few times the probe's 2ms tick, comfortably above ordinary
+    /// scheduling jitter but immediately cleared by a real stall burst.
+    const EVENT_THRESHOLD_MS: f32 = 4.0;
+    /// A rising edge only starts a NEW event if the series has been below
+    /// `EVENT_THRESHOLD_MS` for at least this long; briefer dips are still
+    /// "inside" the same burst (avoids splitting one burst into several
+    /// onsets on intra-burst jitter).
+    const EVENT_DEBOUNCE_S: f64 = 0.4;
+    /// Bin width for the coarse onset-impulse grid. Coarse enough that
+    /// dense intra-burst texture collapses away, fine enough to still
+    /// resolve periods down to a few hundred ms.
+    const EVENT_BIN_S: f64 = 0.05;
+
+    /// Collapse a raw overshoot series into stall-EVENT onset timestamps:
+    /// one rising-edge-after-a-debounce-gap per burst, however many
+    /// densely-elevated samples that burst actually contains.
+    pub(super) fn extract_event_onsets(
+        samples: &[Sample],
+        threshold_ms: f32,
+        debounce_s: f64,
+    ) -> Vec<f64> {
+        let mut onsets = Vec::new();
+        if samples.is_empty() {
+            return onsets;
+        }
+        let mut above = false;
+        // Pretend we've been quiet since before the series started, so a
+        // burst right at the first sample still counts as a genuine onset.
+        let mut below_since = samples[0].t - debounce_s;
+        for s in samples {
+            let is_above = s.overshoot_ms >= threshold_ms;
+            if is_above {
+                if !above && (s.t - below_since) >= debounce_s {
+                    onsets.push(s.t);
+                }
+                above = true;
+            } else {
+                if above {
+                    below_since = s.t;
+                }
+                above = false;
+            }
+        }
+        onsets
+    }
+
+    /// Grid stall-event onsets onto a coarse uniform impulse series (1.0 in
+    /// any bin containing an onset, 0.0 elsewhere) spanning
+    /// `[span_start, span_end]`, shaped as a `Sample` series so the proven
+    /// `analyze_periodicity` can run on it directly.
+    pub(super) fn build_event_impulse_series(
+        onsets: &[f64],
+        span_start: f64,
+        span_end: f64,
+        bin_s: f64,
+    ) -> Vec<Sample> {
+        if bin_s <= 0.0 || span_end <= span_start {
+            return Vec::new();
+        }
+        let n = ((span_end - span_start) / bin_s).floor() as usize + 1;
+        let mut grid = vec![0.0f32; n.max(1)];
+        for &t in onsets {
+            if t < span_start {
+                continue;
+            }
+            let b = (((t - span_start) / bin_s).floor() as usize).min(grid.len() - 1);
+            grid[b] = 1.0;
+        }
+        grid.iter()
+            .enumerate()
+            .map(|(i, &v)| Sample { t: span_start + i as f64 * bin_s, overshoot_ms: v })
+            .collect()
+    }
+
+    /// The stall's own clock, at the event scale: collapse bursts to onsets,
+    /// grid them, and find the period of THAT — see the module comment
+    /// above for why running `analyze_periodicity` on the raw per-tick
+    /// series gets the wrong (intra-burst) answer.
+    pub(super) fn event_clock(samples: &[Sample]) -> Periodicity {
+        if samples.len() < 2 {
+            return Periodicity::default();
+        }
+        let onsets = extract_event_onsets(samples, EVENT_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+        let impulse =
+            build_event_impulse_series(&onsets, samples[0].t, samples[samples.len() - 1].t, EVENT_BIN_S);
+        analyze_periodicity(&impulse, AnalysisConfig::default())
+    }
+
     // ── Offender attribution (simplified) ───────────────────────────────
     //
     // Simplified from `diag::OffenderProbe` + `diag::analyze_offenders`:
@@ -2151,8 +2253,10 @@ mod detect {
                 })
                 .fold(0.0f32, f32::max);
 
-            // The stall's own clock: periodicity of the overshoot series itself.
-            let clock = analyze_periodicity(&samples, AnalysisConfig::default());
+            // The stall's own clock: periodicity of stall-EVENT onsets, not
+            // the raw per-tick series (see `event_clock`'s doc comment —
+            // the raw series' intra-burst texture drowns the true clock).
+            let clock = event_clock(&samples);
             let culprit_comm =
                 clock.period_s.and_then(|cp| find_periodic_offender(&self.group_history, cp));
 
@@ -2218,6 +2322,63 @@ mod detect {
             let p = analyze_periodicity(&s, AnalysisConfig::default());
             let f = p.freq_hz.expect("should find a frequency");
             assert!((f - 4.0).abs() < 0.3, "recovered freq {f} Hz");
+        }
+
+        /// Build a synthetic *bursty* stall series that models a REAL
+        /// scheduler stall, not a clean spike: every `period_s`, overshoot
+        /// is elevated in a `burst_s`-long window made of many discrete
+        /// narrow sub-spikes (repeated "wakeup was late" events) spaced
+        /// `intra_spacing_s` apart — the intra-burst texture a raw
+        /// autocorrelation locks onto — separated by long calm stretches at
+        /// the true `period_s` clock.
+        fn bursty_stall_train(
+            tick_s: f64,
+            period_s: f64,
+            burst_s: f64,
+            intra_spacing_s: f64,
+            dur_s: f64,
+        ) -> Vec<Sample> {
+            let n = (dur_s / tick_s) as usize;
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 * tick_s;
+                    let phase = t % period_s;
+                    let in_burst = phase < burst_s && (phase % intra_spacing_s) < tick_s * 1.5;
+                    let o = if in_burst { 20.0 } else { 0.2 };
+                    Sample { t, overshoot_ms: o }
+                })
+                .collect()
+        }
+
+        /// THE key correctness gate for fix 1. With only 5 repeats of the
+        /// true 3.0s clock in a 15s window but 50 repeats/cycle of a 20ms
+        /// intra-burst spike spacing, the raw (unfixed) autocorrelation's
+        /// correlation estimate for the sparse 3s clock is weak enough that
+        /// it locks onto the intra-burst spacing instead — reproducing the
+        /// real reported bug (period ~0.06s, i.e. "~0.1s") verbatim. The
+        /// event-collapsed clock (`event_clock`) must recover the true
+        /// ~3.0s inter-burst period from the exact same series.
+        #[test]
+        fn event_clock_locks_onto_inter_burst_period_not_intra_burst_texture() {
+            // 250ms dense burst (20ms-spaced sub-spikes, ~13 per burst) every
+            // 3.0s, 2ms probe tick, 15s long -> 5 bursts.
+            let s = bursty_stall_train(0.002, 3.0, 0.25, 0.02, 15.0);
+
+            // Reproduce the bug: raw analyze_periodicity over the per-tick
+            // series locks onto the intra-burst ~20ms-scale harmonic, not
+            // the true 3.0s clock.
+            let raw = analyze_periodicity(&s, AnalysisConfig::default());
+            let raw_period = raw.period_s.expect("raw series should still find *a* period");
+            assert!(
+                raw_period < 0.5,
+                "test setup check: raw period {raw_period} should reproduce the intra-burst-lock bug (~0.1s), \
+                 not the true 3.0s clock — otherwise this input no longer demonstrates the bug"
+            );
+
+            // The fix: event-collapse first, then find the period of THAT.
+            let clock = event_clock(&s);
+            let period = clock.period_s.expect("event clock should find a period");
+            assert!((period - 3.0).abs() < 0.5, "event-clock period {period}, expected ~3.0s");
         }
 
         /// Ported verbatim from `diag.rs`'s `flat_series_has_no_period`.
