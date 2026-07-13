@@ -348,8 +348,8 @@ impl State {
 
         // Weather: a faint full-screen wash + perimeter rim, both scaled by
         // `s`, so the whole map visibly breathes on the stall clock. Drawn
-        // before the nodes so it reads as background, not an overlay on top
-        // of them.
+        // before edges/nodes so it reads as background, not an overlay on
+        // top of them.
         if self.stall {
             let wash = Color::Rgb((25.0 * s) as u8, (10.0 * s) as u8, (10.0 * s) as u8);
             buf.fill(area, Cell::new(" ", Style::default().bg(wash)));
@@ -365,32 +365,97 @@ impl State {
                     style: Style::default().fg(rim_col),
                 },
             );
+        }
 
-            // NOTICE: the detection banner — the reason to look and the
-            // answer to "what do I do with this". Spans the top rim row;
-            // brightness scales with the pulse so it, too, breathes on the
-            // stall clock. Domain-agnostic: period/clock + resource-category
-            // language only. The named resource is the culprit's own
-            // dominant axis (item 5): whichever of cpu/mem/disk it's
-            // currently heaviest on.
-            let contended = self
-                .injector
-                .culprit
-                .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
-                .unwrap_or(Resource::Cpu);
-            let banner = format!(
-                "⚠ stall detected — contention on {} — acting on a ~{:.1}s clock",
-                resource_label(contended),
-                self.injector.period_s
-            );
-            if area.width as usize > banner.chars().count() {
-                let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
-                let x = area.x + (area.width - banner.chars().count() as u16) / 2;
-                buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
+        // Draw order (iteration 3b, item 5): edges, then node boxes, then
+        // banner + readout + footer text last, so routed wires and box
+        // outlines never paint over legible text.
+
+        // Backbone edges (structural). FOLLOW: these recede with everything
+        // else on the stall clock, same rationale as the nodes — and while a
+        // stall is active they're additionally held to a heavy dim floor for
+        // the whole duration (not just at a pulse peak), so they don't add
+        // to the tangle while the culprit's resource star (below) is meant
+        // to be the only thing competing for ink.
+        let backbone_dim = if self.stall { stall_dim.max(0.6) } else { stall_dim };
+        render_edges(
+            buf,
+            &placed,
+            &vp,
+            &self.cons.edges,
+            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), backbone_dim),
+            self.canvas.size(),
+        );
+
+        // Contention overlays (iteration 3b, items 1-2): draw-only edges
+        // meaning "these groups share a resource axis". In CALM mode this is
+        // structure, not a stall effect — faint, colour-coded, capped to the
+        // busiest top-2 resources by activity so at most two axes' worth of
+        // edges ever compete for ink (item 1). Under `--stall` this whole
+        // background picture is suppressed: the only contention edges drawn
+        // are the culprit's own hot star below, so the stall view reads as a
+        // clean hub-and-spoke instead of a tangle (item 2).
+        let node_ids: Vec<TileId> = self.cons.nodes.iter().map(|n| n.id).collect();
+        if !self.stall {
+            let contention = contention_edges(&node_ids, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+            let mut activity = [
+                (Resource::Cpu, resource_activity(&node_ids, &self.cpu_frac)),
+                (Resource::Mem, resource_activity(&node_ids, &self.mem_frac)),
+                (Resource::Disk, resource_activity(&node_ids, &self.io_frac)),
+            ];
+            activity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for &(resource, total) in activity.iter().take(2) {
+                if total <= 0.0 {
+                    continue; // nothing on this axis at all this frame
+                }
+                let subset: Vec<(TileId, TileId)> = contention
+                    .iter()
+                    .filter(|(_, _, r)| *r == resource)
+                    .map(|(a, b, _)| (*a, *b))
+                    .collect();
+                if subset.is_empty() {
+                    continue;
+                }
+                let faint = dim_color(faint_color(resource_color(resource)), dim_amt);
+                // Same elevated crossing penalty as the stall hot star
+                // (item 3): all contention-edge routing biases hard toward
+                // crossing-free routes, not just the culprit's overlay.
+                render_edges_penalized(buf, &placed, &vp, &subset, faint, self.canvas.size(), 4, 20);
             }
         }
 
-        // Nodes.
+        // During a stall pulse, flare the culprit's own dominant resource hot
+        // — edges running FROM the culprit to the other nodes it's currently
+        // contending with on that axis. Under `--stall` this is the ONLY
+        // contention drawing (the faint background overlay above is
+        // suppressed for the duration), and it routes with a much higher
+        // crossing penalty (item 3) than every other edge set so it reads as
+        // a clean hub-and-spoke rather than tangling in the thin gaps
+        // between a horizontal row of boxes. Anchored explicitly at the
+        // culprit (not merely filtered from the generic star above) so it
+        // flares whenever the culprit has any qualifying partner on its
+        // dominant axis, independent of whether the culprit happens to also
+        // be that axis's top-ranked node overall.
+        if self.stall && s > 0.5 {
+            if let Some(cid) = self.injector.culprit {
+                let dom = dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+                let frac = match dom {
+                    Resource::Cpu => &self.cpu_frac,
+                    Resource::Mem => &self.mem_frac,
+                    Resource::Disk => &self.io_frac,
+                };
+                let partners = top_partners(cid, &node_ids, frac, CONTENTION_K - 1);
+                if !partners.is_empty() {
+                    let hot_edges: Vec<(TileId, TileId)> = partners.into_iter().map(|id| (cid, id)).collect();
+                    let hot_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s);
+                    render_edges_penalized(buf, &placed, &vp, &hot_edges, hot_color, self.canvas.size(), 4, 20);
+                }
+            }
+        }
+
+        // Nodes (boxes), drawn after every edge set so a box's fill/outline
+        // always sits on top of a routed wire rather than being crossed by
+        // one (item 5).
         for (id, crect) in &placed {
             if let Some(screen) = vp.project(*crect) {
                 let cpu = self.cpu_frac.get(id).copied().unwrap_or(0.0);
@@ -446,92 +511,29 @@ impl State {
             }
         }
 
-        // Backbone edges (structural). FOLLOW: these recede with everything
-        // else on the stall clock (stall_dim), same rationale as the nodes.
-        render_edges(
-            buf,
-            &placed,
-            &vp,
-            &self.cons.edges,
-            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), stall_dim),
-            self.canvas.size(),
-        );
-
-        // Materialize: while the stall pulse is high, light up the culprit's
-        // lineage edges in a hot hue — a second overlay edge set atop the
-        // backbone, appearing only during a stall and fading between.
-        if self.stall && s > 0.5 {
-            if let Some(cid) = self.injector.culprit {
-                let hot_edges: Vec<(TileId, TileId)> =
-                    self.cons.edges.iter().copied().filter(|(a, b)| *a == cid || *b == cid).collect();
-                if !hot_edges.is_empty() {
-                    render_edges(buf, &placed, &vp, &hot_edges, Color::Rgb(230, 80, 60), self.canvas.size());
-                }
-            }
-        }
-
-        // Contention overlays (iteration 3, items 3-4): draw-only edges
-        // meaning "these groups share a resource axis". Faint + colour-coded
-        // in BOTH modes — this is structure, not a stall effect, so it is
-        // NOT gated on `self.stall`. Drawn after the backbone so it reads as
-        // an overlay on the lineage skeleton, not a replacement for it.
-        let node_ids: Vec<TileId> = self.cons.nodes.iter().map(|n| n.id).collect();
-        let contention = contention_edges(&node_ids, &self.cpu_frac, &self.mem_frac, &self.io_frac);
-        for resource in [Resource::Cpu, Resource::Mem, Resource::Disk] {
-            let subset: Vec<(TileId, TileId)> = contention
-                .iter()
-                .filter(|(_, _, r)| *r == resource)
-                .map(|(a, b, _)| (*a, *b))
-                .collect();
-            if subset.is_empty() {
-                continue;
-            }
-            let faint = dim_color(dim_color(faint_color(resource_color(resource)), dim_amt), stall_dim);
-            render_edges(buf, &placed, &vp, &subset, faint, self.canvas.size());
-        }
-
-        // During a stall pulse, flare the culprit's own dominant resource hot
-        // — edges running FROM the culprit to the other nodes it's currently
-        // contending with on that axis — on top of the faint overlay above.
-        // Anchored explicitly at the culprit (not merely filtered from the
-        // generic star above) so it flares whenever the culprit has any
-        // qualifying partner on its dominant axis, independent of whether the
-        // culprit happens to also be that axis's top-ranked node overall.
-        if self.stall && s > 0.5 {
-            if let Some(cid) = self.injector.culprit {
-                let dom = dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac);
-                let frac = match dom {
-                    Resource::Cpu => &self.cpu_frac,
-                    Resource::Mem => &self.mem_frac,
-                    Resource::Disk => &self.io_frac,
-                };
-                let partners = top_partners(cid, &node_ids, frac, CONTENTION_K - 1);
-                if !partners.is_empty() {
-                    let hot_edges: Vec<(TileId, TileId)> = partners.into_iter().map(|id| (cid, id)).collect();
-                    let hot_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s);
-                    render_edges(buf, &placed, &vp, &hot_edges, hot_color, self.canvas.size());
-                }
-            }
-        }
-
-        // FOLLOW: a small invitation right under the culprit, present
-        // whenever there's somewhere to dive to (not mid-dive already) — the
-        // "what do I do with this" answer made concrete at the node itself.
-        // Prefer just below the box; the layout can place a node flush
-        // against the footer row with no room underneath, so fall back to
-        // its right side on the title row rather than silently dropping it.
-        if self.stall && self.zoom_target.is_none() {
-            if let Some(cid) = self.injector.culprit {
-                if let Some(screen) = placed.iter().find(|(id, _)| *id == cid).and_then(|(_, r)| vp.project(*r)) {
-                    let prompt = "↵ dive";
-                    let footer_y = area.bottom().saturating_sub(1);
-                    let prompt_color = Style::default().fg(Color::Rgb(230, 80, 60));
-                    if screen.bottom() < footer_y {
-                        buf.set_string(screen.x + 1, screen.bottom(), prompt, prompt_color);
-                    } else if screen.right() + 1 + prompt.len() as u16 <= area.right() {
-                        buf.set_string(screen.right() + 1, screen.y, prompt, prompt_color);
-                    }
-                }
+        // NOTICE: the detection banner — the reason to look and the answer
+        // to "what do I do with this". Spans the top rim row; brightness
+        // scales with the pulse so it, too, breathes on the stall clock.
+        // Domain-agnostic: period/clock + resource-category language only.
+        // The named resource is the culprit's own dominant axis: whichever
+        // of cpu/mem/disk it's currently heaviest on. Drawn after every edge
+        // and box this frame (item 5) so a routed wire can never paint over
+        // it.
+        if self.stall {
+            let contended = self
+                .injector
+                .culprit
+                .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
+                .unwrap_or(Resource::Cpu);
+            let banner = format!(
+                "⚠ stall detected — contention on {} — acting on a ~{:.1}s clock",
+                resource_label(contended),
+                self.injector.period_s
+            );
+            if area.width as usize > banner.chars().count() {
+                let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
+                let x = area.x + (area.width - banner.chars().count() as u16) / 2;
+                buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
             }
         }
 
@@ -539,7 +541,10 @@ impl State {
         // culprit) node gets a full readout — its whole comm plus live
         // cpu%/mem% — since its box label is elided to a 2-char stump at
         // small sizes. A header line at top-left, one row below the rim.
-        // Drawn last (after nodes/edges/prompt) so routed wires never paint
+        // Under `--stall` this line also carries the dive invitation (item
+        // 4): appended here instead of drawn under the culprit box, it's
+        // permanently out of the edge band, so no routed wire can ever clip
+        // it. Drawn last (after nodes/edges) so routed wires never paint
         // over it, and only in the overview (the dive overlay has its own
         // title_line once zoomed in).
         if self.zoom_target.is_none() {
@@ -551,8 +556,10 @@ impl State {
                 if let Some(n) = self.cons.nodes.iter().find(|n| n.id == readout_id) {
                     let cpu = self.cpu_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
                     let mem = self.mem_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
-                    let tag = if self.stall && self.injector.culprit == Some(readout_id) { " [culprit]" } else { "" };
-                    let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%", n.comm);
+                    let is_readout_culprit = self.stall && self.injector.culprit == Some(readout_id);
+                    let tag = if is_readout_culprit { " [culprit]" } else { "" };
+                    let dive_hint = if is_readout_culprit { "   ↵ dive to inspect" } else { "" };
+                    let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%{dive_hint}", n.comm);
                     let y = area.y + 1;
                     if y < area.bottom() {
                         buf.set_string(area.x + 1, y, &readout, Style::default().fg(Color::White));
@@ -887,7 +894,7 @@ fn dominant_resource(
 /// this to count as "contending" at all, and at most this many nodes per
 /// resource enter the star (hub + up to K-1 spokes).
 const CONTENTION_THRESHOLD: f32 = 0.05;
-const CONTENTION_K: usize = 4;
+const CONTENTION_K: usize = 3;
 
 /// Rank `node_ids` by `frac`, excluding `hub`, keeping only values above
 /// `CONTENTION_THRESHOLD`, and return up to `k` ids highest-first. Shared by
@@ -942,10 +949,10 @@ fn contention_edges(
     edges
 }
 
-/// Route and draw backbone edges between already-placed node rects. Free
-/// function (not a `State` method) so both the outer constellation and an
-/// inner interior sub-constellation (Task 8) can reuse it with their own
-/// canvas size.
+/// Route and draw backbone edges between already-placed node rects, using
+/// the default (bend=4, crossing=8) routing penalties. Free function (not a
+/// `State` method) so both the outer constellation and an inner interior
+/// sub-constellation (Task 8) can reuse it with their own canvas size.
 fn render_edges(
     buf: &mut Buffer,
     placed: &[(TileId, Rect)],
@@ -953,6 +960,26 @@ fn render_edges(
     edges: &[(TileId, TileId)],
     color: Color,
     canvas_size: (u16, u16),
+) {
+    render_edges_penalized(buf, placed, vp, edges, color, canvas_size, 4, 8);
+}
+
+/// As `render_edges`, but with explicit `route_all` bend/crossing penalties.
+/// Contention edges (iteration 3b) route with a much higher crossing
+/// penalty than backbone edges so the router biases hard toward
+/// crossing-free, straight routes — the culprit's resource star should read
+/// as a clean hub-and-spoke, not a tangle, in the thin gaps between a
+/// horizontal row of boxes.
+#[allow(clippy::too_many_arguments)] // thin routing/drawing wrapper; a struct would be more ceremony than the two extra params it replaces
+fn render_edges_penalized(
+    buf: &mut Buffer,
+    placed: &[(TileId, Rect)],
+    vp: &Viewport,
+    edges: &[(TileId, TileId)],
+    color: Color,
+    canvas_size: (u16, u16),
+    bend_penalty: u32,
+    crossing_penalty: u32,
 ) {
     use mullion::border::LineWeight;
     use mullion::float::free_cells_in_window;
@@ -975,9 +1002,17 @@ fn render_edges(
         let (Some(s), Some(d)) = (src.attach(ra), dst.attach(rb)) else { continue };
         reqs.push(RouteRequest::new(s, d, src.outward().opposite(), dst.outward().opposite()));
     }
-    let wires: Vec<_> = route_all(&free, &reqs, 4, 8).into_iter().flatten().collect();
+    let wires: Vec<_> = route_all(&free, &reqs, bend_penalty, crossing_penalty).into_iter().flatten().collect();
     let styles = vec![Style::default().fg(color); wires.len()];
     render_connectors(buf, vp.visible(), vp.origin(), &wires, &styles, &node_rects, LineWeight::Light);
+}
+
+/// Total per-resource contention activity this frame — sum of qualifying
+/// (above-threshold) fractions across all shown nodes. Used to rank
+/// resources by "how much is currently being contended for" so calm mode
+/// can draw just the busiest couple of axes instead of all three at once.
+fn resource_activity(node_ids: &[TileId], frac: &HashMap<TileId, f32>) -> f32 {
+    node_ids.iter().filter_map(|id| frac.get(id).copied()).filter(|&v| v > CONTENTION_THRESHOLD).sum()
 }
 
 fn main() -> Result<()> {
@@ -1507,16 +1542,22 @@ mod tests {
 
     #[test]
     fn contention_edges_star_per_resource_with_threshold() {
-        // Four nodes with known per-resource values:
-        //   cpu:  1=0.9 (hub), 2=0.6, 3=0.4, 4=0.01 (below threshold)
-        //     -> 3 nodes qualify: star from 1 to {2, 3}.
+        // Five nodes with known per-resource values:
+        //   cpu:  1=0.9 (hub), 2=0.6, 3=0.4, 4=0.3 (4 qualify, but K=3 caps
+        //         the star to hub + top-2 spokes), 5=0.01 (below threshold)
+        //     -> star from 1 to {2, 3}; node 4 is excluded by the K=3 cap
+        //        even though it clears the threshold, and node 5 is excluded
+        //        by the threshold itself.
         //   mem:  1=0.9 only heavy node, everyone else below threshold
         //     -> fewer than 2 qualify: no mem edges at all.
         //   disk: all nodes below threshold -> no disk edges at all.
-        let ids: Vec<TileId> = vec![1, 2, 3, 4];
-        let cpu: HashMap<TileId, f32> = [(1, 0.9), (2, 0.6), (3, 0.4), (4, 0.01)].into_iter().collect();
-        let mem: HashMap<TileId, f32> = [(1, 0.9), (2, 0.02), (3, 0.01), (4, 0.0)].into_iter().collect();
-        let disk: HashMap<TileId, f32> = [(1, 0.02), (2, 0.01), (3, 0.0), (4, 0.0)].into_iter().collect();
+        let ids: Vec<TileId> = vec![1, 2, 3, 4, 5];
+        let cpu: HashMap<TileId, f32> =
+            [(1, 0.9), (2, 0.6), (3, 0.4), (4, 0.3), (5, 0.01)].into_iter().collect();
+        let mem: HashMap<TileId, f32> =
+            [(1, 0.9), (2, 0.02), (3, 0.01), (4, 0.0), (5, 0.0)].into_iter().collect();
+        let disk: HashMap<TileId, f32> =
+            [(1, 0.02), (2, 0.01), (3, 0.0), (4, 0.0), (5, 0.0)].into_iter().collect();
 
         let edges = contention_edges(&ids, &cpu, &mem, &disk);
 
@@ -1525,9 +1566,10 @@ mod tests {
         assert!(!edges.iter().any(|(_, _, r)| *r == Resource::Disk), "disk: <2 heavy nodes -> no edges");
         let cpu_edges: Vec<(TileId, TileId)> =
             edges.iter().filter(|(_, _, r)| *r == Resource::Cpu).map(|(a, b, _)| (*a, *b)).collect();
-        assert_eq!(cpu_edges.len(), 2, "cpu star: hub -> 2 and hub -> 3");
+        assert_eq!(cpu_edges.len(), 2, "cpu star (K=3): hub -> 2 and hub -> 3 only");
         assert!(cpu_edges.contains(&(1, 2)));
         assert!(cpu_edges.contains(&(1, 3)));
-        assert!(!cpu_edges.iter().any(|&(a, b)| a == 4 || b == 4), "below-threshold node excluded");
+        assert!(!cpu_edges.iter().any(|&(a, b)| a == 4 || b == 4), "K=3 cap excludes node 4 despite clearing threshold");
+        assert!(!cpu_edges.iter().any(|&(a, b)| a == 5 || b == 5), "below-threshold node 5 excluded");
     }
 }
