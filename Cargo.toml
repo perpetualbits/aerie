@@ -38,6 +38,10 @@ assets = [
 name = "spiral_stress"
 path = "examples/spiral_stress.rs"
 
+[[bin]]
+name = "constellation"
+path = "examples/constellation.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
