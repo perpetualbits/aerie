@@ -74,10 +74,12 @@ struct State {
     since_sample: f32,
     ids: CommIds,
     prev_cpu: HashMap<TileId, u64>, // last cumulative jiffies per node id
+    prev_io: HashMap<TileId, u64>,  // last cumulative blkio ticks per node id
     cons: Constellation,
     canvas: GraphCanvas,
     cpu_frac: HashMap<TileId, f32>, // per-frame normalized deltas
     mem_frac: HashMap<TileId, f32>,
+    io_frac: HashMap<TileId, f32>, // per-frame normalized blkio (disk-wait) deltas
     injector: Injector,
     // Task 8: semantic zoom (dive/surface) + spatial breadcrumb.
     last_samples: Vec<ProcSample>, // for the interior fallback (member PIDs)
@@ -97,10 +99,12 @@ impl State {
             since_sample: 0.0,
             ids: CommIds::new(),
             prev_cpu: HashMap::new(),
+            prev_io: HashMap::new(),
             cons: Constellation { nodes: Vec::new(), edges: Vec::new() },
             canvas: GraphCanvas::new(1, 1),
             cpu_frac: HashMap::new(),
             mem_frac: HashMap::new(),
+            io_frac: HashMap::new(),
             injector: Injector::new(),
             last_samples: Vec::new(),
             last_area: Rect::new(0, 0, 80, 24),
@@ -267,6 +271,18 @@ impl State {
             .map(|n| (n.id, n.rss_pages as f32 / mmax as f32))
             .collect();
 
+        // Disk (block-I/O wait) deltas vs previous cumulative blkio ticks —
+        // same delta-normalization pattern as CPU: seed prev=current on first
+        // sight, saturating_sub, divisor floored at 1.
+        let mut io_deltas: HashMap<TileId, u64> = HashMap::new();
+        for n in &cons.nodes {
+            let prev = self.prev_io.get(&n.id).copied().unwrap_or(n.blkio_ticks);
+            io_deltas.insert(n.id, n.blkio_ticks.saturating_sub(prev));
+        }
+        self.prev_io = cons.nodes.iter().map(|n| (n.id, n.blkio_ticks)).collect();
+        let imax = io_deltas.values().copied().max().unwrap_or(1).max(1);
+        self.io_frac = io_deltas.iter().map(|(&id, &d)| (id, d as f32 / imax as f32)).collect();
+
         // Node size follows CPU delta; lay out with the same metric so sizes match.
         let cpu_max_for_size = dmax;
         // Build canvas using delta-based sizes: temporarily map jiffies->delta.
@@ -332,8 +348,8 @@ impl State {
 
         // Weather: a faint full-screen wash + perimeter rim, both scaled by
         // `s`, so the whole map visibly breathes on the stall clock. Drawn
-        // before the nodes so it reads as background, not an overlay on top
-        // of them.
+        // before edges/nodes so it reads as background, not an overlay on
+        // top of them.
         if self.stall {
             let wash = Color::Rgb((25.0 * s) as u8, (10.0 * s) as u8, (10.0 * s) as u8);
             buf.fill(area, Cell::new(" ", Style::default().bg(wash)));
@@ -349,23 +365,97 @@ impl State {
                     style: Style::default().fg(rim_col),
                 },
             );
+        }
 
-            // NOTICE: the detection banner — the reason to look and the
-            // answer to "what do I do with this". Spans the top rim row;
-            // brightness scales with the pulse so it, too, breathes on the
-            // stall clock. Domain-agnostic: period/clock language only.
-            let banner = format!(
-                "⚠ stall detected — acting on a ~{:.1}s clock",
-                self.injector.period_s
-            );
-            if area.width as usize > banner.chars().count() {
-                let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
-                let x = area.x + (area.width - banner.chars().count() as u16) / 2;
-                buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
+        // Draw order (iteration 3b, item 5): edges, then node boxes, then
+        // banner + readout + footer text last, so routed wires and box
+        // outlines never paint over legible text.
+
+        // Backbone edges (structural). FOLLOW: these recede with everything
+        // else on the stall clock, same rationale as the nodes — and while a
+        // stall is active they're additionally held to a heavy dim floor for
+        // the whole duration (not just at a pulse peak), so they don't add
+        // to the tangle while the culprit's resource star (below) is meant
+        // to be the only thing competing for ink.
+        let backbone_dim = if self.stall { stall_dim.max(0.6) } else { stall_dim };
+        render_edges(
+            buf,
+            &placed,
+            &vp,
+            &self.cons.edges,
+            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), backbone_dim),
+            self.canvas.size(),
+        );
+
+        // Contention overlays (iteration 3b, items 1-2): draw-only edges
+        // meaning "these groups share a resource axis". In CALM mode this is
+        // structure, not a stall effect — faint, colour-coded, capped to the
+        // busiest top-2 resources by activity so at most two axes' worth of
+        // edges ever compete for ink (item 1). Under `--stall` this whole
+        // background picture is suppressed: the only contention edges drawn
+        // are the culprit's own hot star below, so the stall view reads as a
+        // clean hub-and-spoke instead of a tangle (item 2).
+        let node_ids: Vec<TileId> = self.cons.nodes.iter().map(|n| n.id).collect();
+        if !self.stall {
+            let contention = contention_edges(&node_ids, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+            let mut activity = [
+                (Resource::Cpu, resource_activity(&node_ids, &self.cpu_frac)),
+                (Resource::Mem, resource_activity(&node_ids, &self.mem_frac)),
+                (Resource::Disk, resource_activity(&node_ids, &self.io_frac)),
+            ];
+            activity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for &(resource, total) in activity.iter().take(2) {
+                if total <= 0.0 {
+                    continue; // nothing on this axis at all this frame
+                }
+                let subset: Vec<(TileId, TileId)> = contention
+                    .iter()
+                    .filter(|(_, _, r)| *r == resource)
+                    .map(|(a, b, _)| (*a, *b))
+                    .collect();
+                if subset.is_empty() {
+                    continue;
+                }
+                let faint = dim_color(faint_color(resource_color(resource)), dim_amt);
+                // Same elevated crossing penalty as the stall hot star
+                // (item 3): all contention-edge routing biases hard toward
+                // crossing-free routes, not just the culprit's overlay.
+                render_edges_penalized(buf, &placed, &vp, &subset, faint, self.canvas.size(), 4, 20);
             }
         }
 
-        // Nodes.
+        // During a stall pulse, flare the culprit's own dominant resource hot
+        // — edges running FROM the culprit to the other nodes it's currently
+        // contending with on that axis. Under `--stall` this is the ONLY
+        // contention drawing (the faint background overlay above is
+        // suppressed for the duration), and it routes with a much higher
+        // crossing penalty (item 3) than every other edge set so it reads as
+        // a clean hub-and-spoke rather than tangling in the thin gaps
+        // between a horizontal row of boxes. Anchored explicitly at the
+        // culprit (not merely filtered from the generic star above) so it
+        // flares whenever the culprit has any qualifying partner on its
+        // dominant axis, independent of whether the culprit happens to also
+        // be that axis's top-ranked node overall.
+        if self.stall && s > 0.5 {
+            if let Some(cid) = self.injector.culprit {
+                let dom = dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+                let frac = match dom {
+                    Resource::Cpu => &self.cpu_frac,
+                    Resource::Mem => &self.mem_frac,
+                    Resource::Disk => &self.io_frac,
+                };
+                let partners = top_partners(cid, &node_ids, frac, CONTENTION_K - 1);
+                if !partners.is_empty() {
+                    let hot_edges: Vec<(TileId, TileId)> = partners.into_iter().map(|id| (cid, id)).collect();
+                    let hot_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s);
+                    render_edges_penalized(buf, &placed, &vp, &hot_edges, hot_color, self.canvas.size(), 4, 20);
+                }
+            }
+        }
+
+        // Nodes (boxes), drawn after every edge set so a box's fill/outline
+        // always sits on top of a routed wire rather than being crossed by
+        // one (item 5).
         for (id, crect) in &placed {
             if let Some(screen) = vp.project(*crect) {
                 let cpu = self.cpu_frac.get(id).copied().unwrap_or(0.0);
@@ -421,48 +511,29 @@ impl State {
             }
         }
 
-        // Backbone edges (structural). FOLLOW: these recede with everything
-        // else on the stall clock (stall_dim), same rationale as the nodes.
-        render_edges(
-            buf,
-            &placed,
-            &vp,
-            &self.cons.edges,
-            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), stall_dim),
-            self.canvas.size(),
-        );
-
-        // Materialize: while the stall pulse is high, light up the culprit's
-        // lineage edges in a hot hue — a second overlay edge set atop the
-        // backbone, appearing only during a stall and fading between.
-        if self.stall && s > 0.5 {
-            if let Some(cid) = self.injector.culprit {
-                let hot_edges: Vec<(TileId, TileId)> =
-                    self.cons.edges.iter().copied().filter(|(a, b)| *a == cid || *b == cid).collect();
-                if !hot_edges.is_empty() {
-                    render_edges(buf, &placed, &vp, &hot_edges, Color::Rgb(230, 80, 60), self.canvas.size());
-                }
-            }
-        }
-
-        // FOLLOW: a small invitation right under the culprit, present
-        // whenever there's somewhere to dive to (not mid-dive already) — the
-        // "what do I do with this" answer made concrete at the node itself.
-        // Prefer just below the box; the layout can place a node flush
-        // against the footer row with no room underneath, so fall back to
-        // its right side on the title row rather than silently dropping it.
-        if self.stall && self.zoom_target.is_none() {
-            if let Some(cid) = self.injector.culprit {
-                if let Some(screen) = placed.iter().find(|(id, _)| *id == cid).and_then(|(_, r)| vp.project(*r)) {
-                    let prompt = "↵ dive";
-                    let footer_y = area.bottom().saturating_sub(1);
-                    let prompt_color = Style::default().fg(Color::Rgb(230, 80, 60));
-                    if screen.bottom() < footer_y {
-                        buf.set_string(screen.x + 1, screen.bottom(), prompt, prompt_color);
-                    } else if screen.right() + 1 + prompt.len() as u16 <= area.right() {
-                        buf.set_string(screen.right() + 1, screen.y, prompt, prompt_color);
-                    }
-                }
+        // NOTICE: the detection banner — the reason to look and the answer
+        // to "what do I do with this". Spans the top rim row; brightness
+        // scales with the pulse so it, too, breathes on the stall clock.
+        // Domain-agnostic: period/clock + resource-category language only.
+        // The named resource is the culprit's own dominant axis: whichever
+        // of cpu/mem/disk it's currently heaviest on. Drawn after every edge
+        // and box this frame (item 5) so a routed wire can never paint over
+        // it.
+        if self.stall {
+            let contended = self
+                .injector
+                .culprit
+                .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
+                .unwrap_or(Resource::Cpu);
+            let banner = format!(
+                "⚠ stall detected — contention on {} — acting on a ~{:.1}s clock",
+                resource_label(contended),
+                self.injector.period_s
+            );
+            if area.width as usize > banner.chars().count() {
+                let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
+                let x = area.x + (area.width - banner.chars().count() as u16) / 2;
+                buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
             }
         }
 
@@ -470,7 +541,10 @@ impl State {
         // culprit) node gets a full readout — its whole comm plus live
         // cpu%/mem% — since its box label is elided to a 2-char stump at
         // small sizes. A header line at top-left, one row below the rim.
-        // Drawn last (after nodes/edges/prompt) so routed wires never paint
+        // Under `--stall` this line also carries the dive invitation (item
+        // 4): appended here instead of drawn under the culprit box, it's
+        // permanently out of the edge band, so no routed wire can ever clip
+        // it. Drawn last (after nodes/edges) so routed wires never paint
         // over it, and only in the overview (the dive overlay has its own
         // title_line once zoomed in).
         if self.zoom_target.is_none() {
@@ -482,8 +556,10 @@ impl State {
                 if let Some(n) = self.cons.nodes.iter().find(|n| n.id == readout_id) {
                     let cpu = self.cpu_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
                     let mem = self.mem_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
-                    let tag = if self.stall && self.injector.culprit == Some(readout_id) { " [culprit]" } else { "" };
-                    let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%", n.comm);
+                    let is_readout_culprit = self.stall && self.injector.culprit == Some(readout_id);
+                    let tag = if is_readout_culprit { " [culprit]" } else { "" };
+                    let dive_hint = if is_readout_culprit { "   ↵ dive to inspect" } else { "" };
+                    let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%{dive_hint}", n.comm);
                     let y = area.y + 1;
                     if y < area.bottom() {
                         buf.set_string(area.x + 1, y, &readout, Style::default().fg(Color::White));
@@ -510,7 +586,7 @@ impl State {
         }
         // Legibility baseline (both modes): a one-line legend so the visual
         // encoding is never a guessing game.
-        footer.push_str("  size=CPU  heat=memory  red=stall");
+        footer.push_str("  size=CPU  heat=memory  edges=contention");
         if area.height > 0 {
             let y = area.bottom().saturating_sub(1);
             buf.set_string(area.x + 1, y, &footer, Style::default().fg(Color::White));
@@ -753,10 +829,130 @@ fn title_line(buf: &mut Buffer, rect: Rect, label: &str, color: Color) {
     }
 }
 
-/// Route and draw backbone edges between already-placed node rects. Free
-/// function (not a `State` method) so both the outer constellation and an
-/// inner interior sub-constellation (Task 8) can reuse it with their own
-/// canvas size.
+/// Iteration 3: a shared resource axis that two groups can be said to
+/// "contend" for. Generic category names only — domain-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resource {
+    Cpu,
+    Mem,
+    Disk,
+}
+
+/// Dim, resource-tinted colour for the faint (both-modes) contention overlay.
+fn resource_color(r: Resource) -> Color {
+    match r {
+        Resource::Cpu => Color::Rgb(220, 170, 40),
+        Resource::Mem => Color::Rgb(150, 110, 230),
+        Resource::Disk => Color::Rgb(60, 190, 180),
+    }
+}
+
+/// Domain-agnostic label for the stall banner.
+fn resource_label(r: Resource) -> &'static str {
+    match r {
+        Resource::Cpu => "CPU",
+        Resource::Mem => "memory",
+        Resource::Disk => "disk",
+    }
+}
+
+/// Scale an RGB colour to a faint fraction of itself — the baseline
+/// brightness for contention edges in BOTH modes (structure, not a stall
+/// effect), distinct from `dim_color`'s dive-recede blend.
+fn faint_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => {
+            Color::Rgb((r as f32 * 0.35) as u8, (g as f32 * 0.35) as u8, (b as f32 * 0.35) as u8)
+        }
+        other => other,
+    }
+}
+
+/// The culprit's own dominant resource axis this frame: whichever of its
+/// cpu/mem/disk normalized values is largest. Memory (RSS) is essentially
+/// never zero for a surviving node, so this always resolves to something
+/// sane even when the culprit's current-frame cpu/disk deltas are both 0.
+fn dominant_resource(
+    cid: TileId,
+    cpu_frac: &HashMap<TileId, f32>,
+    mem_frac: &HashMap<TileId, f32>,
+    io_frac: &HashMap<TileId, f32>,
+) -> Resource {
+    let c = cpu_frac.get(&cid).copied().unwrap_or(0.0);
+    let m = mem_frac.get(&cid).copied().unwrap_or(0.0);
+    let d = io_frac.get(&cid).copied().unwrap_or(0.0);
+    if d >= c && d >= m {
+        Resource::Disk
+    } else if m >= c {
+        Resource::Mem
+    } else {
+        Resource::Cpu
+    }
+}
+
+/// Contention-edge threshold/fan-out: a node's per-resource value must clear
+/// this to count as "contending" at all, and at most this many nodes per
+/// resource enter the star (hub + up to K-1 spokes).
+const CONTENTION_THRESHOLD: f32 = 0.05;
+const CONTENTION_K: usize = 3;
+
+/// Rank `node_ids` by `frac`, excluding `hub`, keeping only values above
+/// `CONTENTION_THRESHOLD`, and return up to `k` ids highest-first. Shared by
+/// `contention_edges` (hub = the top-ranked node overall) and the stall
+/// hot-overlay (hub = the culprit, regardless of whether it happens to be
+/// top-ranked) so both draw the same shape of star.
+fn top_partners(hub: TileId, node_ids: &[TileId], frac: &HashMap<TileId, f32>, k: usize) -> Vec<TileId> {
+    let mut ranked: Vec<(TileId, f32)> = node_ids
+        .iter()
+        .copied()
+        .filter(|&id| id != hub)
+        .filter_map(|id| frac.get(&id).copied().map(|v| (id, v)))
+        .filter(|&(_, v)| v > CONTENTION_THRESHOLD)
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(k);
+    ranked.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Draw-only contention edges (item 3): for each resource axis, rank the
+/// shown nodes by that axis's per-frame value; if at least 2 clear
+/// `CONTENTION_THRESHOLD`, emit a star from the top (hub) node to each other
+/// qualifying node (top `CONTENTION_K`), tagged with the resource. A resource
+/// with fewer than 2 heavy nodes contributes no edges — nothing to contend.
+/// These are separate from lineage (`cons.edges`) and are never fed to
+/// `auto_layout`; they only ever affect what gets drawn on top.
+fn contention_edges(
+    node_ids: &[TileId],
+    cpu_frac: &HashMap<TileId, f32>,
+    mem_frac: &HashMap<TileId, f32>,
+    io_frac: &HashMap<TileId, f32>,
+) -> Vec<(TileId, TileId, Resource)> {
+    let mut edges = Vec::new();
+    for (resource, frac) in
+        [(Resource::Cpu, cpu_frac), (Resource::Mem, mem_frac), (Resource::Disk, io_frac)]
+    {
+        let mut ranked: Vec<(TileId, f32)> = node_ids
+            .iter()
+            .filter_map(|&id| frac.get(&id).copied().map(|v| (id, v)))
+            .filter(|&(_, v)| v > CONTENTION_THRESHOLD)
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(CONTENTION_K);
+        if ranked.len() < 2 {
+            continue; // nothing to contend on this axis this frame
+        }
+        let hub = ranked[0].0;
+        for &(id, _) in &ranked[1..] {
+            edges.push((hub, id, resource));
+        }
+    }
+    edges
+}
+
+/// Route and draw backbone edges between already-placed node rects, using
+/// the default (bend=4, crossing=8) routing penalties. Free function (not a
+/// `State` method) so both the outer constellation and an inner interior
+/// sub-constellation (Task 8) can reuse it with their own canvas size.
 fn render_edges(
     buf: &mut Buffer,
     placed: &[(TileId, Rect)],
@@ -764,6 +960,26 @@ fn render_edges(
     edges: &[(TileId, TileId)],
     color: Color,
     canvas_size: (u16, u16),
+) {
+    render_edges_penalized(buf, placed, vp, edges, color, canvas_size, 4, 8);
+}
+
+/// As `render_edges`, but with explicit `route_all` bend/crossing penalties.
+/// Contention edges (iteration 3b) route with a much higher crossing
+/// penalty than backbone edges so the router biases hard toward
+/// crossing-free, straight routes — the culprit's resource star should read
+/// as a clean hub-and-spoke, not a tangle, in the thin gaps between a
+/// horizontal row of boxes.
+#[allow(clippy::too_many_arguments)] // thin routing/drawing wrapper; a struct would be more ceremony than the two extra params it replaces
+fn render_edges_penalized(
+    buf: &mut Buffer,
+    placed: &[(TileId, Rect)],
+    vp: &Viewport,
+    edges: &[(TileId, TileId)],
+    color: Color,
+    canvas_size: (u16, u16),
+    bend_penalty: u32,
+    crossing_penalty: u32,
 ) {
     use mullion::border::LineWeight;
     use mullion::float::free_cells_in_window;
@@ -786,9 +1002,17 @@ fn render_edges(
         let (Some(s), Some(d)) = (src.attach(ra), dst.attach(rb)) else { continue };
         reqs.push(RouteRequest::new(s, d, src.outward().opposite(), dst.outward().opposite()));
     }
-    let wires: Vec<_> = route_all(&free, &reqs, 4, 8).into_iter().flatten().collect();
+    let wires: Vec<_> = route_all(&free, &reqs, bend_penalty, crossing_penalty).into_iter().flatten().collect();
     let styles = vec![Style::default().fg(color); wires.len()];
     render_connectors(buf, vp.visible(), vp.origin(), &wires, &styles, &node_rects, LineWeight::Light);
+}
+
+/// Total per-resource contention activity this frame — sum of qualifying
+/// (above-threshold) fractions across all shown nodes. Used to rank
+/// resources by "how much is currently being contended for" so calm mode
+/// can draw just the busiest couple of axes instead of all three at once.
+fn resource_activity(node_ids: &[TileId], frac: &HashMap<TileId, f32>) -> f32 {
+    node_ids.iter().filter_map(|id| frac.get(id).copied()).filter(|&v| v > CONTENTION_THRESHOLD).sum()
 }
 
 fn main() -> Result<()> {
@@ -850,6 +1074,7 @@ struct ProcStat {
     ppid: u32,
     comm: String,
     cpu_jiffies: u64,
+    blkio_ticks: u64,
 }
 
 fn parse_stat(line: &str) -> Option<ProcStat> {
@@ -861,7 +1086,7 @@ fn parse_stat(line: &str) -> Option<ProcStat> {
     let pid: u32 = line[..open].trim().parse().ok()?;
     let comm = line[open + 1..close].to_string();
     // Remainder starts at field 3 (state). 0-based within remainder:
-    //   state=0, ppid=1, ... utime=11, stime=12
+    //   state=0, ppid=1, ... utime=11, stime=12, ... delayacct_blkio_ticks=39
     let rest: Vec<&str> = line[close + 1..].split_whitespace().collect();
     if rest.len() < 13 {
         return None;
@@ -869,7 +1094,10 @@ fn parse_stat(line: &str) -> Option<ProcStat> {
     let ppid: u32 = rest[1].parse().ok()?;
     let utime: u64 = rest[11].parse().ok()?;
     let stime: u64 = rest[12].parse().ok()?;
-    Some(ProcStat { pid, ppid, comm, cpu_jiffies: utime + stime })
+    // field 42 (delayacct_blkio_ticks) isn't present on every kernel/proc
+    // snapshot; treat it as 0 rather than failing the whole parse.
+    let blkio_ticks: u64 = if rest.len() >= 40 { rest[39].parse().unwrap_or(0) } else { 0 };
+    Some(ProcStat { pid, ppid, comm, cpu_jiffies: utime + stime, blkio_ticks })
 }
 
 fn parse_statm_resident(line: &str) -> Option<u64> {
@@ -883,6 +1111,7 @@ struct ProcSample {
     comm: String,
     cpu_jiffies: u64,
     rss_pages: u64,
+    blkio_ticks: u64,
 }
 
 fn sample_procs() -> Vec<ProcSample> {
@@ -909,6 +1138,7 @@ fn sample_procs() -> Vec<ProcSample> {
             comm: st.comm,
             cpu_jiffies: st.cpu_jiffies,
             rss_pages,
+            blkio_ticks: st.blkio_ticks,
         });
     }
     out
@@ -940,6 +1170,7 @@ struct GNode {
     comm: String,
     cpu_jiffies: u64,
     rss_pages: u64,
+    blkio_ticks: u64,
 }
 
 struct Constellation {
@@ -961,9 +1192,11 @@ fn build_graph(samples: &[ProcSample], ids: &mut CommIds) -> Constellation {
             comm: s.comm.clone(),
             cpu_jiffies: 0,
             rss_pages: 0,
+            blkio_ticks: 0,
         });
         n.cpu_jiffies += s.cpu_jiffies;
         n.rss_pages += s.rss_pages;
+        n.blkio_ticks += s.blkio_ticks;
     }
 
     // Lineage edges parent-comm -> child-comm, deduped, self-edges dropped.
@@ -1118,19 +1351,32 @@ mod tests {
     use super::*;
 
     fn sample(pid: u32, ppid: u32, comm: &str, cpu: u64, rss: u64) -> ProcSample {
-        ProcSample { pid, ppid, comm: comm.into(), cpu_jiffies: cpu, rss_pages: rss }
+        ProcSample { pid, ppid, comm: comm.into(), cpu_jiffies: cpu, rss_pages: rss, blkio_ticks: 0 }
     }
 
     #[test]
     fn parses_stat_with_parens_in_comm() {
         // Real-shaped line: comm "(a b)c" contains spaces and parens.
-        // fields: 1 pid, 2 comm, 3 state, 4 ppid, ... 14 utime, 15 stime
-        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 0 40 60 0 0 20 0 1 0";
+        // fields: 1 pid, 2 comm, 3 state, 4 ppid, ... 14 utime, 15 stime,
+        // ... 42 delayacct_blkio_ticks (rest[39], padded out with trailing
+        // fields so rest.len() >= 40 and the blkio field is present).
+        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 0 40 60 0 0 20 0 1 \
+                     0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 777";
         let s = parse_stat(line).expect("should parse");
         assert_eq!(s.pid, 1234);
         assert_eq!(s.ppid, 1000);
         assert_eq!(s.comm, "(a b)c");
         assert_eq!(s.cpu_jiffies, 100); // utime 40 + stime 60
+        assert_eq!(s.blkio_ticks, 777);
+    }
+
+    #[test]
+    fn parses_stat_defaults_blkio_when_field_absent() {
+        // Same shape as before iteration 3 (short rest[]): blkio should
+        // default to 0 rather than failing the whole parse.
+        let line = "1234 ((a b)c) S 1000 1234 1234 0 -1 0 0 0 0 0 40 60 0 0 20 0 1 0";
+        let s = parse_stat(line).expect("should parse");
+        assert_eq!(s.blkio_ticks, 0);
     }
 
     #[test]
@@ -1292,5 +1538,38 @@ mod tests {
         // Same ids, sizes, edges -> identical placement (auto_layout is idempotent).
         assert_eq!(a, b, "an unchanged graph must not move between frames");
         assert_eq!(a.len(), 4);
+    }
+
+    #[test]
+    fn contention_edges_star_per_resource_with_threshold() {
+        // Five nodes with known per-resource values:
+        //   cpu:  1=0.9 (hub), 2=0.6, 3=0.4, 4=0.3 (4 qualify, but K=3 caps
+        //         the star to hub + top-2 spokes), 5=0.01 (below threshold)
+        //     -> star from 1 to {2, 3}; node 4 is excluded by the K=3 cap
+        //        even though it clears the threshold, and node 5 is excluded
+        //        by the threshold itself.
+        //   mem:  1=0.9 only heavy node, everyone else below threshold
+        //     -> fewer than 2 qualify: no mem edges at all.
+        //   disk: all nodes below threshold -> no disk edges at all.
+        let ids: Vec<TileId> = vec![1, 2, 3, 4, 5];
+        let cpu: HashMap<TileId, f32> =
+            [(1, 0.9), (2, 0.6), (3, 0.4), (4, 0.3), (5, 0.01)].into_iter().collect();
+        let mem: HashMap<TileId, f32> =
+            [(1, 0.9), (2, 0.02), (3, 0.01), (4, 0.0), (5, 0.0)].into_iter().collect();
+        let disk: HashMap<TileId, f32> =
+            [(1, 0.02), (2, 0.01), (3, 0.0), (4, 0.0), (5, 0.0)].into_iter().collect();
+
+        let edges = contention_edges(&ids, &cpu, &mem, &disk);
+
+        // Only the CPU axis has >=2 qualifying nodes; hub is node 1 (highest).
+        assert!(!edges.iter().any(|(_, _, r)| *r == Resource::Mem), "mem: <2 heavy nodes -> no edges");
+        assert!(!edges.iter().any(|(_, _, r)| *r == Resource::Disk), "disk: <2 heavy nodes -> no edges");
+        let cpu_edges: Vec<(TileId, TileId)> =
+            edges.iter().filter(|(_, _, r)| *r == Resource::Cpu).map(|(a, b, _)| (*a, *b)).collect();
+        assert_eq!(cpu_edges.len(), 2, "cpu star (K=3): hub -> 2 and hub -> 3 only");
+        assert!(cpu_edges.contains(&(1, 2)));
+        assert!(cpu_edges.contains(&(1, 3)));
+        assert!(!cpu_edges.iter().any(|&(a, b)| a == 4 || b == 4), "K=3 cap excludes node 4 despite clearing threshold");
+        assert!(!cpu_edges.iter().any(|&(a, b)| a == 5 || b == 5), "below-threshold node 5 excluded");
     }
 }
