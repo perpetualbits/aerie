@@ -223,10 +223,13 @@ impl State {
         }
         self.prev_cpu = cons.nodes.iter().map(|n| (n.id, n.cpu_jiffies)).collect();
 
-        // Task 9: under --stall, pin the injector's culprit to the
-        // highest-CPU-delta node the first time we see one, and re-elect if
-        // that comm's process disappears out from under us later. A no-op
-        // when --stall is off, so the calm (Task 8) path is unaffected.
+        // Task 9: under --stall, pin the injector's culprit to a real, stable
+        // app node the first time we see one — the SHOWN node (kernel threads
+        // already excluded in build_graph) with the highest cumulative
+        // cpu_jiffies, so it reads as a believable, recognizable culprit
+        // rather than an arbitrary first-frame pick. Re-elect only if that
+        // comm's process disappears out from under us later. A no-op when
+        // --stall is off, so the calm (Task 8) path is unaffected.
         if self.stall {
             if let Some(cid) = self.injector.culprit {
                 if !cons.nodes.iter().any(|n| n.id == cid) {
@@ -234,8 +237,7 @@ impl State {
                 }
             }
             if self.injector.culprit.is_none() {
-                self.injector.culprit =
-                    cons.nodes.iter().max_by_key(|n| deltas.get(&n.id).copied().unwrap_or(0)).map(|n| n.id);
+                self.injector.culprit = cons.nodes.iter().max_by_key(|n| n.cpu_jiffies).map(|n| n.id);
             }
         }
 
@@ -298,6 +300,13 @@ impl State {
         // map stays exactly as calm as it was at the end of Task 8.
         let s = self.injector.intensity(self.t);
 
+        // FOLLOW: how hard to dim every non-culprit node/edge toward
+        // near-black this frame. Zero below s=0.35 and rising continuously to
+        // 1.0 at a pulse peak — the zero-crossing at the threshold means
+        // there's no pop where the effect switches on, only the smooth ramp
+        // `s` already gives. Never set when --stall is off.
+        let stall_dim = if self.stall { ((s - 0.35) / 0.65).clamp(0.0, 1.0) } else { 0.0 };
+
         // Weather: a faint full-screen wash + perimeter rim, both scaled by
         // `s`, so the whole map visibly breathes on the stall clock. Drawn
         // before the nodes so it reads as background, not an overlay on top
@@ -317,6 +326,20 @@ impl State {
                     style: Style::default().fg(rim_col),
                 },
             );
+
+            // NOTICE: the detection banner — the reason to look and the
+            // answer to "what do I do with this". Spans the top rim row;
+            // brightness scales with the pulse so it, too, breathes on the
+            // stall clock. Domain-agnostic: period/clock language only.
+            let banner = format!(
+                "⚠ stall detected — acting on a ~{:.1}s clock",
+                self.injector.period_s
+            );
+            if area.width as usize > banner.chars().count() {
+                let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
+                let x = area.x + (area.width - banner.chars().count() as u16) / 2;
+                buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
+            }
         }
 
         // Nodes.
@@ -330,7 +353,12 @@ impl State {
                 let strain = if self.stall && self.injector.culprit == Some(*id) { s } else { 0.0 };
                 let vis = encode_node(cpu, mem, strain);
                 let is_focus = self.zoom_target.is_none() && self.focus == Some(*id);
-                let color = dim_color(vis.color, dim_amt);
+                let is_culprit = self.stall && self.injector.culprit == Some(*id);
+                // FOLLOW: every node except the culprit recedes toward
+                // near-black on the stall clock, so at a pulse peak the eye
+                // has nowhere else to go. The culprit is exempt here — its
+                // own hot pulse (below) carries its visibility instead.
+                let color = dim_color(dim_color(vis.color, dim_amt), if is_culprit { 0.0 } else { stall_dim });
                 // Task 9 fix: consume `vis.pulse` (0 for every node except the
                 // stall culprit under --stall) to blend the border toward a
                 // hot hue, so the culprit itself visibly breathes on the
@@ -361,13 +389,14 @@ impl State {
             }
         }
 
-        // Backbone edges (structural).
+        // Backbone edges (structural). FOLLOW: these recede with everything
+        // else on the stall clock (stall_dim), same rationale as the nodes.
         render_edges(
             buf,
             &placed,
             &vp,
             &self.cons.edges,
-            dim_color(Color::Rgb(90, 90, 110), dim_amt),
+            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), stall_dim),
             self.canvas.size(),
         );
 
@@ -380,6 +409,48 @@ impl State {
                     self.cons.edges.iter().copied().filter(|(a, b)| *a == cid || *b == cid).collect();
                 if !hot_edges.is_empty() {
                     render_edges(buf, &placed, &vp, &hot_edges, Color::Rgb(230, 80, 60), self.canvas.size());
+                }
+            }
+        }
+
+        // FOLLOW: a small invitation right under the culprit, present
+        // whenever there's somewhere to dive to (not mid-dive already) — the
+        // "what do I do with this" answer made concrete at the node itself.
+        // Prefer just below the box; the layout can place a node flush
+        // against the footer row with no room underneath, so fall back to
+        // its right side on the title row rather than silently dropping it.
+        if self.stall && self.zoom_target.is_none() {
+            if let Some(cid) = self.injector.culprit {
+                if let Some(screen) = placed.iter().find(|(id, _)| *id == cid).and_then(|(_, r)| vp.project(*r)) {
+                    let prompt = "↵ dive";
+                    let footer_y = area.bottom().saturating_sub(1);
+                    let prompt_color = Style::default().fg(Color::Rgb(230, 80, 60));
+                    if screen.bottom() < footer_y {
+                        buf.set_string(screen.x + 1, screen.bottom(), prompt, prompt_color);
+                    } else if screen.right() + 1 + prompt.len() as u16 <= area.right() {
+                        buf.set_string(screen.right() + 1, screen.y, prompt, prompt_color);
+                    }
+                }
+            }
+        }
+
+        // Legibility baseline (both modes): the focused (or, under --stall,
+        // culprit) node gets a full readout — its whole comm plus live
+        // cpu%/mem% — since its box label is elided to a 2-char stump at
+        // small sizes. A header line at top-left, one row below the rim.
+        // Drawn last (after nodes/edges/prompt) so routed wires never paint
+        // over it, and only in the overview (the dive overlay has its own
+        // title_line once zoomed in).
+        if self.zoom_target.is_none() {
+            if let Some(focus_id) = self.focus {
+                if let Some(n) = self.cons.nodes.iter().find(|n| n.id == focus_id) {
+                    let cpu = self.cpu_frac.get(&focus_id).copied().unwrap_or(0.0) * 100.0;
+                    let mem = self.mem_frac.get(&focus_id).copied().unwrap_or(0.0) * 100.0;
+                    let readout = format!("{}  cpu {cpu:.0}%  mem {mem:.0}%", n.comm);
+                    let y = area.y + 1;
+                    if y < area.bottom() {
+                        buf.set_string(area.x + 1, y, &readout, Style::default().fg(Color::White));
+                    }
                 }
             }
         }
@@ -400,6 +471,9 @@ impl State {
         if self.stall {
             footer.push_str(&format!(" intensity={s:.2}"));
         }
+        // Legibility baseline (both modes): a one-line legend so the visual
+        // encoding is never a guessing game.
+        footer.push_str("  size=CPU  heat=memory  red=stall");
         if area.height > 0 {
             let y = area.bottom().saturating_sub(1);
             buf.set_string(area.x + 1, y, &footer, Style::default().fg(Color::White));
@@ -563,10 +637,41 @@ impl State {
             |mean| Style::default().fg(Color::Rgb((60.0 + 195.0 * mean) as u8, 90, 70)),
         );
 
-        let label = format!("period {:.1}s", self.injector.period_s);
-        if (label.len() as u16) < strip.width {
-            buf.set_string(strip.x, strip.y.saturating_sub(1), &label, Style::default().fg(Color::Gray));
+        // PROVE: the payoff readout — "I found the periodic thing stalling
+        // the system", in domain-agnostic period/clock terms. Stacked right
+        // above the braille strip when there's room for all three lines;
+        // degrades to just the period line (the old behavior) in a squeezed
+        // Lod::Full rect rather than disappearing outright.
+        let duration_ms = self.duration_ms();
+        let lines = [
+            format!("period {:.1}s", self.injector.period_s),
+            format!("duration ~{duration_ms}ms"),
+            "acting on a clock".to_string(),
+        ];
+        let gap = strip.y.saturating_sub(outer.y + 1); // rows free above the strip, below the title
+        if gap >= lines.len() as u16 {
+            for (i, line) in lines.iter().enumerate() {
+                let y = strip.y - lines.len() as u16 + i as u16;
+                if (line.len() as u16) < strip.width {
+                    buf.set_string(strip.x, y, line, Style::default().fg(Color::Gray));
+                }
+            }
+        } else if gap >= 1 {
+            let label = &lines[0];
+            if (label.len() as u16) < strip.width {
+                buf.set_string(strip.x, strip.y.saturating_sub(1), label, Style::default().fg(Color::Gray));
+            }
         }
+    }
+
+    /// A plausible synthetic duration for the injected hiccup, in whole ms:
+    /// the injector's `sigma` is the pulse's std-dev as a fraction of its
+    /// period, so `sigma * period_s * 1000` is the width (in ms) of the
+    /// "busy" portion of one pulse — a stand-in for a measured stall
+    /// duration, honestly derived from the same synthetic clock as the rest
+    /// of the story rather than an unrelated made-up number.
+    fn duration_ms(&self) -> i64 {
+        (self.injector.sigma * self.injector.period_s * 1000.0).round() as i64
     }
 }
 
@@ -836,7 +941,12 @@ fn build_graph(samples: &[ProcSample], ids: &mut CommIds) -> Constellation {
         edge_set.insert((p, c));
     }
 
-    let mut nodes: Vec<GNode> = agg.into_values().collect();
+    // Kernel threads have no user-space memory, so /proc/PID/statm resident
+    // aggregates to 0 for them. Drop those BEFORE the significance cap so the
+    // map shows the user's real apps (kt*/ir*/ksoftirqd/etc. never compete for
+    // one of the MAX_NODES slots). If this ever leaves zero nodes, downstream
+    // code already guards against an empty node set (no panics).
+    let mut nodes: Vec<GNode> = agg.into_values().filter(|n| n.rss_pages > 0).collect();
     if nodes.len() > MAX_NODES {
         // Keep only the top MAX_NODES by significance (cpu_jiffies desc, then
         // rss_pages desc as a tiebreak) so the visible set stays stable
