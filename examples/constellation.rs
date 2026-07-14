@@ -1210,9 +1210,9 @@ impl State {
 
     /// Real bedrock (item 4): the detector's own recent `overshoot_series`
     /// swept across the strip as a braille trace — no synthetic values. The
-    /// readout is `period {p:.1}s · magnitude {m:.0}ms` from the cached
-    /// report, or `irregular · magnitude {m:.0}ms` when there's no clear
-    /// period.
+    /// readout is `period {p:.1}s · magnitude {m:.0}ms` using the SAME
+    /// debounced `held_period_s` the banner shows (so the two never disagree),
+    /// or `irregular · magnitude {m:.0}ms` when there's no stable period.
     fn render_real_timeline(&self, buf: &mut Buffer, outer: Rect) {
         let strip_h = 3u16.min(outer.height.saturating_sub(2));
         if outer.width < 12 || strip_h < 2 {
@@ -1250,7 +1250,12 @@ impl State {
             );
         }
 
-        let readout = match report.period_s {
+        // Use the SAME debounced clock the banner shows (`held_period_s`),
+        // not the raw per-tick `report.period_s` — otherwise the bedrock can
+        // read `irregular` while the banner says `~3.0s clock` on the same
+        // frame, since the raw reading flickers before `stable_period`
+        // settles it. Magnitude still comes straight from the report.
+        let readout = match self.held_period_s {
             Some(p) => format!("period {p:.1}s · magnitude {:.0}ms", report.magnitude_ms),
             None => format!("irregular · magnitude {:.0}ms", report.magnitude_ms),
         };
