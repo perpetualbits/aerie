@@ -665,21 +665,16 @@ impl State {
         // banner + readout + footer text last, so routed wires and box
         // outlines never paint over legible text.
 
-        // Backbone edges (structural). FOLLOW: these recede with everything
-        // else on the stall clock, same rationale as the nodes — and while a
-        // stall is active they're additionally held to a heavy dim floor for
-        // the whole duration (not just at a pulse peak), so they don't add
-        // to the tangle while the culprit's resource star (below) is meant
-        // to be the only thing competing for ink.
-        let backbone_dim = if stall_on { stall_dim.max(0.6) } else { stall_dim };
-        render_edges(
-            buf,
-            &placed,
-            &vp,
-            &self.cons.edges,
-            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), backbone_dim),
-            self.canvas.size(),
-        );
+        // Backbone lineage edges (`self.cons.edges`) are NOT drawn on the
+        // overview (iteration 8b): they used to pin the sugiyama layout,
+        // but the treemap (iteration 7) is significance-based and skips
+        // `auto_layout`, so lineage no longer pins anything here — drawing
+        // it was purely decorative and was the last remaining source of
+        // long box-glyph wires routed across non-adjacent tiles. The
+        // treemap's packed adjacency + tile sizes already convey
+        // structure. `self.cons.edges` itself is untouched and still feeds
+        // the DIVE interior (`render_interior` builds a child
+        // sub-constellation from it) — only this overview draw is removed.
 
         // Contention overlays (iteration 3b, items 1-2; reworked to a
         // treemap-native shared-wall glow in iteration 8 — see the
@@ -725,24 +720,35 @@ impl State {
             }
         }
 
-        // During a stall pulse, glow the culprit's own dominant resource hot
-        // (iteration 8: a shared-wall glow, not a routed star) — the shared
-        // walls between the culprit tile and each ADJACENT co-contender on
-        // that axis. Under `--stall` this is the ONLY contention drawn (the
-        // faint background overlay above is suppressed for the duration).
-        // Anchored explicitly at the culprit (not merely filtered from the
-        // generic star above) so it glows whenever the culprit has any
-        // qualifying partner on its dominant axis, independent of whether
-        // the culprit happens to also be that axis's top-ranked node
-        // overall. The gate is lowered from `s > 0.5` to `s > 0.30` so the
-        // glow is present through more of the pulse, not just its very
-        // peak, while still breathing on the stall clock. If the culprit
-        // has no adjacent co-contender at all (isolated in a corner of the
-        // map), a bright halo is redrawn one cell out around the culprit
-        // tile instead, so a hot cue never disappears — this is IN ADDITION
-        // to the culprit's own tile flare (heavy hot border, iteration
-        // 5/9) drawn in the node loop below, never a replacement for it.
-        if stall_on && s > 0.30 {
+        // During a stall pulse, the culprit RADIATES: every shared wall
+        // between the culprit tile and each tile it abuts on-screen glows
+        // hot, breathing with the pulse (iteration 8b). Under `--stall`
+        // this is the ONLY contention drawn (the faint background overlay
+        // above is suppressed for the duration). Anchored explicitly at
+        // the culprit so it glows whenever it's on-screen, independent of
+        // whether it happens to also be top-ranked overall.
+        //
+        // Iteration 8b fix: previously this only glowed walls shared with
+        // a genuine co-contender (`top_partners` on the dominant axis) —
+        // but a LONE hog has no co-contender, so it never glowed at all
+        // and fell back to a halo almost every frame; and the gate
+        // (`s > 0.30`) sat above this box's real pulse ceiling (~0.28) so
+        // it also almost never fired. Now: (1) the gate is `s > 0.12`,
+        // this box's real pulse floor, so it breathes visibly within
+        // range; (2) EVERY wall the culprit shares with a neighboring
+        // tile glows (not only co-contender walls) — a packed treemap
+        // tile almost always abuts several neighbors, so this makes the
+        // culprit visibly radiate heat into its surroundings on nearly
+        // every firing frame. A genuine co-contender's wall (still ranked
+        // via `top_partners` on the culprit's dominant resource) is drawn
+        // hotter/heavier to preserve "shared-resource contention" as a
+        // visible subset of the baseline radiate. If the culprit has no
+        // on-screen neighbor at all (fully isolated), the halo fallback
+        // still applies so a hot cue never disappears. This is IN
+        // ADDITION to the culprit's own tile flare (heavy hot border,
+        // iteration 5/9) drawn in the node loop below, never a
+        // replacement for it.
+        if stall_on && s > 0.12 {
             if let Some(cid) = self.culprit() {
                 // Prefer the real detector's own held resource reading when
                 // we have one (item 4: "use the REAL report values"); fall
@@ -761,21 +767,30 @@ impl State {
                     Resource::Disk => &self.io_frac,
                 };
                 let partners = top_partners(cid, &node_ids, frac, CONTENTION_K - 1);
+                // Baseline radiate color: hot, intensity proportional to
+                // `s`, but capped short of full white so a genuine
+                // co-contender wall (below) reads as hotter still.
+                let radiate_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s * 0.7);
+                // Co-contender color: the brighter, more assertive blend
+                // (as before c7cae42) — a hotter subset of the baseline.
                 let hot_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s);
                 if let Some(culprit_screen) = screen_of.get(&cid).copied() {
                     let mut glowed = false;
-                    for pid in &partners {
-                        let Some(partner_screen) = screen_of.get(pid).copied() else { continue };
-                        if let Some(seg) = shared_wall(culprit_screen, partner_screen, TREEMAP_GUTTER) {
-                            draw_wall_glow(buf, seg, hot_color);
+                    for (&nid, &neighbor_screen) in screen_of.iter() {
+                        if nid == cid {
+                            continue;
+                        }
+                        if let Some(seg) = shared_wall(culprit_screen, neighbor_screen, TREEMAP_GUTTER) {
+                            let color = if partners.contains(&nid) { hot_color } else { radiate_color };
+                            draw_wall_glow(buf, seg, color);
                             glowed = true;
                         }
                     }
                     if !glowed {
-                        // Halo fallback: no adjacent co-contender to glow a
-                        // shared wall with (or none at all this frame) —
-                        // redraw the culprit's border one cell further out
-                        // so something hot always shows, clipped to the
+                        // Halo fallback: no on-screen neighbor to glow a
+                        // shared wall with (fully isolated) — redraw the
+                        // culprit's border one cell further out so
+                        // something hot always shows, clipped to the
                         // graph area so it never bleeds into the rim/banner.
                         let halo = Rect::new(
                             culprit_screen.x.saturating_sub(1),
