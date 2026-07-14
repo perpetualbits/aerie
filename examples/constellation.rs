@@ -40,10 +40,12 @@ const FRAME: Duration = Duration::from_millis(33); // ~30 fps
 const HELP: &str = "\
 constellation — aerie unifying-face spike
 
-USAGE: constellation [--demo]
+USAGE: constellation [--demo] [--probe-debug]
   --demo    drive a synthetic periodic-stall injector instead of the real
             detector; the banner reads DEMO so it's never mistaken for a
             real detection
+  --probe-debug  dump raw probe samples/event onsets/period to stderr each
+            resample (diagnostic; real mode only)
   -h,--help show this help
 
 Default (no flag): real stall detection — a background latency probe + PSI
@@ -81,7 +83,25 @@ const MAX_NODES: usize = 12;
 /// How long (in `t` seconds) a detected stall stays displayed after the
 /// probe's reading momentarily drops below the active threshold — a single
 /// quiet sample shouldn't flicker the whole readout off (brief item 3).
-const STALL_HOLD_SECS: f32 = 1.5;
+///
+/// Fix 4 (iteration 4d): a real burst is only a small fraction of its own
+/// period (e.g. 250ms out of a 3.0s cycle), so a FIXED short hold lapses
+/// `active` in every inter-burst gap — the observed ~28%-of-polls firing.
+/// Once a period is known, hold `STALL_HOLD_PERIOD_MULT` times it (so the
+/// hold outlasts the gap between bursts, not just the burst itself);
+/// before a period is known yet, fall back to a fixed floor. See
+/// `State::stall_hold_secs`.
+const STALL_HOLD_FALLBACK_SECS: f32 = 4.0;
+const STALL_HOLD_PERIOD_MULT: f32 = 1.5;
+
+/// Fix 3 (iteration 4d): how many consecutive ACTIVE resamples the raw
+/// detected period must agree (within `PERIOD_STABLE_TOLERANCE`) before the
+/// DISPLAYED period adopts it. Stops the banner flickering between e.g.
+/// `~9.0s`/`~12s`/`irregular` on transient aliasing noise — shows the last
+/// stable value (or `irregular` before any value has stabilized) instead.
+const PERIOD_STABLE_N: usize = 3;
+/// Fractional tolerance for "the last `PERIOD_STABLE_N` raw periods agree".
+const PERIOD_STABLE_TOLERANCE: f32 = 0.2;
 
 /// Time constant for easing the shown weather pulse toward the cached real
 /// report's `pulse` between resamples, so a once-a-second report update
@@ -90,6 +110,7 @@ const PULSE_EASE_TAU: f32 = 0.4;
 
 struct State {
     demo: bool,   // --demo: synthetic injector, clearly labeled, instead of real detection
+    probe_debug: bool, // --probe-debug: STEP-0 diagnostic eprintln dump (see detect::Detector::debug_dump)
     paused: bool, // space toggles; while true, advance() freezes the clock
     t: f32,       // seconds since start
     since_sample: f32,
@@ -112,14 +133,17 @@ struct State {
     cached_report: Option<detect::DetectionReport>, // latest raw report (recomputed only on resample)
     pulse_shown: f32,                                // eased weather pulse, real mode only
     // Honest, held (hysteresis) display state — updated on resample, kept
-    // through a short `STALL_HOLD_SECS` dip so a single quiet sample doesn't
-    // flicker the banner/flare/culprit off.
+    // through a short dynamic hold (`stall_hold_secs`) so a single quiet
+    // sample doesn't flicker the banner/flare/culprit off.
     held_active: bool,
     held_resource: Option<Resource>,
     held_period_s: Option<f32>,
     held_culprit_comm: Option<String>,
     held_culprit_id: Option<TileId>,
     last_active_at: Option<f32>,
+    // Fix 3 (iteration 4d): last `PERIOD_STABLE_N` raw (undebounced) period
+    // readings from active resamples, oldest first — see `stable_period`.
+    recent_periods: std::collections::VecDeque<Option<f32>>,
     // Task 8: semantic zoom (dive/surface) + spatial breadcrumb.
     last_samples: Vec<ProcSample>, // for the interior fallback (member PIDs)
     last_area: Rect,               // most recent screen area rendered into
@@ -133,6 +157,7 @@ impl State {
     fn new(demo: bool, detector: Option<detect::Detector>, epoch: Instant) -> Self {
         let mut state = State {
             demo,
+            probe_debug: false,
             paused: false,
             t: 0.0,
             since_sample: 0.0,
@@ -156,6 +181,7 @@ impl State {
             held_culprit_comm: None,
             held_culprit_id: None,
             last_active_at: None,
+            recent_periods: std::collections::VecDeque::new(),
             last_samples: Vec::new(),
             last_area: Rect::new(0, 0, 80, 24),
             focus: None,
@@ -172,6 +198,18 @@ impl State {
     /// else the held (hysteresis) real-detection active flag.
     fn stall_on(&self) -> bool {
         self.demo || self.held_active
+    }
+
+    /// Fix 4 (iteration 4d): how long `active` survives after the probe's
+    /// reading last cleared the active threshold. Once a period is known,
+    /// `STALL_HOLD_PERIOD_MULT` times it — long enough to bridge the quiet
+    /// gap between bursts (a burst is a small fraction of its own period),
+    /// not just the burst's own duration — else a fixed floor before a
+    /// period is known yet.
+    fn stall_hold_secs(&self) -> f32 {
+        self.held_period_s
+            .map(|p| (p * STALL_HOLD_PERIOD_MULT).max(STALL_HOLD_FALLBACK_SECS))
+            .unwrap_or(STALL_HOLD_FALLBACK_SECS)
     }
 
     /// The node currently playing "culprit": the injector's pinned node under
@@ -358,24 +396,53 @@ impl State {
             let now_secs = self.epoch.elapsed().as_secs_f64();
             detector.observe(now_secs, &group_cpu_deltas);
             let report = detector.report(now_secs);
+            if self.probe_debug {
+                detector.debug_dump(now_secs, 15.0);
+                // Also dump the assembled report's own pulse/active gate —
+                // this is what surfaced the second STEP-0 finding: period
+                // extraction was fixed, but `active` (pulse vs
+                // PULSE_ACTIVE_THRESHOLD) barely crossed on this box's
+                // modest real overshoot until PULSE_NORM_MS was recalibrated.
+                eprintln!(
+                    "[probe-debug] report pulse={:.3} active={} magnitude_ms={:.1} period_s={:?}",
+                    report.pulse, report.active, report.magnitude_ms, report.period_s
+                );
+            }
 
             // Hold (hysteresis): only refresh the displayed active/resource/
-            // period/culprit while genuinely active, or within a short hold
-            // window after the last active reading — a single quiet sample
-            // must not flicker the whole readout off (brief item 3).
+            // period/culprit while genuinely active, or within a dynamic
+            // hold window (fix 4, `stall_hold_secs`) after the last active
+            // reading — a single quiet sample, or the ordinary inter-burst
+            // gap, must not flicker the whole readout off (brief item 3).
             if report.active {
                 self.held_active = true;
                 self.last_active_at = Some(self.t);
                 self.held_resource = report.resource;
-                self.held_period_s = report.period_s;
                 self.held_culprit_comm = report.culprit_comm.clone();
+
+                // Fix 3: debounce the DISPLAYED period across resamples —
+                // only adopt a new raw period once the last
+                // `PERIOD_STABLE_N` active readings agree within
+                // `PERIOD_STABLE_TOLERANCE`; otherwise keep showing
+                // whatever was last stable (or `irregular`/None before
+                // anything has stabilized yet).
+                self.recent_periods.push_back(report.period_s);
+                while self.recent_periods.len() > PERIOD_STABLE_N {
+                    self.recent_periods.pop_front();
+                }
+                if self.recent_periods.len() == PERIOD_STABLE_N {
+                    if let Some(p) = stable_period(&self.recent_periods, PERIOD_STABLE_TOLERANCE) {
+                        self.held_period_s = Some(p);
+                    }
+                }
             } else if !(self.held_active
-                && self.last_active_at.is_some_and(|at| self.t - at < STALL_HOLD_SECS))
+                && self.last_active_at.is_some_and(|at| self.t - at < self.stall_hold_secs()))
             {
                 self.held_active = false;
                 self.held_resource = None;
                 self.held_period_s = None;
                 self.held_culprit_comm = None;
+                self.recent_periods.clear();
             }
 
             // Force-include: if the held culprit isn't among the shown
@@ -1034,6 +1101,29 @@ impl State {
     }
 }
 
+/// Fix 3 (iteration 4d): `Some(mean)` only if every entry in `history` is
+/// `Some` and all are within `tol` fractional tolerance of their mean —
+/// i.e. the raw per-resample period reading has been stable across the
+/// whole window, not flickering (e.g. 9.0s / 12.0s / irregular on
+/// transient aliasing noise). `None` (including on any `None` entry, or an
+/// empty/non-positive mean) means "not yet stable" — the caller should
+/// keep showing the last stable value.
+fn stable_period(history: &std::collections::VecDeque<Option<f32>>, tol: f32) -> Option<f32> {
+    let mut vals = Vec::with_capacity(history.len());
+    for h in history {
+        vals.push((*h)?);
+    }
+    if vals.is_empty() {
+        return None;
+    }
+    let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+    if mean <= 0.0 {
+        return None;
+    }
+    let max_dev = vals.iter().map(|v| (v - mean).abs() / mean).fold(0.0f32, f32::max);
+    (max_dev <= tol).then_some(mean)
+}
+
 /// Blend a color toward dark gray by `amt` in `[0, 1]` — used to recede the
 /// overview constellation into the background while a dive is in progress.
 fn dim_color(c: Color, amt: f32) -> Color {
@@ -1334,6 +1424,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let demo = args.iter().any(|a| a == "--demo");
+    // Iteration 4d STEP-0: temporary, gated diagnostic dump (see
+    // `detect::Detector::debug_dump`) — eprintln's the raw overshoot
+    // samples, extracted event onsets, and resulting period once per
+    // resample so a real induced stall's numbers can be read directly
+    // instead of guessed at. No-op unless passed.
+    let probe_debug = args.iter().any(|a| a == "--probe-debug");
 
     // Iteration 4b: the real detector spawns its background latency-probe
     // thread here, before entering the TUI, under a single shared `epoch` so
@@ -1344,6 +1440,7 @@ fn main() -> Result<()> {
     let detector = if demo { None } else { Some(detect::Detector::spawn()) };
 
     let mut state = State::new(demo, detector, epoch);
+    state.probe_debug = probe_debug;
     let mut backend = CrosstermBackend::new(io::stdout());
     backend.apply_capabilities(&Capabilities::detect());
     let mut terminal = Terminal::new(backend)?;
@@ -1937,8 +2034,30 @@ mod detect {
         const PERIOD_MIN_CORR: f64 = 0.20;
         if best_corr > PERIOD_MIN_CORR {
             let thresh = best_corr * 0.9;
-            let fundamental = (search_from..=lag_max).find(|&lag| corr[lag] >= thresh).unwrap_or(0);
+            let mut fundamental = (search_from..=lag_max).find(|&lag| corr[lag] >= thresh).unwrap_or(0);
             if fundamental > 0 {
+                // Fix 2 (safety net): reject supra-harmonics. If the
+                // candidate lag has a sub-multiple (/2, /3) that ALSO
+                // lands within the feasible lag band and correlates
+                // comparably strongly, prefer the smaller (truer
+                // fundamental) — a real Nx period must not display as a
+                // multiple of itself just because the subsampled/aliased
+                // event series happens to correlate best at the larger
+                // lag. Checked /3 before /2 so the most-reduced valid
+                // candidate wins. This is a backstop: the primary cure for
+                // the observed 3x supra-harmonic is catching every real
+                // burst as an event upstream (see EVENT_THRESHOLD_MS).
+                const SUPRA_HARMONIC_REJECT_FRACTION: f64 = 0.8;
+                for divisor in [3usize, 2usize] {
+                    let candidate = fundamental / divisor;
+                    if candidate >= lag_min
+                        && candidate <= lag_max
+                        && corr[candidate] >= best_corr * SUPRA_HARMONIC_REJECT_FRACTION
+                    {
+                        fundamental = candidate;
+                        break;
+                    }
+                }
                 let period = fundamental as f64 * bin_dt;
                 out.period_s = Some(period);
                 out.freq_hz = Some(1.0 / period);
@@ -1989,10 +2108,22 @@ mod detect {
     // EVENT onset first, grid the onsets onto a coarse uniform impulse
     // series, and run the same proven `analyze_periodicity` on THAT.
 
-    /// Overshoot magnitude that counts as "stalled" for event-extraction: a
-    /// few times the probe's 2ms tick, comfortably above ordinary
-    /// scheduling jitter but immediately cleared by a real stall burst.
-    const EVENT_THRESHOLD_MS: f32 = 4.0;
+    /// Overshoot magnitude that counts as "stalled" for event-extraction.
+    ///
+    /// STEP-0 diagnosis (iteration 4d), read via `--probe-debug` under a
+    /// real induced ~3.0s/250ms 16-core stall (41 phase-aligned burners):
+    /// the probe DOES overshoot on every single burst (onsets landed at
+    /// 0.85/3.85/6.85/9.87/12.87/15.88/18.86s — a clean 3.0s train, exactly
+    /// as expected), but the per-burst PEAK overshoot on this box was only
+    /// ~1.0-5.7ms (typically 1.3-2.9ms; only occasionally topping 4ms) —
+    /// nowhere near the "dozens of ms" a synthetic 20ms-amplitude test
+    /// burst assumes. The old 4.0ms threshold cleared just 1 of 7 real
+    /// bursts in a 20s window, leaving a sparse subsampled onset train that
+    /// `analyze_periodicity` correctly, but uselessly, read as a ~9s clock.
+    /// Lowered to comfortably UNDER the smallest observed real-burst peak
+    /// (1.6ms) while staying well above ordinary idle jitter (a small
+    /// fraction of the 2ms probe tick), so every real burst clears it.
+    const EVENT_THRESHOLD_MS: f32 = 1.0;
     /// A rising edge only starts a NEW event if the series has been below
     /// `EVENT_THRESHOLD_MS` for at least this long; briefer dips are still
     /// "inside" the same burst (avoids splitting one burst into several
@@ -2148,7 +2279,24 @@ mod detect {
 
     const PULSE_DECAY_S: f32 = 1.5; // time constant for the weather-intensity decay
     const PULSE_LOOKBACK_S: f32 = PULSE_DECAY_S * 6.0; // ~7 half-lives; negligible beyond this
-    const PULSE_NORM_MS: f32 = 20.0; // overshoot that saturates pulse to ~1.0
+    /// Overshoot that saturates the weather pulse to ~1.0.
+    ///
+    /// Additional STEP-0 finding (iteration 4d), beyond the event-onset
+    /// threshold: the old 20.0ms norm assumed a real stall shows up as
+    /// tens-of-ms overshoot. On the box used for the real induced-stall
+    /// re-proof, idle/ambient overshoot (890 background tasks, no induced
+    /// stall) sat at a steady ~0.2-0.4ms, while every real 3.0s/250ms burst
+    /// peaked at ~1.0-5.7ms — a clean >4x separation, but one the old
+    /// 20.0ms norm mostly couldn't SEE: `active`'s pulse gate
+    /// (`overshoot_ms / PULSE_NORM_MS > PULSE_ACTIVE_THRESHOLD`) rarely
+    /// crossed 0.15 (needs ≥3.0ms at the old norm), leaving fix 3/4 (period
+    /// debounce + hold extension) almost nothing to work with — `active`
+    /// has to fire at least occasionally for a hold to have something to
+    /// extend. Lowered to sit inside the observed real gap (idle ~0.4ms ->
+    /// ratio 0.07, comfortably below threshold; burst floor ~1.6ms -> ratio
+    /// 0.27, comfortably above it) so `active` fires on real bursts of this
+    /// magnitude without false-triggering on ordinary background jitter.
+    const PULSE_NORM_MS: f32 = 6.0;
     const PULSE_ACTIVE_THRESHOLD: f32 = 0.15;
     const MAGNITUDE_WINDOW_S: f64 = 1.0; // window for "recent max overshoot"
     const SERIES_WINDOW_S: f64 = 30.0; // bedrock timeline span
@@ -2224,6 +2372,51 @@ mod detect {
                     self.resource = None;
                 }
             }
+        }
+
+        /// STEP-0 diagnostic scaffolding (iteration 4d), gated behind
+        /// `--probe-debug`: dumps the raw elevated-tick overshoot
+        /// magnitudes, the extracted event-onset timestamps (and their
+        /// spacing), and the resulting event-clock period to stderr for a
+        /// window of recent history. Exists to let a real induced stall's
+        /// numbers be READ (not guessed at) to explain why the displayed
+        /// period was drifting to a 3x supra-harmonic. Temporary; kept
+        /// cleanly gated rather than ripped out so the next regression can
+        /// be diagnosed the same way.
+        pub fn debug_dump(&self, now_secs: f64, window_s: f64) {
+            let samples = self.probe.snapshot();
+            let recent: Vec<Sample> =
+                samples.iter().copied().filter(|s| now_secs - s.t <= window_s).collect();
+            if recent.len() < 2 {
+                eprintln!("[probe-debug] t={now_secs:.2} not enough samples yet ({})", recent.len());
+                return;
+            }
+            let elevated: Vec<(f64, f32)> = recent
+                .iter()
+                .filter(|s| s.overshoot_ms > 1.0)
+                .map(|s| (s.t, s.overshoot_ms))
+                .collect();
+            eprintln!(
+                "[probe-debug] t={now_secs:.2} window={window_s}s samples={} elevated_ticks={}",
+                recent.len(),
+                elevated.len()
+            );
+            for (t, ms) in &elevated {
+                eprintln!("[probe-debug]   tick t={t:.3} overshoot={ms:.1}ms");
+            }
+            let onsets = extract_event_onsets(&recent, EVENT_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+            let onset_strs: Vec<String> = onsets.iter().map(|t| format!("{t:.2}")).collect();
+            eprintln!("[probe-debug] onsets ({}): {:?}", onsets.len(), onset_strs);
+            if onsets.len() >= 2 {
+                let gaps: Vec<String> =
+                    onsets.windows(2).map(|w| format!("{:.2}", w[1] - w[0])).collect();
+                eprintln!("[probe-debug] onset gaps (s): {:?}", gaps);
+            }
+            let clock = event_clock(&recent);
+            eprintln!(
+                "[probe-debug] event_clock period_s={:?} confidence={:.2}",
+                clock.period_s, clock.confidence
+            );
         }
 
         /// Assemble the current diagnosis. Pure w.r.t. `self` — recomputes
@@ -2379,6 +2572,106 @@ mod detect {
             let clock = event_clock(&s);
             let period = clock.period_s.expect("event clock should find a period");
             assert!((period - 3.0).abs() < 0.5, "event-clock period {period}, expected ~3.0s");
+        }
+
+        /// THE key correctness gate for iteration 4d, fix 1. STEP-0
+        /// diagnosis on a real 16-core box under a real induced 3.0s/250ms
+        /// stall (41 phase-aligned burners) read via `--probe-debug`: the
+        /// probe overshot on EVERY single burst (a clean 3.0s onset train:
+        /// 0.85, 3.85, 6.85, 9.87, 12.87, 15.88, 18.86), but the per-burst
+        /// PEAK was only ~1.0-5.7ms (typically 1.3-2.9ms) — nowhere near
+        /// the tens-of-ms the old fixed 4.0ms `EVENT_THRESHOLD_MS` assumed.
+        /// That threshold cleared just 1 of those 7 real bursts, leaving a
+        /// sparse onset train that (correctly, but uselessly) resolved to
+        /// a ~9s supra-harmonic. This test reproduces the diagnosed shape
+        /// with the exact observed peak magnitudes and demonstrates both
+        /// the bug (at the old threshold) and the fix (at the new one).
+        #[test]
+        fn event_clock_catches_modest_real_burst_peaks_not_just_the_rare_tall_one() {
+            // Peaks (ms) observed per-burst in the real STEP-0 diagnosis,
+            // one per 3.0s-spaced burst, over a 21s window (7 bursts).
+            const OLD_THRESHOLD_MS: f32 = 4.0;
+            let peaks = [2.3f32, 4.0, 2.5, 1.6, 5.7, 4.0, 2.3];
+            let tick_s = 0.002;
+            let period_s = 3.0;
+            let dur_s = period_s * peaks.len() as f64;
+            let n = (dur_s / tick_s) as usize;
+            let samples: Vec<Sample> = (0..n)
+                .map(|i| {
+                    let t = i as f64 * tick_s;
+                    let burst_idx = (t / period_s).floor() as usize;
+                    let phase = t % period_s;
+                    // A brief (~30ms) elevated window per burst, peaking at
+                    // that burst's diagnosed magnitude — modeling how few
+                    // real ticks within a 250ms burst actually cleared even
+                    // a low ms-scale gate on this box.
+                    let o = if phase < 0.03 && burst_idx < peaks.len() { peaks[burst_idx] } else { 0.2 };
+                    Sample { t, overshoot_ms: o }
+                })
+                .collect();
+
+            // Reproduce the bug: the OLD threshold drops most of these
+            // modest, real-shaped bursts.
+            let old_onsets = extract_event_onsets(&samples, OLD_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+            assert!(
+                old_onsets.len() <= 3,
+                "test setup check: the old {OLD_THRESHOLD_MS}ms threshold should drop most of \
+                 these modest real-shaped bursts (got {} of {} onsets) — otherwise this no \
+                 longer demonstrates the diagnosed bug",
+                old_onsets.len(),
+                peaks.len()
+            );
+
+            // The fix: the new (lower) EVENT_THRESHOLD_MS catches every
+            // single burst -> a clean 3.0s onset train, not a subsampled one.
+            let onsets = extract_event_onsets(&samples, EVENT_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+            assert_eq!(
+                onsets.len(),
+                peaks.len(),
+                "should catch every one of the {} real bursts, not just the rare tall one",
+                peaks.len()
+            );
+            for w in onsets.windows(2) {
+                let gap = w[1] - w[0];
+                assert!(
+                    (gap - period_s).abs() < 0.2,
+                    "onset gap {gap} should be ~3.0s, not a supra-harmonic multiple of it"
+                );
+            }
+
+            let clock = event_clock(&samples);
+            let period = clock.period_s.expect("event clock should find a period");
+            assert!(
+                (period - period_s).abs() < 0.5,
+                "event-clock period {period}, expected ~3.0s (not a 9s supra-harmonic)"
+            );
+        }
+
+        /// Fix 2 (safety net) correctness gate: even when event extraction
+        /// misses an occasional burst (not systematically every Nth, just a
+        /// couple of real-world drops), the fundamental must still win over
+        /// a supra-harmonic that the sparser onset pattern could otherwise
+        /// make look comparably strong.
+        #[test]
+        fn event_clock_prefers_fundamental_over_supra_harmonic_with_occasional_misses() {
+            // True 3.0s clock, 9 onsets, but drop 2 of them (indices 2 and
+            // 5) to model occasional real-world misses rather than a clean
+            // train — the scenario fix 1 alone doesn't fully guarantee away.
+            let all_onsets: Vec<f64> = (0..9).map(|i| i as f64 * 3.0).collect();
+            let onsets: Vec<f64> = all_onsets
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 2 && *i != 5)
+                .map(|(_, &t)| t)
+                .collect();
+            let impulse = build_event_impulse_series(&onsets, 0.0, 26.0, EVENT_BIN_S);
+            let p = analyze_periodicity(&impulse, AnalysisConfig::default());
+            let period = p.period_s.expect("should find a period");
+            assert!(
+                (period - 3.0).abs() < 0.5,
+                "period {period}, expected the fundamental ~3.0s even with occasional missed onsets, \
+                 not a supra-harmonic (~6s/~9s)"
+            );
         }
 
         /// Ported verbatim from `diag.rs`'s `flat_series_has_no_period`.
