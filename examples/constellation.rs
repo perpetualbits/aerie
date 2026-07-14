@@ -28,7 +28,6 @@ use mullion::ease::{gaussian, smoothstep};
 use mullion::input::{KeyCode, KeyModifiers};
 use mullion::layout::TileId;
 use mullion::style::{Color, Modifier, Style};
-use mullion::sugiyama::{auto_layout, LayerDir, SugiyamaParams};
 use mullion::zoom::{lerp_rect, Lod, LodScale};
 use mullion::{Buffer, Cell, EventReader, Field, FloatRect, GraphCanvas, Rect, Terminal, Viewport};
 use std::collections::{HashMap, HashSet};
@@ -577,7 +576,12 @@ impl State {
                 .collect(),
             edges: cons.edges.clone(),
         };
-        self.canvas = build_canvas(&sized, cpu_max_for_size);
+        // Size the treemap to the graph area of the last-rendered frame so
+        // the map fills whatever terminal size is actually on-screen (the
+        // startup default, before the first real `render` call, is a sane
+        // fallback size — see `last_area`'s initializer).
+        let ga = graph_area(self.last_area);
+        self.canvas = build_canvas(&sized, cpu_max_for_size, (ga.width, ga.height));
         self.cons = cons;
         self.since_sample = 0.0;
 
@@ -1041,7 +1045,7 @@ impl State {
             self.cons.edges.iter().filter(|(a, b)| child_ids.contains(a) && child_ids.contains(b)).copied().collect();
         let cpu_max = nodes.iter().map(|n| n.cpu_jiffies).max().unwrap_or(1).max(1);
         let child_cons = Constellation { nodes, edges };
-        let inner_canvas = build_canvas(&child_cons, cpu_max);
+        let inner_canvas = build_canvas(&child_cons, cpu_max, (interior.width, interior.height));
         let (icw, ich) = inner_canvas.size();
         let inner_vp = Viewport::new(interior, icw, ich);
         let inner_placed = placed_rects(&inner_canvas, Rect::new(0, 0, icw, ich));
@@ -1818,32 +1822,164 @@ fn encode_node(cpu_frac: f32, mem_frac: f32, strain: f32) -> NodeVisual {
     NodeVisual { cells, color, pulse: strain.clamp(0.0, 1.0) }
 }
 
-fn node_side(cpu_jiffies: u64, cpu_max: u64) -> u16 {
-    let frac = if cpu_max == 0 { 0.0 } else { cpu_jiffies as f32 / cpu_max as f32 };
-    encode_node(frac, 0.0, 0.0).cells
+// ── Iteration 7: significance treemap ───────────────────────────────────────
+//
+// The overview used to run a sugiyama layered layout (`auto_layout`) over
+// process lineage. That lineage is nearly flat (mostly a star from systemd,
+// edgeless after kernel-thread exclusion), so sugiyama stacked everything
+// into ~1 layer of wide-but-short boxes filling only the top ~15% of the
+// frame — it read as a toolbar, not a map. Replaced with a **squarified
+// treemap** (Bruls/Huizing/van Wijk): nodes packed to fill the WHOLE canvas,
+// each tile's AREA proportional to its significance (`cpu_jiffies`), so
+// `size=CPU` becomes literal — the busiest process is a big tile, quiet ones
+// small, packed edge-to-edge with a thin gutter between them.
+
+/// Floor on a node's treemap weight, as a fraction of the busiest node's
+/// `cpu_jiffies` — without it a near-zero-CPU node's tile area shrinks to
+/// nothing. At 8%, even an all-idle-but-one canvas gives every quiet node
+/// roughly `0.08 / (1.0 + 11*0.08)` ≈ 4% of the canvas (comfortably above the
+/// min tile floor below on any real terminal size) while still leaving the
+/// busiest node the majority of the map.
+const TREEMAP_WEIGHT_FLOOR_FRAC: f32 = 0.08;
+
+/// Gutter (canvas cells) between adjacent treemap tiles: half is carved out
+/// of each tile's own rect on every side, so two neighbouring tiles are
+/// always separated by this many blank canvas cells. That gap is what makes
+/// (a) tiles read as distinct boxes instead of one solid block, and (b)
+/// `free_cells_in_window` still find a channel for contention/lineage edges
+/// to route through — a treemap packed perfectly solid has no whitespace to
+/// route in at all.
+const TREEMAP_GUTTER: u16 = 2;
+
+/// Smallest a tile is allowed to come out after the gutter inset: wide
+/// enough for a truncated comm label, tall enough for the top border (which
+/// doubles as the title row), one interior row, and the bottom border.
+const TREEMAP_MIN_W: u16 = 10;
+const TREEMAP_MIN_H: u16 = 3;
+
+/// The worst (largest) aspect-ratio distortion a candidate treemap row can
+/// produce, given the fixed side length `side` it's being built along and the
+/// row's running `(sum, min, max)` area stats — the exact Bruls/Huizing/van
+/// Wijk formula: `max(side² · max(R) / sum(R)², sum(R)² / (side² · min(R)))`.
+/// Lower is better (1.0 is a perfect square); `squarify_rec` grows a row only
+/// while doing so doesn't increase this.
+fn worst_ratio(sum: f32, min: f32, max: f32, side: f32) -> f32 {
+    let side2 = (side * side).max(f32::EPSILON);
+    let sum2 = (sum * sum).max(f32::EPSILON);
+    ((side2 * max) / sum2).max(sum2 / (side2 * min.max(f32::EPSILON)))
 }
 
-fn build_canvas(cons: &Constellation, cpu_max: u64) -> GraphCanvas {
-    // Canvas is generously larger than the screen; auto_layout resizes to fit.
-    let mut canvas = GraphCanvas::new(200, 80).with_grid(2);
-    for n in &cons.nodes {
-        let side = node_side(n.cpu_jiffies, cpu_max);
-        // Nodes are wide-but-short boxes: width carries the label (comm text),
-        // height only needs to fit the top border (which doubles as the
-        // title row), one interior row, and the bottom border.
-        let h = (side / 4).max(3);
-        canvas.add(n.id, FloatRect::new(0, 0, side, h));
+/// Squarified treemap recursion. `order` is the (unplaced) subset of node
+/// indices left to place, ordered largest-`area`-first (best feeds the
+/// row-growing heuristic below); `areas[i]` is node `i`'s target tile area in
+/// canvas cells, pre-scaled so `areas.iter().sum() == rect.2 * rect.3`
+/// (width · height) for the *initial* call — each recursive step then peels
+/// exactly one row's worth of area off both the remaining rect and the
+/// remaining sum, so the invariant holds at every level. Writes each placed
+/// node's `(x, y, w, h)` (canvas-local, f32 cells) into `out[i]`.
+fn squarify_rec(order: &[usize], areas: &[f32], rect: (f32, f32, f32, f32), out: &mut [(f32, f32, f32, f32)]) {
+    let (x, y, w, h) = rect;
+    if order.is_empty() {
+        return;
     }
-    // Process lineage is shallow (systemd -> app -> worker, ~2-4 layers), so
-    // laying out TopBottom stacks the few layers vertically and spreads each
-    // layer's many nodes HORIZONTALLY across the wide screen. LeftRight on
-    // this same shallow-wide shape degenerates into one tall column stacked
-    // against the left edge, which is what a real /proc capture showed.
-    auto_layout(
-        &mut canvas,
-        &cons.edges,
-        &SugiyamaParams { dir: LayerDir::TopDown, layer_gap: 5, node_gap: 3, grid: 2 },
-    );
+    if order.len() == 1 {
+        out[order[0]] = (x, y, w, h);
+        return;
+    }
+    // The row grows along whichever side of the REMAINING rect is currently
+    // shorter (the classic squarify heuristic keeps tiles closer to square).
+    let side = w.min(h).max(f32::EPSILON);
+    let mut i = 1usize;
+    let mut row_sum = areas[order[0]];
+    let mut row_min = row_sum;
+    let mut row_max = row_sum;
+    let mut best = worst_ratio(row_sum, row_min, row_max, side);
+    while i < order.len() {
+        let v = areas[order[i]];
+        let (new_sum, new_min, new_max) = (row_sum + v, row_min.min(v), row_max.max(v));
+        let candidate = worst_ratio(new_sum, new_min, new_max, side);
+        if candidate > best {
+            break; // adding the next item would make the row's worst tile less square
+        }
+        row_sum = new_sum;
+        row_min = new_min;
+        row_max = new_max;
+        best = candidate;
+        i += 1;
+    }
+    let (row, rest) = order.split_at(i);
+
+    if w >= h {
+        // Wider than tall: the row becomes a full-height column on the left,
+        // its items stacked vertically inside it.
+        let strip_w = (row_sum / h).min(w);
+        let mut cy = y;
+        for &idx in row {
+            let item_h = (areas[idx] / row_sum) * h;
+            out[idx] = (x, cy, strip_w, item_h);
+            cy += item_h;
+        }
+        squarify_rec(rest, areas, (x + strip_w, y, (w - strip_w).max(0.0), h), out);
+    } else {
+        // Taller than wide: the row becomes a full-width band along the top,
+        // its items placed left-to-right inside it.
+        let strip_h = (row_sum / w).min(h);
+        let mut cx = x;
+        for &idx in row {
+            let item_w = (areas[idx] / row_sum) * w;
+            out[idx] = (cx, y, item_w, strip_h);
+            cx += item_w;
+        }
+        squarify_rec(rest, areas, (x, y + strip_h, w, (h - strip_h).max(0.0)), out);
+    }
+}
+
+/// Lay `cons`'s nodes out as a significance treemap filling a `target`-sized
+/// canvas (`(width, height)` cells — callers pass the actual graph area/
+/// window so the map fills whatever frame it's drawn into), then return the
+/// canvas WITHOUT running `auto_layout`: `solve()`/`Viewport::project` only
+/// need each node to have a canvas-space rect, so leaving the treemap's
+/// explicit placements alone is enough for pan, dive, and edge routing
+/// (which reads free canvas cells, not the layout algorithm) to keep working
+/// unchanged.
+fn build_canvas(cons: &Constellation, cpu_max: u64, target: (u16, u16)) -> GraphCanvas {
+    // Floor the target size too: an interior dive canvas can in principle be
+    // asked for a tiny rect, and the treemap needs room for at least a
+    // min-sized tile or two to mean anything.
+    let tw = target.0.max(TREEMAP_MIN_W * 2);
+    let th = target.1.max(TREEMAP_MIN_H * 2);
+    let mut canvas = GraphCanvas::new(tw, th).with_grid(TREEMAP_GUTTER);
+    if cons.nodes.is_empty() {
+        return canvas;
+    }
+
+    // Largest-first ordering feeds squarify's row-growing heuristic best.
+    let mut order: Vec<usize> = (0..cons.nodes.len()).collect();
+    order.sort_by(|&a, &b| cons.nodes[b].cpu_jiffies.cmp(&cons.nodes[a].cpu_jiffies));
+
+    let floor = (cpu_max as f32 * TREEMAP_WEIGHT_FLOOR_FRAC).max(1.0);
+    let weights: Vec<f32> = cons.nodes.iter().map(|n| (n.cpu_jiffies as f32).max(floor)).collect();
+    let total_weight: f32 = weights.iter().sum::<f32>().max(f32::EPSILON);
+    // Scale weights into actual canvas-cell areas (squarify's row/strip math
+    // needs areas that sum to the rect's true area, not raw weight units).
+    let canvas_area = tw as f32 * th as f32;
+    let areas: Vec<f32> = weights.iter().map(|w| w / total_weight * canvas_area).collect();
+
+    let mut rects = vec![(0.0f32, 0.0f32, 0.0f32, 0.0f32); cons.nodes.len()];
+    squarify_rec(&order, &areas, (0.0, 0.0, tw as f32, th as f32), &mut rects);
+
+    let inset = TREEMAP_GUTTER as f32 / 2.0;
+    for (i, n) in cons.nodes.iter().enumerate() {
+        let (x, y, w, h) = rects[i];
+        let gx = (x + inset).round().clamp(0.0, tw as f32);
+        let gy = (y + inset).round().clamp(0.0, th as f32);
+        let gw = (w - TREEMAP_GUTTER as f32).max(TREEMAP_MIN_W as f32).round();
+        let gh = (h - TREEMAP_GUTTER as f32).max(TREEMAP_MIN_H as f32).round();
+        // `canvas.add` clamps the rect fully inside the canvas, so a tile
+        // whose floor pushed it wider/taller than the space its treemap cell
+        // left near an edge is pulled back in rather than overflowing.
+        canvas.add(n.id, FloatRect::new(gx as u16, gy as u16, gw as u16, gh as u16));
+    }
     canvas
 }
 
@@ -3113,11 +3249,76 @@ mod tests {
     fn layout_is_stable_across_identical_frames() {
         let (g, cpu_max) = tiny_constellation();
         let window = MRect::new(0, 0, 120, 40);
-        let a = placed_rects(&build_canvas(&g, cpu_max), window);
-        let b = placed_rects(&build_canvas(&g, cpu_max), window);
-        // Same ids, sizes, edges -> identical placement (auto_layout is idempotent).
+        let a = placed_rects(&build_canvas(&g, cpu_max, (120, 40)), window);
+        let b = placed_rects(&build_canvas(&g, cpu_max, (120, 40)), window);
+        // Same ids, sizes, edges -> identical placement (the treemap is a pure
+        // function of the node weights/order, not of prior positions).
         assert_eq!(a, b, "an unchanged graph must not move between frames");
         assert_eq!(a.len(), 4);
+    }
+
+    /// Iteration 7: the treemap fills the canvas, tiles never overlap, and
+    /// area tracks significance (more CPU -> a strictly bigger tile).
+    #[test]
+    fn treemap_tiles_are_disjoint_bounded_and_area_tracks_cpu() {
+        // Five comms with a wide spread of cpu_jiffies, including one at (or
+        // near) zero to exercise the weight floor.
+        let samples = vec![
+            sample(1, 0, "hog", 900, 100),
+            sample(2, 0, "mid", 300, 100),
+            sample(3, 0, "quiet", 1, 100),
+            sample(4, 0, "idle", 0, 100),
+            sample(5, 0, "steady", 120, 100),
+        ];
+        let mut ids = CommIds::new();
+        let g = build_graph(&samples, &mut ids);
+        let cpu_max = g.nodes.iter().map(|n| n.cpu_jiffies).max().unwrap_or(1);
+        let target = (140u16, 60u16);
+        let canvas = build_canvas(&g, cpu_max, target);
+        let nodes = canvas.nodes();
+        assert_eq!(nodes.len(), g.nodes.len());
+
+        // Every tile stays fully within the canvas extent.
+        for n in nodes {
+            let r = n.place;
+            assert!(r.x + r.width <= target.0, "tile {:?} escapes canvas width", n.id);
+            assert!(r.y + r.height <= target.1, "tile {:?} escapes canvas height", n.id);
+            assert!(r.width >= 1 && r.height >= 1, "tile {:?} has non-positive extent", n.id);
+        }
+
+        // No two tiles overlap (the gutter inset keeps them strictly disjoint).
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let a = nodes[i].place;
+                let b = nodes[j].place;
+                let overlap = a.x < b.x + b.width
+                    && b.x < a.x + a.width
+                    && a.y < b.y + b.height
+                    && b.y < a.y + a.height;
+                assert!(!overlap, "tiles {:?} and {:?} overlap: {:?} vs {:?}", nodes[i].id, nodes[j].id, a, b);
+            }
+        }
+
+        // Tiles cover most of the canvas (allowing for the gutters between
+        // and around them) -- the whole point of a "fills the frame" map.
+        let total_area: u32 = nodes.iter().map(|n| n.place.width as u32 * n.place.height as u32).sum();
+        let canvas_area = target.0 as u32 * target.1 as u32;
+        assert!(
+            total_area as f32 >= canvas_area as f32 * 0.6,
+            "tiles ({total_area}) should cover most of the canvas ({canvas_area}), gutters aside"
+        );
+
+        // Higher CPU -> strictly larger tile area (hog > mid > steady >
+        // quiet), even with the weight floor applied to the quiet ones.
+        let area_of = |comm: &str| -> u32 {
+            let id = g.nodes.iter().find(|n| n.comm == comm).unwrap().id;
+            let r = canvas.place(id).unwrap();
+            r.width as u32 * r.height as u32
+        };
+        let (hog, mid, steady, quiet) = (area_of("hog"), area_of("mid"), area_of("steady"), area_of("quiet"));
+        assert!(hog > mid, "hog ({hog}) should be bigger than mid ({mid})");
+        assert!(mid > steady, "mid ({mid}) should be bigger than steady ({steady})");
+        assert!(steady > quiet, "steady ({steady}) should be bigger than quiet ({quiet})");
     }
 
     #[test]
