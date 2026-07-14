@@ -68,6 +68,18 @@ enum ArrowDir {
 
 const SAMPLE_EVERY: f32 = 1.0;
 
+/// The offender-history CPU sampler runs faster than the full resample.
+/// Periodicity attribution has a hard floor: `analyze_periodicity` needs
+/// ≥16 grid points and ≥3 clock periods of span, and at the coarse 1 Hz
+/// resample spacing its bin size is forced to ~1.5 s, so 16 bins = ~24 s —
+/// which is why a freshly-appeared offender used to take ~24 s to name. A
+/// finer CPU-delta series shrinks the bin size so the 16-grid-point floor
+/// stops binding, letting attribution lock in the fundamental ~3-period
+/// time (~10 s for a 3 s clock). Only the cheap per-comm CPU scan runs at
+/// this rate; the expensive report/autocorrelation, PSI, and render stay at
+/// `SAMPLE_EVERY`.
+const OFFENDER_SAMPLE_EVERY: f32 = 0.33;
+
 /// Cap on distinct comm-groups shown as nodes. Real `/proc` can have hundreds
 /// of distinct `comm`s; per-frame edge routing (`render_edges` runs grid-A*
 /// routing over the whole canvas every frame, not just on resample) over that
@@ -121,10 +133,15 @@ struct State {
     paused: bool, // space toggles; while true, advance() freezes the clock
     t: f32,       // seconds since start
     since_sample: f32,
+    // Fast offender-history sampler (decoupled from the 1 Hz resample so a
+    // fresh periodic offender is nameable in ~10 s instead of ~24 s — see
+    // OFFENDER_SAMPLE_EVERY). Its own accumulator + previous cumulative
+    // per-comm jiffies, so its deltas cover the fine ~0.33 s interval.
+    since_offender: f32,
+    prev_offender_cpu: HashMap<String, u64>,
     ids: CommIds,
     prev_cpu: HashMap<TileId, u64>, // last cumulative jiffies per node id
     prev_io: HashMap<TileId, u64>,  // last cumulative blkio ticks per node id
-    prev_cpu_by_comm: HashMap<String, u64>, // last cumulative jiffies per comm, uncapped (feeds the detector)
     cons: Constellation,
     canvas: GraphCanvas,
     cpu_frac: HashMap<TileId, f32>, // per-frame normalized deltas
@@ -178,10 +195,11 @@ impl State {
             paused: false,
             t: 0.0,
             since_sample: 0.0,
+            since_offender: 0.0,
+            prev_offender_cpu: HashMap::new(),
             ids: CommIds::new(),
             prev_cpu: HashMap::new(),
             prev_io: HashMap::new(),
-            prev_cpu_by_comm: HashMap::new(),
             cons: Constellation { nodes: Vec::new(), edges: Vec::new() },
             canvas: GraphCanvas::new(1, 1),
             cpu_frac: HashMap::new(),
@@ -251,6 +269,17 @@ impl State {
             return;
         }
         self.t += dt;
+        // Fast offender-history sampler: a cheap per-comm CPU scan several
+        // times a second so a fresh periodic offender's activity series is
+        // dense enough to clear `analyze_periodicity`'s grid floor in the
+        // fundamental ~3-period time rather than ~24 s (see
+        // OFFENDER_SAMPLE_EVERY). The expensive report/PSI stay on the
+        // `resample` clock below.
+        self.since_offender += dt;
+        if self.since_offender >= OFFENDER_SAMPLE_EVERY {
+            self.since_offender = 0.0;
+            self.sample_offender();
+        }
         self.since_sample += dt;
         if self.since_sample >= SAMPLE_EVERY {
             self.resample();
@@ -371,6 +400,38 @@ impl State {
         self.zoom_goal = 0.0;
     }
 
+    /// Fast path (see OFFENDER_SAMPLE_EVERY): a cheap per-comm CPU scan that
+    /// feeds ONLY the detector's offender-activity history — no graph
+    /// rebuild, no PSI, no report. Running this several times a second makes
+    /// each group's CPU-delta series fine enough that `analyze_periodicity`
+    /// clears its 16-grid-point floor in the fundamental ~3-period time,
+    /// dropping the warmup to name a fresh offender from ~24 s to ~10 s.
+    fn sample_offender(&mut self) {
+        if self.detector.is_none() {
+            return; // --demo: no real detector to feed
+        }
+        let samples = sample_procs();
+        let comm_cpu = cpu_by_comm(&samples);
+        // Userspace comms only (rss > 0) — the same structural kernel-thread
+        // filter iteration 6 applies at feed time so `group_history` never
+        // accumulates a bystander that could win attribution.
+        let userspace: HashSet<&str> =
+            samples.iter().filter(|s| s.rss_pages > 0).map(|s| s.comm.as_str()).collect();
+        let deltas: Vec<(String, u64)> = comm_cpu
+            .iter()
+            .filter(|(comm, _)| userspace.contains(comm.as_str()))
+            .map(|(comm, &total)| {
+                let prev = self.prev_offender_cpu.get(comm).copied().unwrap_or(total);
+                (comm.clone(), total.saturating_sub(prev))
+            })
+            .collect();
+        self.prev_offender_cpu = comm_cpu;
+        let now_secs = self.epoch.elapsed().as_secs_f64();
+        if let Some(detector) = &mut self.detector {
+            detector.observe_offender(now_secs, &deltas);
+        }
+    }
+
     fn resample(&mut self) {
         let samples = sample_procs();
         let mut cons = build_graph(&samples, &mut self.ids);
@@ -401,41 +462,13 @@ impl State {
             }
         }
 
-        // Iteration 4b: feed the real detector this resample's per-comm CPU
-        // deltas — UNCAPPED (every comm this sample saw), not just the
-        // MAX_NODES currently shown, so a periodic offender outside the
-        // top-12 can still be identified and then forced on-screen below.
+        // Iteration 4b: the real detector's offender-activity history is now
+        // fed by the fast `sample_offender` path (OFFENDER_SAMPLE_EVERY), so
+        // here we only refresh the (cheap) PSI reading and recompute the
+        // report — keeping the expensive autocorrelation on this 1 Hz clock.
         if let Some(detector) = &mut self.detector {
-            let comm_cpu = cpu_by_comm(&samples);
-
-            // Fix 1 (iteration 6): only feed the detector USERSPACE comms —
-            // the same structural signal `build_graph` already uses to drop
-            // kernel threads from the shown map (rss_pages aggregates to 0
-            // for a kernel-scheduled thread with no address space, ~1709).
-            // Without this, `group_history` accumulates `ksoftirqd/*`,
-            // `rcu_preempt`, `irq/*`, `kworker/*` right alongside real apps;
-            // a kernel thread just reacting to the load on the same clock is
-            // exactly as "periodic" as the real cause and can win the
-            // max-confidence argmax in `find_periodic_offender`, naming an
-            // otherwise-hidden, non-actionable bystander as culprit. A comm
-            // with at least one sample carrying resident memory is
-            // userspace; one whose every sample has `rss_pages == 0` never
-            // is. Filtering at feed time (rather than in the offender
-            // search) keeps `group_history` itself clean.
-            let userspace: HashSet<&str> =
-                samples.iter().filter(|s| s.rss_pages > 0).map(|s| s.comm.as_str()).collect();
-            let group_cpu_deltas: Vec<(String, u64)> = comm_cpu
-                .iter()
-                .filter(|(comm, _)| userspace.contains(comm.as_str()))
-                .map(|(comm, &total)| {
-                    let prev = self.prev_cpu_by_comm.get(comm).copied().unwrap_or(total);
-                    (comm.clone(), total.saturating_sub(prev))
-                })
-                .collect();
-            self.prev_cpu_by_comm = comm_cpu;
-
             let now_secs = self.epoch.elapsed().as_secs_f64();
-            detector.observe(now_secs, &group_cpu_deltas);
+            detector.observe_pressure(now_secs);
             let report = detector.report(now_secs);
             if self.probe_debug {
                 detector.debug_dump(now_secs, 15.0);
@@ -2618,7 +2651,22 @@ mod detect {
     // those in is exactly the cheap, no-second-/proc-scanner path the brief
     // asks for.
 
-    const MIN_GROUP_SAMPLES: usize = 24; // matches diag.rs's analyze_offenders floor
+    /// Absolute minimum ring entries before a group is even analyzed — a
+    /// low floor just so `analyze_periodicity` (which itself needs ≥8 raw
+    /// samples and ≥16 grid points) has data to chew on. The REAL gate is
+    /// the time-span floor below, not this count: with the fast offender
+    /// sampler (OFFENDER_SAMPLE_EVERY) the ring fills quickly, so a fixed
+    /// count no longer maps to a meaningful observation window.
+    const MIN_GROUP_SAMPLES: usize = 16;
+    /// A group's history must SPAN at least this many seconds before it can
+    /// be named — periodicity fundamentally needs to watch several clock
+    /// periods (`analyze_periodicity`'s autocorrelation only searches lags up
+    /// to n/3, i.e. ≥3 periods must fit the window). ~10 s covers ≥3 periods
+    /// of the multi-second stalls this detector targets; it is what replaces
+    /// the old fixed 24-sample count (which, at 1 Hz, forced a ~24 s warmup).
+    /// This is a floor, not a cap: `analyze_periodicity` still rejects a
+    /// clock slower than a third of the actual observed span on its own.
+    const MIN_OFFENDER_SPAN_S: f64 = 10.0;
     const OFFENDER_MIN_CONFIDENCE: f32 = 0.25; // matches diag.rs's MIN_CONF
     const PERIOD_MATCH_TOLERANCE: f64 = 0.25; // fractional tolerance vs the stall clock
 
@@ -2683,7 +2731,14 @@ mod detect {
         }
         group_history
             .iter()
-            .filter(|(_, hist)| hist.len() >= MIN_GROUP_SAMPLES)
+            .filter(|(_, hist)| {
+                // Enough points for autocorrelation AND a wide enough
+                // observation window to have watched several clock periods —
+                // the latter (span) is the real requirement; see
+                // MIN_OFFENDER_SPAN_S.
+                hist.len() >= MIN_GROUP_SAMPLES
+                    && matches!((hist.front(), hist.back()), (Some(f), Some(b)) if b.0 - f.0 >= MIN_OFFENDER_SPAN_S)
+            })
             .filter_map(|(name, hist)| {
                 let series: Vec<Sample> =
                     hist.iter().map(|&(t, d)| Sample { t, overshoot_ms: d as f32 }).collect();
@@ -2753,12 +2808,13 @@ mod detect {
     /// the render path wants one (not wired up until 4b).
     pub(super) struct Detector {
         probe: LatencyProbe,
-        /// Per-group CPU-jiffy-delta history, fed by [`Detector::observe`]
-        /// from the example's own per-comm deltas — no second /proc scanner.
+        /// Per-group CPU-jiffy-delta history, fed by
+        /// [`Detector::observe_offender`] from the example's own per-comm
+        /// deltas — no second /proc scanner.
         group_history: HashMap<String, VecDeque<(f64, u64)>>,
         group_cap: usize,
         /// Previous (cpu, mem, io) cumulative PSI "some" totals + when, to
-        /// derive per-second stall rates on each `observe`.
+        /// derive per-second stall rates on each `observe_pressure`.
         psi_prev: Option<(u64, u64, u64, f64)>,
         /// Most recently identified contended resource. Sticky across PSI
         /// reads that come back "nothing elevated" so a brief dip doesn't
@@ -2772,15 +2828,18 @@ mod detect {
             Detector {
                 probe: LatencyProbe::spawn(ProbeConfig::default()),
                 group_history: HashMap::new(),
-                group_cap: 300, // ~5 min at the example's ~1 Hz resample cadence
+                group_cap: 900, // ~5 min at the ~3 Hz offender-sample cadence
                 psi_prev: None,
                 resource: None,
             }
         }
 
-        /// Feed the latest per-group CPU-jiffy deltas (as the example
-        /// already computes each `resample`) and refresh the PSI reading.
-        pub fn observe(&mut self, now_secs: f64, group_cpu_deltas: &[(String, u64)]) {
+        /// Feed the latest per-group CPU-jiffy deltas into the rolling
+        /// offender-activity history. Called from the fast `sample_offender`
+        /// path (OFFENDER_SAMPLE_EVERY), several times a second, so each
+        /// group's series is fine-grained enough for `analyze_periodicity` to
+        /// lock a fresh offender in the fundamental ~3-period time.
+        pub fn observe_offender(&mut self, now_secs: f64, group_cpu_deltas: &[(String, u64)]) {
             for (name, delta) in group_cpu_deltas {
                 let ring = self.group_history.entry(name.clone()).or_default();
                 if ring.len() >= self.group_cap {
@@ -2788,8 +2847,14 @@ mod detect {
                 }
                 ring.push_back((now_secs, *delta));
             }
+        }
 
-            // PSI: rate the three channels since the previous observe() and
+        /// Refresh the PSI-derived contended resource. Called on the slower
+        /// `resample` (1 Hz) clock — PSI rates over a ~1 s window are steadier
+        /// than over the fast offender interval, and the resource only needs
+        /// to update as often as the report is shown.
+        pub fn observe_pressure(&mut self, now_secs: f64) {
+            // PSI: rate the three channels since the previous read and
             // remember whichever is currently most elevated. A read failure
             // (any file missing — no PSI on this kernel) clears `resource`
             // outright rather than reporting a stale one.
