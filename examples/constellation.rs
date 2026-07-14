@@ -148,6 +148,13 @@ struct State {
     last_samples: Vec<ProcSample>, // for the interior fallback (member PIDs)
     last_area: Rect,               // most recent screen area rendered into
     focus: Option<TileId>,         // currently highlighted node
+    // Bug 1 fix: true once the user has arrowed to a node during the
+    // CURRENT stall activation — while false, `resample` keeps `focus`
+    // auto-following the culprit as it's attributed, so Enter with no
+    // prior arrow dives the real culprit; an arrow press sets this so a
+    // later Enter dives the arrowed node instead. Reset to false on every
+    // fresh stall rising-edge (a new stall starts back in auto-follow).
+    focus_explicit: bool,
     zoom_target: Option<TileId>,   // node being dived into, if any
     zoom_t: f32,                   // eased 0..1 progress (0 = overview, 1 = filled)
     zoom_goal: f32,                // 0.0 (surfacing) or 1.0 (diving)
@@ -185,6 +192,7 @@ impl State {
             last_samples: Vec::new(),
             last_area: Rect::new(0, 0, 80, 24),
             focus: None,
+            focus_explicit: false,
             zoom_target: None,
             zoom_t: 0.0,
             zoom_goal: 0.0,
@@ -280,6 +288,10 @@ impl State {
     /// Move `focus` to the nearest node in `dir`, comparing screen-space rect
     /// centers (matching what the eye sees, not raw canvas coordinates).
     fn move_focus(&mut self, dir: ArrowDir) {
+        // Bug 1 fix: any arrow press is the user taking explicit control of
+        // focus, so `resample` stops auto-following the culprit until the
+        // next fresh stall (see `focus_explicit` on `State`).
+        self.focus_explicit = true;
         let (cw, ch) = self.canvas.size();
         let ga = graph_area(self.last_area);
         let mut vp = Viewport::new(ga, cw, ch);
@@ -409,6 +421,14 @@ impl State {
                 );
             }
 
+            // Bug 1 fix: remember whether the stall was on-screen BEFORE this
+            // resample updates `held_active`, so we can detect the rising
+            // edge (stall just turned on) below and reset `focus_explicit` —
+            // a fresh stall starts back in auto-follow-the-culprit mode even
+            // if the user had arrowed away during a previous, now-ended,
+            // stall.
+            let was_active = self.held_active;
+
             // Hold (hysteresis): only refresh the displayed active/resource/
             // period/culprit while genuinely active, or within a dynamic
             // hold window (fix 4, `stall_hold_secs`) after the last active
@@ -455,6 +475,24 @@ impl State {
                 .held_culprit_comm
                 .as_deref()
                 .and_then(|name| cons.nodes.iter().find(|n| n.comm == name).map(|n| n.id));
+
+            // Bug 1 fix: on the rising edge of the stall (was off, now on),
+            // forget any manual arrow pick from a previous stall so this
+            // fresh one starts in auto-follow mode again.
+            if !was_active && self.held_active {
+                self.focus_explicit = false;
+            }
+            // While the stall is on-screen and the user hasn't taken
+            // explicit control via an arrow press, keep `focus` following
+            // the culprit as it's attributed (attribution can lag a sample
+            // or two behind the stall itself first showing "unattributed")
+            // — so the readout line, the dive target, and the pan target
+            // all agree with what's on-screen, and Enter with no prior
+            // arrow dives the actual culprit, not merely the
+            // highest-significance node.
+            if let Some(cid) = auto_follow_culprit(self.held_active, self.focus_explicit, self.held_culprit_id) {
+                self.focus = Some(cid);
+            }
 
             self.cached_report = Some(report);
         }
@@ -867,6 +905,21 @@ impl State {
         let comm = self.cons.nodes.iter().find(|n| n.id == tid).map(|n| n.comm.as_str()).unwrap_or("?");
         let members = self.last_samples.iter().filter(|s| s.comm == comm).count();
 
+        // Bug 2 fix: the room must become an OPAQUE surface, not merely a
+        // border drawn over a dimmed-but-still-visible map. Fill the grown
+        // rect with blank cells first so nothing underneath (dimmed box
+        // borders, edges) shows through the interior before we draw
+        // anything into it. Once the dive is mostly complete (`eased` past
+        // ~0.6), also clear the whole graph area — not just `grown` — so no
+        // dimmed geometry survives in the thin margin between `grown` and
+        // `area` either; a partial bleed during the early grow is fine
+        // (it reads as the room arriving over the map), but by the end there
+        // must be zero bleed-through.
+        if eased > 0.6 {
+            buf.fill(graph_area(area), Cell::new(" ", Style::default()));
+        }
+        buf.fill(grown, Cell::new(" ", Style::default()));
+
         draw_box(
             buf,
             grown,
@@ -1122,6 +1175,26 @@ fn stable_period(history: &std::collections::VecDeque<Option<f32>>, tol: f32) ->
     }
     let max_dev = vals.iter().map(|v| (v - mean).abs() / mean).fold(0.0f32, f32::max);
     (max_dev <= tol).then_some(mean)
+}
+
+/// Bug 1 fix: what `focus` should become on this resample, given whether the
+/// stall is currently on-screen (`is_active`), whether the user has taken
+/// explicit control of focus via an arrow press since the current stall
+/// activation began (`focus_explicit`), and the (possibly still-unknown,
+/// e.g. for the first sample or two after the stall turns on) culprit.
+/// `Some(_)` means "auto-follow: point focus at the culprit", which keeps
+/// firing every resample while the stall stays on-screen and the culprit
+/// updates — not just once on the stall's rising edge — since attribution
+/// can lag a sample or two behind `is_active` first going true. Returns
+/// `None` (meaning "leave focus alone") once the culprit isn't known yet, or
+/// once the user has arrowed away, so an explicit pick sticks instead of
+/// being clobbered back onto the culprit on the next resample.
+fn auto_follow_culprit(is_active: bool, focus_explicit: bool, culprit: Option<TileId>) -> Option<TileId> {
+    if is_active && !focus_explicit {
+        culprit
+    } else {
+        None
+    }
 }
 
 /// Blend a color toward dark gray by `amt` in `[0, 1]` — used to recede the
@@ -2948,5 +3021,34 @@ mod tests {
         assert!(cpu_edges.contains(&(1, 3)));
         assert!(!cpu_edges.iter().any(|&(a, b)| a == 4 || b == 4), "K=3 cap excludes node 4 despite clearing threshold");
         assert!(!cpu_edges.iter().any(|&(a, b)| a == 5 || b == 5), "below-threshold node 5 excluded");
+    }
+
+    #[test]
+    fn auto_follow_culprit_tracks_until_user_takes_explicit_control() {
+        // Bug 1: Enter must dive the actual culprit during a stall, not
+        // merely the highest-significance node. The fix keeps `focus`
+        // auto-following the culprit every resample while the stall is
+        // on-screen and the user hasn't arrowed away — not just once on the
+        // rising edge — because real attribution can lag a sample or two
+        // behind the stall itself first showing as active/"unattributed".
+        let culprit: Option<TileId> = Some(7);
+
+        // Active, no explicit user pick -> follow the culprit.
+        assert_eq!(auto_follow_culprit(true, false, culprit), culprit);
+
+        // Still active a sample later, still no explicit pick, culprit just
+        // became known (was None on an earlier frame) -> still follows.
+        assert_eq!(auto_follow_culprit(true, false, culprit), culprit);
+
+        // Not active -> nothing to follow.
+        assert_eq!(auto_follow_culprit(false, false, culprit), None);
+
+        // User has arrowed (explicit) -> leave focus alone even though the
+        // stall is still active and the culprit is known.
+        assert_eq!(auto_follow_culprit(true, true, culprit), None);
+
+        // Active, no explicit pick, but culprit not yet attributed -> leave
+        // focus alone (nothing to follow yet).
+        assert_eq!(auto_follow_culprit(true, false, None), None);
     }
 }
