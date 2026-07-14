@@ -103,6 +103,14 @@ const PERIOD_STABLE_N: usize = 3;
 /// Fractional tolerance for "the last `PERIOD_STABLE_N` raw periods agree".
 const PERIOD_STABLE_TOLERANCE: f32 = 0.2;
 
+/// Fix 2 (iteration 6): how many consecutive ACTIVE resamples the raw
+/// detected culprit must agree (unanimously, on the SAME comm) before the
+/// DISPLAYED culprit adopts it — same discipline as `PERIOD_STABLE_N`/
+/// `stable_period`, applied to attribution instead of the clock. Stops the
+/// banner flickering between the real offender and a bystander (or
+/// `unattributed`) on a single dissenting sample.
+const CULPRIT_STABLE_N: usize = 3;
+
 /// Time constant for easing the shown weather pulse toward the cached real
 /// report's `pulse` between resamples, so a once-a-second report update
 /// doesn't read as a jerky step function.
@@ -144,6 +152,9 @@ struct State {
     // Fix 3 (iteration 4d): last `PERIOD_STABLE_N` raw (undebounced) period
     // readings from active resamples, oldest first — see `stable_period`.
     recent_periods: std::collections::VecDeque<Option<f32>>,
+    // Fix 2 (iteration 6): last `CULPRIT_STABLE_N` raw (undebounced) culprit
+    // readings from active resamples, oldest first — see `stable_culprit`.
+    recent_culprits: std::collections::VecDeque<Option<String>>,
     // Task 8: semantic zoom (dive/surface) + spatial breadcrumb.
     last_samples: Vec<ProcSample>, // for the interior fallback (member PIDs)
     last_area: Rect,               // most recent screen area rendered into
@@ -189,6 +200,7 @@ impl State {
             held_culprit_id: None,
             last_active_at: None,
             recent_periods: std::collections::VecDeque::new(),
+            recent_culprits: std::collections::VecDeque::new(),
             last_samples: Vec::new(),
             last_area: Rect::new(0, 0, 80, 24),
             focus: None,
@@ -396,8 +408,26 @@ impl State {
         // top-12 can still be identified and then forced on-screen below.
         if let Some(detector) = &mut self.detector {
             let comm_cpu = cpu_by_comm(&samples);
+
+            // Fix 1 (iteration 6): only feed the detector USERSPACE comms —
+            // the same structural signal `build_graph` already uses to drop
+            // kernel threads from the shown map (rss_pages aggregates to 0
+            // for a kernel-scheduled thread with no address space, ~1709).
+            // Without this, `group_history` accumulates `ksoftirqd/*`,
+            // `rcu_preempt`, `irq/*`, `kworker/*` right alongside real apps;
+            // a kernel thread just reacting to the load on the same clock is
+            // exactly as "periodic" as the real cause and can win the
+            // max-confidence argmax in `find_periodic_offender`, naming an
+            // otherwise-hidden, non-actionable bystander as culprit. A comm
+            // with at least one sample carrying resident memory is
+            // userspace; one whose every sample has `rss_pages == 0` never
+            // is. Filtering at feed time (rather than in the offender
+            // search) keeps `group_history` itself clean.
+            let userspace: HashSet<&str> =
+                samples.iter().filter(|s| s.rss_pages > 0).map(|s| s.comm.as_str()).collect();
             let group_cpu_deltas: Vec<(String, u64)> = comm_cpu
                 .iter()
+                .filter(|(comm, _)| userspace.contains(comm.as_str()))
                 .map(|(comm, &total)| {
                     let prev = self.prev_cpu_by_comm.get(comm).copied().unwrap_or(total);
                     (comm.clone(), total.saturating_sub(prev))
@@ -438,7 +468,22 @@ impl State {
                 self.held_active = true;
                 self.last_active_at = Some(self.t);
                 self.held_resource = report.resource;
-                self.held_culprit_comm = report.culprit_comm.clone();
+
+                // Fix 2 (iteration 6): debounce the DISPLAYED culprit across
+                // resamples — mirrors the period gate directly below. Only
+                // adopt a new raw culprit once the last `CULPRIT_STABLE_N`
+                // active readings unanimously name the SAME comm; otherwise
+                // keep showing whatever was last stable (never clear it on a
+                // single dissenting/`None` sample).
+                self.recent_culprits.push_back(report.culprit_comm.clone());
+                while self.recent_culprits.len() > CULPRIT_STABLE_N {
+                    self.recent_culprits.pop_front();
+                }
+                if self.recent_culprits.len() == CULPRIT_STABLE_N {
+                    if let Some(name) = stable_culprit(&self.recent_culprits, CULPRIT_STABLE_N) {
+                        self.held_culprit_comm = Some(name);
+                    }
+                }
 
                 // Fix 3: debounce the DISPLAYED period across resamples —
                 // only adopt a new raw period once the last
@@ -463,6 +508,7 @@ impl State {
                 self.held_period_s = None;
                 self.held_culprit_comm = None;
                 self.recent_periods.clear();
+                self.recent_culprits.clear();
             }
 
             // Force-include: if the held culprit isn't among the shown
@@ -1175,6 +1221,25 @@ fn stable_period(history: &std::collections::VecDeque<Option<f32>>, tol: f32) ->
     }
     let max_dev = vals.iter().map(|v| (v - mean).abs() / mean).fold(0.0f32, f32::max);
     (max_dev <= tol).then_some(mean)
+}
+
+/// Fix 2 (iteration 6): `Some(comm)` only if `history` has exactly `n`
+/// entries and every one is `Some(comm)` naming the SAME comm — i.e. the raw
+/// per-resample culprit reading has agreed unanimously across the whole
+/// debounce window, not flickering between the real offender and a
+/// bystander (or `unattributed`) on transient noise. `None` (including on
+/// any `None` entry, a dissenting comm, or a window that isn't yet full)
+/// means "not yet stable" — the caller should keep showing the last stable
+/// value. Mirrors `stable_period`'s same discipline, applied to attribution.
+fn stable_culprit(history: &std::collections::VecDeque<Option<String>>, n: usize) -> Option<String> {
+    if history.len() != n {
+        return None;
+    }
+    let first = history.front()?.clone()?;
+    history
+        .iter()
+        .all(|h| h.as_deref() == Some(first.as_str()))
+        .then_some(first)
 }
 
 /// Bug 1 fix: what `focus` should become on this resample, given whether the
@@ -1967,26 +2032,6 @@ mod detect {
             .find_map(|tok| tok.strip_prefix("total=").and_then(|v| v.parse::<u64>().ok()))
     }
 
-    /// Which PSI channel is contended. Ported from `diag::PressureChannel`,
-    /// trimmed to the three PSI resources and mapped onto the example's own
-    /// [`Resource`] (`Io` -> `Disk`) rather than duplicating names.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum PressureChannel {
-        Cpu,
-        Mem,
-        Io,
-    }
-
-    impl PressureChannel {
-        fn resource(self) -> Resource {
-            match self {
-                PressureChannel::Cpu => Resource::Cpu,
-                PressureChannel::Mem => Resource::Mem,
-                PressureChannel::Io => Resource::Disk,
-            }
-        }
-    }
-
     // ── Periodicity analyzer ───────────────────────────────────────────
 
     /// Configuration for [`analyze_periodicity`]. Ported from
@@ -2295,6 +2340,53 @@ mod detect {
     const OFFENDER_MIN_CONFIDENCE: f32 = 0.25; // matches diag.rs's MIN_CONF
     const PERIOD_MATCH_TOLERANCE: f64 = 0.25; // fractional tolerance vs the stall clock
 
+    /// Fix 3 (iteration 6): absolute noise floor for a PSI "some" rate
+    /// (microseconds of stall accumulated per second) to even be considered
+    /// as a contended-resource winner. Chosen from this box's OWN observed
+    /// regime, sampled directly off `/proc/pressure/*` while a real 250ms/
+    /// 3.0s CPU burst ran: ordinary inter-burst/ambient noise sits around
+    /// 18,000-29,000 us/s on the cpu channel and 8,000-23,000 us/s on the io
+    /// channel (close enough to each other that an unconditional argmax
+    /// flips between them on pure noise), while a genuine burst's cpu rate
+    /// jumps to 170,000-285,000 us/s. The floor sits well above the noise
+    /// ceiling and well below the burst floor (roughly 3x headroom each
+    /// way), so ambient noise on either channel never clears it.
+    const RESOURCE_RATE_FLOOR: f32 = 80_000.0;
+    /// Fix 3 (iteration 6): once a channel clears the floor, it must also
+    /// lead the runner-up by at least this much (same us/s units) to be
+    /// ADOPTED as the new resource — a secondary guard for the case where
+    /// two channels are both (unusually) above the floor at once. Observed
+    /// bursts lead the runner-up by well over 100,000 us/s; this is a
+    /// conservative fraction of that.
+    const RESOURCE_RATE_MARGIN: f32 = 20_000.0;
+
+    /// Fix 3 (iteration 6): the genuinely sticky PSI resource pick. Only
+    /// ADOPTS a new channel when its rate clears `floor` AND leads the
+    /// runner-up by at least `margin`; otherwise KEEPS `prev` unchanged —
+    /// a near-zero inter-burst sample never switches (or blanks) the held
+    /// resource mid-stall. Called only when PSI itself read successfully;
+    /// a hard PSI-unavailable read still clears the resource outright at the
+    /// call site, not here (this helper never has a reason to return `None`
+    /// unless `prev` was already `None`).
+    fn pick_contended_resource(
+        prev: Option<Resource>,
+        cpu_rate: f32,
+        mem_rate: f32,
+        io_rate: f32,
+        floor: f32,
+        margin: f32,
+    ) -> Option<Resource> {
+        let mut candidates = [(Resource::Cpu, cpu_rate), (Resource::Mem, mem_rate), (Resource::Disk, io_rate)];
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (best_r, best_v) = candidates[0];
+        let runner_up_v = candidates[1].1;
+        if best_v >= floor && best_v - runner_up_v >= margin {
+            Some(best_r)
+        } else {
+            prev
+        }
+    }
+
     /// Find the process group whose CPU-delta activity is both convincingly
     /// periodic (via [`analyze_periodicity`]) and lands on `clock_period_s`
     /// — the stall's own clock. `None` when no group is a convincing match
@@ -2428,15 +2520,14 @@ mod detect {
                     if let Some((pc, pm, pi, pt)) = self.psi_prev {
                         let dt = (now_secs - pt).max(1e-3);
                         let rate = |c: u64, p: u64| (c.saturating_sub(p) as f64 / dt) as f32;
-                        let candidates = [
-                            (PressureChannel::Cpu, rate(cpu, pc)),
-                            (PressureChannel::Mem, rate(mem, pm)),
-                            (PressureChannel::Io, rate(io, pi)),
-                        ];
-                        let best = candidates
-                            .into_iter()
-                            .fold((PressureChannel::Cpu, 0.0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
-                        self.resource = if best.1 > 0.0 { Some(best.0.resource()) } else { None };
+                        self.resource = pick_contended_resource(
+                            self.resource,
+                            rate(cpu, pc),
+                            rate(mem, pm),
+                            rate(io, pi),
+                            RESOURCE_RATE_FLOOR,
+                            RESOURCE_RATE_MARGIN,
+                        );
                     }
                     self.psi_prev = Some((cpu, mem, io, now_secs));
                 }
@@ -2793,6 +2884,45 @@ mod detect {
 
             assert_eq!(find_periodic_offender(&groups, 3.0), None);
         }
+
+        /// Fix 3 (iteration 6): a clear CPU winner (well above the floor,
+        /// well clear of the runner-up) is adopted regardless of `prev`.
+        #[test]
+        fn pick_contended_resource_clear_cpu_winner() {
+            let picked = pick_contended_resource(None, 200_000.0, 0.0, 10_000.0, 80_000.0, 20_000.0);
+            assert_eq!(picked, Some(Resource::Cpu));
+
+            // Also flips a previously-held resource when the new winner is
+            // genuinely dominant, not just barely ahead.
+            let picked2 =
+                pick_contended_resource(Some(Resource::Disk), 200_000.0, 0.0, 10_000.0, 80_000.0, 20_000.0);
+            assert_eq!(picked2, Some(Resource::Cpu));
+        }
+
+        /// All three channels near zero (inter-burst noise, none clearing
+        /// the floor) -> keep whatever was previously held, don't blank it
+        /// and don't adopt whichever near-zero channel happens to be largest.
+        #[test]
+        fn pick_contended_resource_near_zero_keeps_prev() {
+            let picked =
+                pick_contended_resource(Some(Resource::Cpu), 22_000.0, 0.0, 23_000.0, 80_000.0, 20_000.0);
+            assert_eq!(picked, Some(Resource::Cpu));
+
+            // Also stays `None` if nothing was held yet and nothing clears the floor.
+            let picked_none = pick_contended_resource(None, 22_000.0, 0.0, 23_000.0, 80_000.0, 20_000.0);
+            assert_eq!(picked_none, None);
+        }
+
+        /// A tiny IO rate that's below the floor must NOT flip a held CPU
+        /// resource to disk, even though it's technically the largest of a
+        /// near-silent trio (mirrors the observed inter-burst regime where
+        /// cpu_rate drops near zero but io noise alone doesn't qualify).
+        #[test]
+        fn pick_contended_resource_tiny_io_does_not_flip_held_cpu() {
+            let picked =
+                pick_contended_resource(Some(Resource::Cpu), 500.0, 0.0, 9_000.0, 80_000.0, 20_000.0);
+            assert_eq!(picked, Some(Resource::Cpu));
+        }
     }
 }
 
@@ -3050,5 +3180,50 @@ mod tests {
         // Active, no explicit pick, but culprit not yet attributed -> leave
         // focus alone (nothing to follow yet).
         assert_eq!(auto_follow_culprit(true, false, None), None);
+    }
+
+    /// Fix 2 (iteration 6): unanimous window -> stable.
+    #[test]
+    fn stable_culprit_unanimous_is_stable() {
+        let hist: std::collections::VecDeque<Option<String>> =
+            [Some("python3".to_string()), Some("python3".to_string()), Some("python3".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(stable_culprit(&hist, 3).as_deref(), Some("python3"));
+    }
+
+    /// A dissenting comm anywhere in the window -> not yet stable (keep
+    /// showing the last stable value, don't adopt the mixed reading).
+    #[test]
+    fn stable_culprit_mixed_is_not_stable() {
+        let hist: std::collections::VecDeque<Option<String>> =
+            [Some("python3".to_string()), Some("ksoftirqd/2".to_string()), Some("python3".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(stable_culprit(&hist, 3), None);
+    }
+
+    /// A single `None` (unattributed) reading anywhere in the window also
+    /// blocks stability — a fleeting "unattributed" sample shouldn't clear
+    /// an otherwise-agreeing culprit.
+    #[test]
+    fn stable_culprit_single_none_is_not_stable() {
+        let hist: std::collections::VecDeque<Option<String>> =
+            [Some("python3".to_string()), None, Some("python3".to_string())].into_iter().collect();
+        assert_eq!(stable_culprit(&hist, 3), None);
+
+        // All-None is likewise not stable.
+        let all_none: std::collections::VecDeque<Option<String>> =
+            [None, None, None].into_iter().collect();
+        assert_eq!(stable_culprit(&all_none, 3), None);
+    }
+
+    /// A window that isn't yet full (fewer than `n` readings collected)
+    /// is not stable, regardless of agreement among what's there.
+    #[test]
+    fn stable_culprit_partial_window_is_not_stable() {
+        let hist: std::collections::VecDeque<Option<String>> =
+            [Some("python3".to_string()), Some("python3".to_string())].into_iter().collect();
+        assert_eq!(stable_culprit(&hist, 3), None);
     }
 }
