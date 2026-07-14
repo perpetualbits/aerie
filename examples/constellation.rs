@@ -665,31 +665,38 @@ impl State {
         // banner + readout + footer text last, so routed wires and box
         // outlines never paint over legible text.
 
-        // Backbone edges (structural). FOLLOW: these recede with everything
-        // else on the stall clock, same rationale as the nodes — and while a
-        // stall is active they're additionally held to a heavy dim floor for
-        // the whole duration (not just at a pulse peak), so they don't add
-        // to the tangle while the culprit's resource star (below) is meant
-        // to be the only thing competing for ink.
-        let backbone_dim = if stall_on { stall_dim.max(0.6) } else { stall_dim };
-        render_edges(
-            buf,
-            &placed,
-            &vp,
-            &self.cons.edges,
-            dim_color(dim_color(Color::Rgb(90, 90, 110), dim_amt), backbone_dim),
-            self.canvas.size(),
-        );
+        // Backbone lineage edges (`self.cons.edges`) are NOT drawn on the
+        // overview (iteration 8b): they used to pin the sugiyama layout,
+        // but the treemap (iteration 7) is significance-based and skips
+        // `auto_layout`, so lineage no longer pins anything here — drawing
+        // it was purely decorative and was the last remaining source of
+        // long box-glyph wires routed across non-adjacent tiles. The
+        // treemap's packed adjacency + tile sizes already convey
+        // structure. `self.cons.edges` itself is untouched and still feeds
+        // the DIVE interior (`render_interior` builds a child
+        // sub-constellation from it) — only this overview draw is removed.
 
-        // Contention overlays (iteration 3b, items 1-2): draw-only edges
-        // meaning "these groups share a resource axis". In CALM mode this is
-        // structure, not a stall effect — faint, colour-coded, capped to the
-        // busiest top-2 resources by activity so at most two axes' worth of
-        // edges ever compete for ink (item 1). Under `--stall` this whole
-        // background picture is suppressed: the only contention edges drawn
-        // are the culprit's own hot star below, so the stall view reads as a
-        // clean hub-and-spoke instead of a tangle (item 2).
+        // Contention overlays (iteration 3b, items 1-2; reworked to a
+        // treemap-native shared-wall glow in iteration 8 — see the
+        // `shared_wall`/`draw_wall_tint`/`draw_wall_glow` block above):
+        // draw-only cues meaning "these tiles share a resource axis". In
+        // CALM mode this is structure, not a stall effect — faint,
+        // colour-coded, capped to the single busiest resource by activity
+        // (iteration 8: down from top-2 — the treemap fill already reads as
+        // "one connected map", so calm contention is now just a subtle cue,
+        // not a second axis' worth of ink). Only ADJACENT contending pairs
+        // draw anything; a non-adjacent pair simply has no shared wall to
+        // tint. Under `--stall` this whole background picture is
+        // suppressed: the only contention drawn is the culprit's own hot
+        // glow below, so the stall view reads as a clean focal point
+        // instead of a tangle (item 2).
         let node_ids: Vec<TileId> = self.cons.nodes.iter().map(|n| n.id).collect();
+        // Screen-space rects for every currently-visible tile, precomputed
+        // once so both the calm and stall shared-wall lookups below can
+        // look up a pair's on-screen rects without re-deriving the
+        // projection per pair.
+        let screen_of: HashMap<TileId, Rect> =
+            placed.iter().filter_map(|(id, crect)| vp.project(*crect).map(|r| (*id, r))).collect();
         if !stall_on {
             let contention = contention_edges(&node_ids, &self.cpu_frac, &self.mem_frac, &self.io_frac);
             let mut activity = [
@@ -698,39 +705,50 @@ impl State {
                 (Resource::Disk, resource_activity(&node_ids, &self.io_frac)),
             ];
             activity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for &(resource, total) in activity.iter().take(2) {
-                if total <= 0.0 {
-                    continue; // nothing on this axis at all this frame
+            if let Some(&(resource, total)) = activity.first() {
+                if total > 0.0 {
+                    let tint = dim_color(faint_color(resource_color(resource)), dim_amt);
+                    for (a, b, _) in contention.iter().filter(|(_, _, r)| *r == resource) {
+                        let (Some(ra), Some(rb)) = (screen_of.get(a).copied(), screen_of.get(b).copied()) else {
+                            continue;
+                        };
+                        if let Some(seg) = shared_wall(ra, rb, TREEMAP_GUTTER) {
+                            draw_wall_tint(buf, seg, tint);
+                        }
+                    }
                 }
-                let subset: Vec<(TileId, TileId)> = contention
-                    .iter()
-                    .filter(|(_, _, r)| *r == resource)
-                    .map(|(a, b, _)| (*a, *b))
-                    .collect();
-                if subset.is_empty() {
-                    continue;
-                }
-                let faint = dim_color(faint_color(resource_color(resource)), dim_amt);
-                // Same elevated crossing penalty as the stall hot star
-                // (item 3): all contention-edge routing biases hard toward
-                // crossing-free routes, not just the culprit's overlay.
-                render_edges_penalized(buf, &placed, &vp, &subset, faint, self.canvas.size(), 4, 20);
             }
         }
 
-        // During a stall pulse, flare the culprit's own dominant resource hot
-        // — edges running FROM the culprit to the other nodes it's currently
-        // contending with on that axis. Under `--stall` this is the ONLY
-        // contention drawing (the faint background overlay above is
-        // suppressed for the duration), and it routes with a much higher
-        // crossing penalty (item 3) than every other edge set so it reads as
-        // a clean hub-and-spoke rather than tangling in the thin gaps
-        // between a horizontal row of boxes. Anchored explicitly at the
-        // culprit (not merely filtered from the generic star above) so it
-        // flares whenever the culprit has any qualifying partner on its
-        // dominant axis, independent of whether the culprit happens to also
-        // be that axis's top-ranked node overall.
-        if stall_on && s > 0.5 {
+        // During a stall pulse, the culprit RADIATES: every shared wall
+        // between the culprit tile and each tile it abuts on-screen glows
+        // hot, breathing with the pulse (iteration 8b). Under `--stall`
+        // this is the ONLY contention drawn (the faint background overlay
+        // above is suppressed for the duration). Anchored explicitly at
+        // the culprit so it glows whenever it's on-screen, independent of
+        // whether it happens to also be top-ranked overall.
+        //
+        // Iteration 8b fix: previously this only glowed walls shared with
+        // a genuine co-contender (`top_partners` on the dominant axis) —
+        // but a LONE hog has no co-contender, so it never glowed at all
+        // and fell back to a halo almost every frame; and the gate
+        // (`s > 0.30`) sat above this box's real pulse ceiling (~0.28) so
+        // it also almost never fired. Now: (1) the gate is `s > 0.12`,
+        // this box's real pulse floor, so it breathes visibly within
+        // range; (2) EVERY wall the culprit shares with a neighboring
+        // tile glows (not only co-contender walls) — a packed treemap
+        // tile almost always abuts several neighbors, so this makes the
+        // culprit visibly radiate heat into its surroundings on nearly
+        // every firing frame. A genuine co-contender's wall (still ranked
+        // via `top_partners` on the culprit's dominant resource) is drawn
+        // hotter/heavier to preserve "shared-resource contention" as a
+        // visible subset of the baseline radiate. If the culprit has no
+        // on-screen neighbor at all (fully isolated), the halo fallback
+        // still applies so a hot cue never disappears. This is IN
+        // ADDITION to the culprit's own tile flare (heavy hot border,
+        // iteration 5/9) drawn in the node loop below, never a
+        // replacement for it.
+        if stall_on && s > 0.12 {
             if let Some(cid) = self.culprit() {
                 // Prefer the real detector's own held resource reading when
                 // we have one (item 4: "use the REAL report values"); fall
@@ -749,10 +767,49 @@ impl State {
                     Resource::Disk => &self.io_frac,
                 };
                 let partners = top_partners(cid, &node_ids, frac, CONTENTION_K - 1);
-                if !partners.is_empty() {
-                    let hot_edges: Vec<(TileId, TileId)> = partners.into_iter().map(|id| (cid, id)).collect();
-                    let hot_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s);
-                    render_edges_penalized(buf, &placed, &vp, &hot_edges, hot_color, self.canvas.size(), 4, 20);
+                // Baseline radiate color: hot, intensity proportional to
+                // `s`, but capped short of full white so a genuine
+                // co-contender wall (below) reads as hotter still.
+                let radiate_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s * 0.7);
+                // Co-contender color: the brighter, more assertive blend
+                // (as before c7cae42) — a hotter subset of the baseline.
+                let hot_color = blend_color(resource_color(dom), Color::Rgb(255, 255, 255), s);
+                if let Some(culprit_screen) = screen_of.get(&cid).copied() {
+                    let mut glowed = false;
+                    for (&nid, &neighbor_screen) in screen_of.iter() {
+                        if nid == cid {
+                            continue;
+                        }
+                        if let Some(seg) = shared_wall(culprit_screen, neighbor_screen, TREEMAP_GUTTER) {
+                            let color = if partners.contains(&nid) { hot_color } else { radiate_color };
+                            draw_wall_glow(buf, seg, color);
+                            glowed = true;
+                        }
+                    }
+                    if !glowed {
+                        // Halo fallback: no on-screen neighbor to glow a
+                        // shared wall with (fully isolated) — redraw the
+                        // culprit's border one cell further out so
+                        // something hot always shows, clipped to the
+                        // graph area so it never bleeds into the rim/banner.
+                        let halo = Rect::new(
+                            culprit_screen.x.saturating_sub(1),
+                            culprit_screen.y.saturating_sub(1),
+                            culprit_screen.width + 2,
+                            culprit_screen.height + 2,
+                        )
+                        .intersection(ga);
+                        draw_box(
+                            buf,
+                            halo,
+                            Borders::ALL,
+                            &BorderStyle {
+                                weight: LineWeight::Heavy,
+                                corners: CornerStyle::Rounded,
+                                style: Style::default().fg(hot_color),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -1488,9 +1545,93 @@ fn render_edges_penalized(
 /// Total per-resource contention activity this frame — sum of qualifying
 /// (above-threshold) fractions across all shown nodes. Used to rank
 /// resources by "how much is currently being contended for" so calm mode
-/// can draw just the busiest couple of axes instead of all three at once.
+/// can draw just the single busiest axis instead of all three at once.
 fn resource_activity(node_ids: &[TileId], frac: &HashMap<TileId, f32>) -> f32 {
     node_ids.iter().filter_map(|id| frac.get(id).copied()).filter(|&v| v > CONTENTION_THRESHOLD).sum()
+}
+
+// ── Iteration 8: treemap-native contention — shared-wall glow ──────────────
+//
+// Routing contention as orthogonal box-glyph wires through the treemap's
+// thin (1-2 cell) gutters reliably reads as border corruption (stray
+// `┬┤┐└` fragments hugging tile borders) once the treemap fills the frame
+// (iteration 7) — a wire threaded through a tile-width gutter always mimics
+// a border. Fixed by not routing contention through the gutter at all:
+// instead, draw directly ON the shared wall between two ADJACENT contending
+// tiles — a colored seam (calm) or a hot glow (stall), never a wire
+// crossing it. Non-adjacent contenders simply draw nothing.
+
+/// A wall segment between two adjacent treemap tiles, in screen-space
+/// cells: a vertical run at column `x` spanning rows `[y0, y1)` — the
+/// shared wall between a left/right pair of tiles — or a horizontal run at
+/// row `y` spanning columns `[x0, x1)` — the shared wall between a
+/// top/bottom pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WallSeg {
+    Vertical { x: u16, y0: u16, y1: u16 },
+    Horizontal { y: u16, x0: u16, x1: u16 },
+}
+
+impl WallSeg {
+    /// The 1-cell-thick screen rect this segment occupies, for drawing.
+    fn rect(self) -> Rect {
+        match self {
+            WallSeg::Vertical { x, y0, y1 } => Rect::new(x, y0, 1, y1.saturating_sub(y0)),
+            WallSeg::Horizontal { y, x0, x1 } => Rect::new(x0, y, x1.saturating_sub(x0), 1),
+        }
+    }
+}
+
+/// The shared-wall segment between screen rects `a` and `b`, if they're
+/// adjacent across a gutter of at most `gutter + 1` cells — else `None`.
+/// Two rects are adjacent on the VERTICAL gutter (a left/right pair) when
+/// one's right edge (`right()`, exclusive) and the other's left edge (`x`)
+/// differ by at most `gutter + 1` cells, in either order, AND their
+/// y-ranges overlap; the segment then runs the overlapping y-range, at the
+/// midpoint column between the two edges. Adjacency on the HORIZONTAL
+/// gutter (a top/bottom pair) is the symmetric case over x-ranges. Both
+/// orientations are tried in both orders so callers don't need to know
+/// ahead of time which of `a`/`b` is the left/top one.
+fn shared_wall(a: Rect, b: Rect, gutter: u16) -> Option<WallSeg> {
+    let max_gap = i32::from(gutter) + 1;
+
+    let vertical = |left: Rect, right: Rect| -> Option<WallSeg> {
+        let gap = i32::from(right.x) - i32::from(left.right());
+        if !(0..=max_gap).contains(&gap) {
+            return None;
+        }
+        let y0 = left.y.max(right.y);
+        let y1 = left.bottom().min(right.bottom());
+        (y0 < y1).then(|| WallSeg::Vertical { x: (left.right() + right.x) / 2, y0, y1 })
+    };
+    if let Some(w) = vertical(a, b).or_else(|| vertical(b, a)) {
+        return Some(w);
+    }
+
+    let horizontal = |top: Rect, bottom: Rect| -> Option<WallSeg> {
+        let gap = i32::from(bottom.y) - i32::from(top.bottom());
+        if !(0..=max_gap).contains(&gap) {
+            return None;
+        }
+        let x0 = top.x.max(bottom.x);
+        let x1 = top.right().min(bottom.right());
+        (x0 < x1).then(|| WallSeg::Horizontal { y: (top.bottom() + bottom.y) / 2, x0, x1 })
+    };
+    horizontal(a, b).or_else(|| horizontal(b, a))
+}
+
+/// Calm contention (fix 1): a faint resource-tinted seam ON the shared
+/// wall — a colored background strip, not a glyph, so it reads as a subtle
+/// structural cue rather than another routed wire.
+fn draw_wall_tint(buf: &mut Buffer, seg: WallSeg, color: Color) {
+    buf.fill(seg.rect(), Cell::new(" ", Style::default().bg(color)));
+}
+
+/// Stall culprit glow (fix 2): a bright, bold block filling the shared
+/// wall — deliberately more assertive than the calm tint so the culprit's
+/// contention reads as the hot focus of the frame, not a background cue.
+fn draw_wall_glow(buf: &mut Buffer, seg: WallSeg, color: Color) {
+    buf.fill(seg.rect(), Cell::new("█", Style::default().fg(color).add_modifier(Modifier::BOLD)));
 }
 
 /// Sum of `cpu_jiffies` per comm over EVERY sample this resample saw —
@@ -3352,6 +3493,64 @@ mod tests {
         assert!(cpu_edges.contains(&(1, 3)));
         assert!(!cpu_edges.iter().any(|&(a, b)| a == 4 || b == 4), "K=3 cap excludes node 4 despite clearing threshold");
         assert!(!cpu_edges.iter().any(|&(a, b)| a == 5 || b == 5), "below-threshold node 5 excluded");
+    }
+
+    /// Iteration 8: the shared-wall primitive behind the treemap-native
+    /// contention glow. Two tiles side by side with the treemap's usual
+    /// 2-cell gutter between them, y-ranges overlapping in [2, 6) — must
+    /// yield a vertical wall segment sitting in that gutter, spanning
+    /// exactly the overlapping y-range.
+    #[test]
+    fn shared_wall_adjacent_left_right_pair() {
+        let a = Rect::new(0, 0, 10, 6); // x in [0, 10), y in [0, 6)
+        let b = Rect::new(12, 2, 10, 6); // x in [12, 22), y in [2, 8)
+        let seg = shared_wall(a, b, TREEMAP_GUTTER).expect("adjacent L/R pair should share a wall");
+        match seg {
+            WallSeg::Vertical { x, y0, y1 } => {
+                assert!(
+                    (a.right()..=b.x).contains(&x),
+                    "wall column {x} should sit in the gutter [{}, {}]",
+                    a.right(),
+                    b.x
+                );
+                assert_eq!((y0, y1), (2, 6), "wall should span the overlapping y-range only");
+            }
+            WallSeg::Horizontal { .. } => panic!("a left/right pair should yield a vertical wall"),
+        }
+
+        // Symmetric: swapping argument order must find the same wall.
+        let seg2 = shared_wall(b, a, TREEMAP_GUTTER).expect("order shouldn't matter");
+        assert_eq!(seg, seg2);
+    }
+
+    /// A pair far enough apart that no treemap gutter would ever separate
+    /// them (well beyond `gutter + 1`) has no shared wall at all.
+    #[test]
+    fn shared_wall_distant_pair_is_none() {
+        let a = Rect::new(0, 0, 10, 6);
+        let b = Rect::new(40, 0, 10, 6);
+        assert!(shared_wall(a, b, TREEMAP_GUTTER).is_none(), "distant pair should not share a wall");
+    }
+
+    /// A vertically-stacked pair (top/bottom neighbours) must yield a
+    /// HORIZONTAL wall segment, spanning the overlapping x-range.
+    #[test]
+    fn shared_wall_vertically_stacked_pair_is_horizontal() {
+        let a = Rect::new(0, 0, 10, 6); // y in [0, 6)
+        let b = Rect::new(2, 8, 10, 6); // y in [8, 14), 2-cell gutter below a
+        let seg = shared_wall(a, b, TREEMAP_GUTTER).expect("stacked pair should share a wall");
+        match seg {
+            WallSeg::Horizontal { y, x0, x1 } => {
+                assert!(
+                    (a.bottom()..=b.y).contains(&y),
+                    "wall row {y} should sit in the gutter [{}, {}]",
+                    a.bottom(),
+                    b.y
+                );
+                assert_eq!((x0, x1), (2, 10), "wall should span the overlapping x-range only");
+            }
+            WallSeg::Vertical { .. } => panic!("a stacked pair should yield a horizontal wall"),
+        }
     }
 
     #[test]
