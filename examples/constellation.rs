@@ -4,11 +4,16 @@
 //
 // Live /proc process-groups become nodes in one semantically-zoomable graph:
 // backbone edges are lineage (parent comm -> child comm), node size = CPU,
-// heat = memory, pulse = strain. A --stall injector fakes a periodic system
-// stall so we can feel the notice -> materialize -> dive arc before wiring the
-// real Instruments subsystem. Standalone: mullion + crossterm only.
+// heat = memory, pulse = strain. By default the pulse/banner/culprit are
+// driven by a REAL stall detector (`mod detect`: a background latency probe +
+// PSI + periodicity/offender analysis) — the map only ever shows a red stall
+// banner when a real stall is actually detected; otherwise a quiet
+// "monitoring" status. Pass `--demo` to drive the same visuals from a
+// synthetic periodic-stall injector instead (clearly labeled DEMO), useful
+// when there's no real stall around to feel the notice -> materialize -> dive
+// arc. Standalone: mullion + crossterm only.
 //
-// Run:  cargo run --bin constellation [--stall]
+// Run:  cargo run --bin constellation [--demo]
 // Keys: q / Ctrl-C  quit
 //       arrows      move focus
 //       Enter / + / = dive into the focused node
@@ -35,9 +40,17 @@ const FRAME: Duration = Duration::from_millis(33); // ~30 fps
 const HELP: &str = "\
 constellation — aerie unifying-face spike
 
-USAGE: constellation [--stall]
-  --stall   drive the fake periodic-stall injector on startup
+USAGE: constellation [--demo] [--probe-debug]
+  --demo    drive a synthetic periodic-stall injector instead of the real
+            detector; the banner reads DEMO so it's never mistaken for a
+            real detection
+  --probe-debug  dump raw probe samples/event onsets/period to stderr each
+            resample (diagnostic; real mode only)
   -h,--help show this help
+
+Default (no flag): real stall detection — a background latency probe + PSI
++ periodicity/offender analysis. Shows a red stall banner only when a real
+stall is detected; otherwise a quiet monitoring status.
 
 KEYS: q/Ctrl-C quit; arrows move focus; Enter/+/= dive; Esc/-/_ surface;
       space pause/resume clock\n";
@@ -67,20 +80,70 @@ const SAMPLE_EVERY: f32 = 1.0;
 /// crowd — still comfortably under the render budget.
 const MAX_NODES: usize = 12;
 
+/// How long (in `t` seconds) a detected stall stays displayed after the
+/// probe's reading momentarily drops below the active threshold — a single
+/// quiet sample shouldn't flicker the whole readout off (brief item 3).
+///
+/// Fix 4 (iteration 4d): a real burst is only a small fraction of its own
+/// period (e.g. 250ms out of a 3.0s cycle), so a FIXED short hold lapses
+/// `active` in every inter-burst gap — the observed ~28%-of-polls firing.
+/// Once a period is known, hold `STALL_HOLD_PERIOD_MULT` times it (so the
+/// hold outlasts the gap between bursts, not just the burst itself);
+/// before a period is known yet, fall back to a fixed floor. See
+/// `State::stall_hold_secs`.
+const STALL_HOLD_FALLBACK_SECS: f32 = 4.0;
+const STALL_HOLD_PERIOD_MULT: f32 = 1.5;
+
+/// Fix 3 (iteration 4d): how many consecutive ACTIVE resamples the raw
+/// detected period must agree (within `PERIOD_STABLE_TOLERANCE`) before the
+/// DISPLAYED period adopts it. Stops the banner flickering between e.g.
+/// `~9.0s`/`~12s`/`irregular` on transient aliasing noise — shows the last
+/// stable value (or `irregular` before any value has stabilized) instead.
+const PERIOD_STABLE_N: usize = 3;
+/// Fractional tolerance for "the last `PERIOD_STABLE_N` raw periods agree".
+const PERIOD_STABLE_TOLERANCE: f32 = 0.2;
+
+/// Time constant for easing the shown weather pulse toward the cached real
+/// report's `pulse` between resamples, so a once-a-second report update
+/// doesn't read as a jerky step function.
+const PULSE_EASE_TAU: f32 = 0.4;
+
 struct State {
-    stall: bool,
+    demo: bool,   // --demo: synthetic injector, clearly labeled, instead of real detection
+    probe_debug: bool, // --probe-debug: STEP-0 diagnostic eprintln dump (see detect::Detector::debug_dump)
     paused: bool, // space toggles; while true, advance() freezes the clock
     t: f32,       // seconds since start
     since_sample: f32,
     ids: CommIds,
     prev_cpu: HashMap<TileId, u64>, // last cumulative jiffies per node id
     prev_io: HashMap<TileId, u64>,  // last cumulative blkio ticks per node id
+    prev_cpu_by_comm: HashMap<String, u64>, // last cumulative jiffies per comm, uncapped (feeds the detector)
     cons: Constellation,
     canvas: GraphCanvas,
     cpu_frac: HashMap<TileId, f32>, // per-frame normalized deltas
     mem_frac: HashMap<TileId, f32>,
     io_frac: HashMap<TileId, f32>, // per-frame normalized blkio (disk-wait) deltas
     injector: Injector,
+    // Iteration 4b: the real detector (`None` under --demo). Spawned once in
+    // `main` before entering the TUI; `epoch` is the single `Instant` shared
+    // between its latency-probe clock and every `now_secs` we pass it, so the
+    // probe's own sample timestamps and our window queries stay aligned.
+    detector: Option<detect::Detector>,
+    epoch: Instant,
+    cached_report: Option<detect::DetectionReport>, // latest raw report (recomputed only on resample)
+    pulse_shown: f32,                                // eased weather pulse, real mode only
+    // Honest, held (hysteresis) display state — updated on resample, kept
+    // through a short dynamic hold (`stall_hold_secs`) so a single quiet
+    // sample doesn't flicker the banner/flare/culprit off.
+    held_active: bool,
+    held_resource: Option<Resource>,
+    held_period_s: Option<f32>,
+    held_culprit_comm: Option<String>,
+    held_culprit_id: Option<TileId>,
+    last_active_at: Option<f32>,
+    // Fix 3 (iteration 4d): last `PERIOD_STABLE_N` raw (undebounced) period
+    // readings from active resamples, oldest first — see `stable_period`.
+    recent_periods: std::collections::VecDeque<Option<f32>>,
     // Task 8: semantic zoom (dive/surface) + spatial breadcrumb.
     last_samples: Vec<ProcSample>, // for the interior fallback (member PIDs)
     last_area: Rect,               // most recent screen area rendered into
@@ -91,21 +154,34 @@ struct State {
 }
 
 impl State {
-    fn new(stall: bool) -> Self {
+    fn new(demo: bool, detector: Option<detect::Detector>, epoch: Instant) -> Self {
         let mut state = State {
-            stall,
+            demo,
+            probe_debug: false,
             paused: false,
             t: 0.0,
             since_sample: 0.0,
             ids: CommIds::new(),
             prev_cpu: HashMap::new(),
             prev_io: HashMap::new(),
+            prev_cpu_by_comm: HashMap::new(),
             cons: Constellation { nodes: Vec::new(), edges: Vec::new() },
             canvas: GraphCanvas::new(1, 1),
             cpu_frac: HashMap::new(),
             mem_frac: HashMap::new(),
             io_frac: HashMap::new(),
             injector: Injector::new(),
+            detector,
+            epoch,
+            cached_report: None,
+            pulse_shown: 0.0,
+            held_active: false,
+            held_resource: None,
+            held_period_s: None,
+            held_culprit_comm: None,
+            held_culprit_id: None,
+            last_active_at: None,
+            recent_periods: std::collections::VecDeque::new(),
             last_samples: Vec::new(),
             last_area: Rect::new(0, 0, 80, 24),
             focus: None,
@@ -115,6 +191,36 @@ impl State {
         };
         state.resample(); // populate the first frame immediately
         state
+    }
+
+    /// Whether the stall visuals (banner/flare/wash/dim) should be "on" this
+    /// frame: always true under `--demo` (the synthetic clock never stops),
+    /// else the held (hysteresis) real-detection active flag.
+    fn stall_on(&self) -> bool {
+        self.demo || self.held_active
+    }
+
+    /// Fix 4 (iteration 4d): how long `active` survives after the probe's
+    /// reading last cleared the active threshold. Once a period is known,
+    /// `STALL_HOLD_PERIOD_MULT` times it — long enough to bridge the quiet
+    /// gap between bursts (a burst is a small fraction of its own period),
+    /// not just the burst's own duration — else a fixed floor before a
+    /// period is known yet.
+    fn stall_hold_secs(&self) -> f32 {
+        self.held_period_s
+            .map(|p| (p * STALL_HOLD_PERIOD_MULT).max(STALL_HOLD_FALLBACK_SECS))
+            .unwrap_or(STALL_HOLD_FALLBACK_SECS)
+    }
+
+    /// The node currently playing "culprit": the injector's pinned node under
+    /// `--demo`, else the real detector's held culprit mapped to a shown node
+    /// id (see `force_include_culprit`).
+    fn culprit(&self) -> Option<TileId> {
+        if self.demo {
+            self.injector.culprit
+        } else {
+            self.held_culprit_id
+        }
     }
 
     fn advance(&mut self, dt: f32) {
@@ -129,6 +235,16 @@ impl State {
         self.since_sample += dt;
         if self.since_sample >= SAMPLE_EVERY {
             self.resample();
+        }
+
+        // Ease the shown weather pulse toward the cached real report's pulse
+        // every frame (not just on resample) so it breathes smoothly rather
+        // than stepping once a second. No-op under --demo, which drives its
+        // pulse straight from the continuous injector formula instead.
+        if !self.demo {
+            let target = self.cached_report.as_ref().map(|r| r.pulse).unwrap_or(0.0);
+            let k = (dt / PULSE_EASE_TAU).clamp(0.0, 1.0);
+            self.pulse_shown += (target - self.pulse_shown) * k;
         }
 
         // Ease zoom_t toward zoom_goal over ~ZOOM_SECS, in either direction.
@@ -147,12 +263,13 @@ impl State {
     }
 
     /// The node the viewport should be panned to keep on-screen: the stall
-    /// culprit under `--stall`, else the focused node, else the
-    /// highest-significance (first, since `cons.nodes` is kept sorted) node
-    /// so startup lands on content rather than an empty canvas corner.
+    /// culprit while a stall is on-screen (real or `--demo`), else the
+    /// focused node, else the highest-significance (first, since
+    /// `cons.nodes` is kept sorted) node so startup lands on content rather
+    /// than an empty canvas corner.
     fn pan_target(&self) -> Option<TileId> {
-        if self.stall {
-            self.injector.culprit
+        if self.stall_on() {
+            self.culprit().or(self.focus).or_else(|| self.cons.nodes.first().map(|n| n.id))
         } else if let Some(f) = self.focus {
             Some(f)
         } else {
@@ -233,8 +350,7 @@ impl State {
 
     fn resample(&mut self) {
         let samples = sample_procs();
-        let cons = build_graph(&samples, &mut self.ids);
-        self.last_samples = samples; // kept for the Task 8 interior fallback
+        let mut cons = build_graph(&samples, &mut self.ids);
 
         // CPU deltas vs previous cumulative jiffies.
         let mut deltas: HashMap<TileId, u64> = HashMap::new();
@@ -244,14 +360,14 @@ impl State {
         }
         self.prev_cpu = cons.nodes.iter().map(|n| (n.id, n.cpu_jiffies)).collect();
 
-        // Task 9: under --stall, pin the injector's culprit to a real, stable
+        // Task 9: under --demo, pin the injector's culprit to a real, stable
         // app node the first time we see one — the SHOWN node (kernel threads
         // already excluded in build_graph) with the highest cumulative
         // cpu_jiffies, so it reads as a believable, recognizable culprit
         // rather than an arbitrary first-frame pick. Re-elect only if that
         // comm's process disappears out from under us later. A no-op when
-        // --stall is off, so the calm (Task 8) path is unaffected.
-        if self.stall {
+        // --demo is off, so the real-detection path below is unaffected.
+        if self.demo {
             if let Some(cid) = self.injector.culprit {
                 if !cons.nodes.iter().any(|n| n.id == cid) {
                     self.injector.culprit = None;
@@ -261,6 +377,89 @@ impl State {
                 self.injector.culprit = cons.nodes.iter().max_by_key(|n| n.cpu_jiffies).map(|n| n.id);
             }
         }
+
+        // Iteration 4b: feed the real detector this resample's per-comm CPU
+        // deltas — UNCAPPED (every comm this sample saw), not just the
+        // MAX_NODES currently shown, so a periodic offender outside the
+        // top-12 can still be identified and then forced on-screen below.
+        if let Some(detector) = &mut self.detector {
+            let comm_cpu = cpu_by_comm(&samples);
+            let group_cpu_deltas: Vec<(String, u64)> = comm_cpu
+                .iter()
+                .map(|(comm, &total)| {
+                    let prev = self.prev_cpu_by_comm.get(comm).copied().unwrap_or(total);
+                    (comm.clone(), total.saturating_sub(prev))
+                })
+                .collect();
+            self.prev_cpu_by_comm = comm_cpu;
+
+            let now_secs = self.epoch.elapsed().as_secs_f64();
+            detector.observe(now_secs, &group_cpu_deltas);
+            let report = detector.report(now_secs);
+            if self.probe_debug {
+                detector.debug_dump(now_secs, 15.0);
+                // Also dump the assembled report's own pulse/active gate —
+                // this is what surfaced the second STEP-0 finding: period
+                // extraction was fixed, but `active` (pulse vs
+                // PULSE_ACTIVE_THRESHOLD) barely crossed on this box's
+                // modest real overshoot until PULSE_NORM_MS was recalibrated.
+                eprintln!(
+                    "[probe-debug] report pulse={:.3} active={} magnitude_ms={:.1} period_s={:?}",
+                    report.pulse, report.active, report.magnitude_ms, report.period_s
+                );
+            }
+
+            // Hold (hysteresis): only refresh the displayed active/resource/
+            // period/culprit while genuinely active, or within a dynamic
+            // hold window (fix 4, `stall_hold_secs`) after the last active
+            // reading — a single quiet sample, or the ordinary inter-burst
+            // gap, must not flicker the whole readout off (brief item 3).
+            if report.active {
+                self.held_active = true;
+                self.last_active_at = Some(self.t);
+                self.held_resource = report.resource;
+                self.held_culprit_comm = report.culprit_comm.clone();
+
+                // Fix 3: debounce the DISPLAYED period across resamples —
+                // only adopt a new raw period once the last
+                // `PERIOD_STABLE_N` active readings agree within
+                // `PERIOD_STABLE_TOLERANCE`; otherwise keep showing
+                // whatever was last stable (or `irregular`/None before
+                // anything has stabilized yet).
+                self.recent_periods.push_back(report.period_s);
+                while self.recent_periods.len() > PERIOD_STABLE_N {
+                    self.recent_periods.pop_front();
+                }
+                if self.recent_periods.len() == PERIOD_STABLE_N {
+                    if let Some(p) = stable_period(&self.recent_periods, PERIOD_STABLE_TOLERANCE) {
+                        self.held_period_s = Some(p);
+                    }
+                }
+            } else if !(self.held_active
+                && self.last_active_at.is_some_and(|at| self.t - at < self.stall_hold_secs()))
+            {
+                self.held_active = false;
+                self.held_resource = None;
+                self.held_period_s = None;
+                self.held_culprit_comm = None;
+                self.recent_periods.clear();
+            }
+
+            // Force-include: if the held culprit isn't among the shown
+            // top-12 nodes, swap it in so it's visible, can flare, and can
+            // be dived (same principle as the earlier culprit-on-screen fix).
+            if let Some(name) = self.held_culprit_comm.clone() {
+                force_include_culprit(&mut cons, &mut self.ids, &samples, &name);
+            }
+            self.held_culprit_id = self
+                .held_culprit_comm
+                .as_deref()
+                .and_then(|name| cons.nodes.iter().find(|n| n.comm == name).map(|n| n.id));
+
+            self.cached_report = Some(report);
+        }
+
+        self.last_samples = samples; // kept for the Task 8 interior fallback
 
         let dmax = deltas.values().copied().max().unwrap_or(1).max(1);
         let mmax = cons.nodes.iter().map(|n| n.rss_pages).max().unwrap_or(1).max(1);
@@ -334,23 +533,30 @@ impl State {
         // surface, so there is no visible pop when the overlay first appears.
         let dim_amt = if self.zoom_target.is_some() { smoothstep(self.zoom_t.clamp(0.0, 1.0)) } else { 0.0 };
 
-        // Task 9: the injector's stall pulse, 0..1, peaking every period_s.
-        // Only ever fed to visuals when `self.stall` is set — with it off the
-        // map stays exactly as calm as it was at the end of Task 8.
-        let s = self.injector.intensity(self.t);
+        // Iteration 4b: `s` is the weather pulse driving every stall visual,
+        // 0..1. Under `--demo` it's the continuous synthetic injector
+        // formula; by default it's the real detector's cached report pulse,
+        // eased frame-to-frame by `advance` (see `pulse_shown`) since the
+        // report itself is only recomputed once a resample.
+        let s = if self.demo { self.injector.intensity(self.t) } else { self.pulse_shown };
+        // `stall_on`: whether the stall visuals are "on" this frame at all —
+        // always true under `--demo`, else the held (hysteresis) real
+        // detection active flag. With it off the map stays exactly as calm
+        // as it was at the end of Task 8.
+        let stall_on = self.stall_on();
 
         // FOLLOW: how hard to dim every non-culprit node/edge toward
         // near-black this frame. Zero below s=0.35 and rising continuously to
         // 1.0 at a pulse peak — the zero-crossing at the threshold means
         // there's no pop where the effect switches on, only the smooth ramp
-        // `s` already gives. Never set when --stall is off.
-        let stall_dim = if self.stall { ((s - 0.35) / 0.65).clamp(0.0, 1.0) } else { 0.0 };
+        // `s` already gives. Never set when no stall is on-screen.
+        let stall_dim = if stall_on { ((s - 0.35) / 0.65).clamp(0.0, 1.0) } else { 0.0 };
 
         // Weather: a faint full-screen wash + perimeter rim, both scaled by
         // `s`, so the whole map visibly breathes on the stall clock. Drawn
         // before edges/nodes so it reads as background, not an overlay on
         // top of them.
-        if self.stall {
+        if stall_on {
             let wash = Color::Rgb((25.0 * s) as u8, (10.0 * s) as u8, (10.0 * s) as u8);
             buf.fill(area, Cell::new(" ", Style::default().bg(wash)));
             let rim_col =
@@ -377,7 +583,7 @@ impl State {
         // the whole duration (not just at a pulse peak), so they don't add
         // to the tangle while the culprit's resource star (below) is meant
         // to be the only thing competing for ink.
-        let backbone_dim = if self.stall { stall_dim.max(0.6) } else { stall_dim };
+        let backbone_dim = if stall_on { stall_dim.max(0.6) } else { stall_dim };
         render_edges(
             buf,
             &placed,
@@ -396,7 +602,7 @@ impl State {
         // are the culprit's own hot star below, so the stall view reads as a
         // clean hub-and-spoke instead of a tangle (item 2).
         let node_ids: Vec<TileId> = self.cons.nodes.iter().map(|n| n.id).collect();
-        if !self.stall {
+        if !stall_on {
             let contention = contention_edges(&node_ids, &self.cpu_frac, &self.mem_frac, &self.io_frac);
             let mut activity = [
                 (Resource::Cpu, resource_activity(&node_ids, &self.cpu_frac)),
@@ -436,9 +642,19 @@ impl State {
         // flares whenever the culprit has any qualifying partner on its
         // dominant axis, independent of whether the culprit happens to also
         // be that axis's top-ranked node overall.
-        if self.stall && s > 0.5 {
-            if let Some(cid) = self.injector.culprit {
-                let dom = dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac);
+        if stall_on && s > 0.5 {
+            if let Some(cid) = self.culprit() {
+                // Prefer the real detector's own held resource reading when
+                // we have one (item 4: "use the REAL report values"); fall
+                // back to the frac-derived dominant axis under --demo or
+                // when the resource is momentarily unattributed.
+                let dom = if !self.demo {
+                    self.held_resource.unwrap_or_else(|| {
+                        dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac)
+                    })
+                } else {
+                    dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac)
+                };
                 let frac = match dom {
                     Resource::Cpu => &self.cpu_frac,
                     Resource::Mem => &self.mem_frac,
@@ -456,17 +672,19 @@ impl State {
         // Nodes (boxes), drawn after every edge set so a box's fill/outline
         // always sits on top of a routed wire rather than being crossed by
         // one (item 5).
+        let culprit_id = self.culprit();
         for (id, crect) in &placed {
             if let Some(screen) = vp.project(*crect) {
                 let cpu = self.cpu_frac.get(id).copied().unwrap_or(0.0);
                 let mem = self.mem_frac.get(id).copied().unwrap_or(0.0);
-                // Task 9: only the stall culprit pulses, and only under
-                // --stall; every other node (and every node when --stall is
-                // off) gets zero strain, same as the Task-7 placeholder.
-                let strain = if self.stall && self.injector.culprit == Some(*id) { s } else { 0.0 };
+                // Task 9: only the stall culprit pulses, and only while a
+                // stall is on-screen; every other node (and every node when
+                // no stall is on-screen) gets zero strain, same as the
+                // Task-7 placeholder.
+                let strain = if stall_on && culprit_id == Some(*id) { s } else { 0.0 };
                 let vis = encode_node(cpu, mem, strain);
                 let is_focus = self.zoom_target.is_none() && self.focus == Some(*id);
-                let is_culprit = self.stall && self.injector.culprit == Some(*id);
+                let is_culprit = stall_on && culprit_id == Some(*id);
                 // FOLLOW: every node except the culprit recedes toward
                 // near-black on the stall clock, so at a pulse peak the eye
                 // has nowhere else to go. The culprit is exempt here — its
@@ -515,48 +733,76 @@ impl State {
         // to "what do I do with this". Spans the top rim row; brightness
         // scales with the pulse so it, too, breathes on the stall clock.
         // Domain-agnostic: period/clock + resource-category language only.
-        // The named resource is the culprit's own dominant axis: whichever
-        // of cpu/mem/disk it's currently heaviest on. Drawn after every edge
-        // and box this frame (item 5) so a routed wire can never paint over
-        // it.
-        if self.stall {
-            let contended = self
-                .injector
-                .culprit
-                .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
-                .unwrap_or(Resource::Cpu);
-            let banner = format!(
-                "⚠ stall detected — contention on {} — acting on a ~{:.1}s clock",
-                resource_label(contended),
-                self.injector.period_s
-            );
+        // Drawn after every edge and box this frame (item 5) so a routed
+        // wire can never paint over it. Honest states (item 3): a red banner
+        // ONLY while a stall is on-screen; otherwise (real mode only) a
+        // quiet, non-alarming monitoring status — never a red banner when
+        // the real probe hasn't detected anything.
+        if stall_on {
+            let banner = if self.demo {
+                let contended = self
+                    .injector
+                    .culprit
+                    .map(|cid| dominant_resource(cid, &self.cpu_frac, &self.mem_frac, &self.io_frac))
+                    .unwrap_or(Resource::Cpu);
+                format!(
+                    "⚠ DEMO stall (synthetic) — contention on {} — acting on a ~{:.1}s clock",
+                    resource_label(contended),
+                    self.injector.period_s
+                )
+            } else {
+                let mut b = String::from("⚠ stall detected");
+                if let Some(r) = self.held_resource {
+                    b.push_str(&format!(" — contention on {}", resource_label(r)));
+                }
+                match self.held_period_s {
+                    Some(p) => b.push_str(&format!(" — ~{p:.1}s clock")),
+                    None => b.push_str(" — irregular"),
+                }
+                if self.held_culprit_comm.is_none() {
+                    b.push_str(" — unattributed");
+                }
+                b
+            };
             if area.width as usize > banner.chars().count() {
                 let banner_color = blend_color(Color::Rgb(120, 90, 20), Color::Rgb(255, 70, 40), s);
                 let x = area.x + (area.width - banner.chars().count() as u16) / 2;
                 buf.set_string(x, area.y, &banner, Style::default().fg(banner_color).add_modifier(Modifier::BOLD));
             }
+        } else if !self.demo {
+            // Calm (real mode only): honest default on a healthy system —
+            // quiet, no red, but still legible that monitoring is live and
+            // shows the probe's current peak so "nothing to see" is
+            // distinguishable from "not running".
+            let peak = self.cached_report.as_ref().map(|r| r.magnitude_ms).unwrap_or(0.0);
+            let status = format!("monitoring — no stall detected (peak {peak:.0}ms)");
+            if area.width as usize > status.chars().count() {
+                let x = area.x + (area.width - status.chars().count() as u16) / 2;
+                buf.set_string(x, area.y, &status, Style::default().fg(Color::Gray));
+            }
         }
 
-        // Legibility baseline (both modes): the focused (or, under --stall,
-        // culprit) node gets a full readout — its whole comm plus live
-        // cpu%/mem% — since its box label is elided to a 2-char stump at
+        // Legibility baseline (both modes): the focused (or, while a stall is
+        // on-screen, culprit) node gets a full readout — its whole comm plus
+        // live cpu%/mem% — since its box label is elided to a 2-char stump at
         // small sizes. A header line at top-left, one row below the rim.
-        // Under `--stall` this line also carries the dive invitation (item
-        // 4): appended here instead of drawn under the culprit box, it's
-        // permanently out of the edge band, so no routed wire can ever clip
-        // it. Drawn last (after nodes/edges) so routed wires never paint
-        // over it, and only in the overview (the dive overlay has its own
-        // title_line once zoomed in).
+        // While a stall is on-screen this line also carries the dive
+        // invitation (item 4): appended here instead of drawn under the
+        // culprit box, it's permanently out of the edge band, so no routed
+        // wire can ever clip it. Drawn last (after nodes/edges) so routed
+        // wires never paint over it, and only in the overview (the dive
+        // overlay has its own title_line once zoomed in).
         if self.zoom_target.is_none() {
-            // Under --stall, the culprit takes priority over plain focus so
-            // its full comm/cpu/mem readout is always on-screen — the
-            // "unmistakable" requirement doesn't stop at the border color.
-            let readout_id = if self.stall { self.injector.culprit.or(self.focus) } else { self.focus };
+            // While a stall is on-screen, the culprit takes priority over
+            // plain focus so its full comm/cpu/mem readout is always
+            // on-screen — the "unmistakable" requirement doesn't stop at the
+            // border color.
+            let readout_id = if stall_on { culprit_id.or(self.focus) } else { self.focus };
             if let Some(readout_id) = readout_id {
                 if let Some(n) = self.cons.nodes.iter().find(|n| n.id == readout_id) {
                     let cpu = self.cpu_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
                     let mem = self.mem_frac.get(&readout_id).copied().unwrap_or(0.0) * 100.0;
-                    let is_readout_culprit = self.stall && self.injector.culprit == Some(readout_id);
+                    let is_readout_culprit = stall_on && culprit_id == Some(readout_id);
                     let tag = if is_readout_culprit { " [culprit]" } else { "" };
                     let dive_hint = if is_readout_culprit { "   ↵ dive to inspect" } else { "" };
                     let readout = format!("{}{tag}  cpu {cpu:.0}%  mem {mem:.0}%{dive_hint}", n.comm);
@@ -574,14 +820,15 @@ impl State {
         }
 
         // HUD footer: node count, sample age (seconds since last resample),
-        // and — under --stall — the live injector intensity, so manual
-        // verification of the spike proof-goals is legible at a glance.
-        // Domain-agnostic: counts/seconds/numbers only, no product names.
+        // and — while a stall is on-screen — the live pulse intensity, so
+        // manual verification of the spike proof-goals is legible at a
+        // glance. Domain-agnostic: counts/seconds/numbers only, no product
+        // names.
         let mut footer = format!("nodes={} age={:.1}s", self.cons.nodes.len(), self.since_sample);
         if self.paused {
             footer.push_str(" paused");
         }
-        if self.stall {
+        if stall_on {
             footer.push_str(&format!(" intensity={s:.2}"));
         }
         // Legibility baseline (both modes): a one-line legend so the visual
@@ -641,8 +888,10 @@ impl State {
                 self.render_interior(buf, grown, tid, comm, members);
                 title_line(buf, grown, &format!(" {comm} "), Color::Cyan);
                 // Bedrock: diving into the stall culprit itself, at Full LoD,
-                // reveals the injected latency timeline underneath its interior.
-                if self.stall && self.injector.culprit == Some(tid) {
+                // reveals the latency timeline underneath its interior — the
+                // real detector's overshoot series by default, or the
+                // synthetic injector's own pulse train under --demo.
+                if self.stall_on() && self.culprit() == Some(tid) {
                     self.render_stall_timeline(buf, grown);
                 }
             }
@@ -723,11 +972,23 @@ impl State {
     }
 
     /// Bedrock: a bottom strip inside the culprit's `Lod::Full` rect, rendered
-    /// as a latency timeline — the injector's own pulse train swept across a
-    /// small time window via `Field::render_braille`, so the peaks the map has
-    /// been breathing to are visible as a trace. Labeled only in neutral
-    /// period-seconds terms; no product names or remediation hints.
+    /// as a latency timeline via `Field::render_braille`. Dispatches to the
+    /// real detector's own overshoot series by default, or the synthetic
+    /// injector's pulse train under `--demo` (item 4/5: no synthetic values
+    /// mixed into the real story, and vice versa).
     fn render_stall_timeline(&self, buf: &mut Buffer, outer: Rect) {
+        if self.demo {
+            self.render_demo_timeline(buf, outer);
+        } else {
+            self.render_real_timeline(buf, outer);
+        }
+    }
+
+    /// `--demo` bedrock: the injector's own pulse train swept across a small
+    /// time window, so the peaks the map has been breathing to are visible
+    /// as a trace. Labeled only in neutral period-seconds terms; no product
+    /// names or remediation hints.
+    fn render_demo_timeline(&self, buf: &mut Buffer, outer: Rect) {
         let strip_h = 3u16.min(outer.height.saturating_sub(2));
         if outer.width < 12 || strip_h < 2 {
             return; // too small to show a timeline
@@ -786,6 +1047,81 @@ impl State {
     fn duration_ms(&self) -> i64 {
         (self.injector.sigma * self.injector.period_s * 1000.0).round() as i64
     }
+
+    /// Real bedrock (item 4): the detector's own recent `overshoot_series`
+    /// swept across the strip as a braille trace — no synthetic values. The
+    /// readout is `period {p:.1}s · magnitude {m:.0}ms` from the cached
+    /// report, or `irregular · magnitude {m:.0}ms` when there's no clear
+    /// period.
+    fn render_real_timeline(&self, buf: &mut Buffer, outer: Rect) {
+        let strip_h = 3u16.min(outer.height.saturating_sub(2));
+        if outer.width < 12 || strip_h < 2 {
+            return; // too small to show a timeline
+        }
+        let strip = Rect::new(
+            outer.x + 2,
+            outer.bottom().saturating_sub(strip_h + 1),
+            outer.width.saturating_sub(4),
+            strip_h,
+        );
+
+        let Some(report) = self.cached_report.as_ref() else { return };
+        let series = &report.overshoot_series;
+        if series.len() >= 2 {
+            let t0 = series[0].0;
+            let t1 = series[series.len() - 1].0;
+            let span = (t1 - t0).max(1e-3);
+            let max_ms = series.iter().map(|&(_, m)| m).fold(0.0f32, f32::max).max(1.0);
+            let field = Field::rect(strip);
+            field.render_braille(
+                buf,
+                |u, _v| {
+                    let target_t = t0 + u as f64 * span;
+                    // Nearest sample to this point in the swept window —
+                    // the series is irregularly spaced (probe ticks), so a
+                    // simple nearest-neighbour lookup is enough for a strip
+                    // a few dozen cells wide.
+                    let nearest = series.iter().min_by(|a, b| {
+                        (a.0 - target_t).abs().partial_cmp(&(b.0 - target_t).abs()).unwrap()
+                    });
+                    nearest.map(|&(_, m)| (m / max_ms).clamp(0.0, 1.0)).unwrap_or(0.0)
+                },
+                |mean| Style::default().fg(Color::Rgb((60.0 + 195.0 * mean) as u8, 90, 70)),
+            );
+        }
+
+        let readout = match report.period_s {
+            Some(p) => format!("period {p:.1}s · magnitude {:.0}ms", report.magnitude_ms),
+            None => format!("irregular · magnitude {:.0}ms", report.magnitude_ms),
+        };
+        let gap = strip.y.saturating_sub(outer.y + 1);
+        if gap >= 1 && (readout.len() as u16) < strip.width {
+            buf.set_string(strip.x, strip.y.saturating_sub(1), &readout, Style::default().fg(Color::Gray));
+        }
+    }
+}
+
+/// Fix 3 (iteration 4d): `Some(mean)` only if every entry in `history` is
+/// `Some` and all are within `tol` fractional tolerance of their mean —
+/// i.e. the raw per-resample period reading has been stable across the
+/// whole window, not flickering (e.g. 9.0s / 12.0s / irregular on
+/// transient aliasing noise). `None` (including on any `None` entry, or an
+/// empty/non-positive mean) means "not yet stable" — the caller should
+/// keep showing the last stable value.
+fn stable_period(history: &std::collections::VecDeque<Option<f32>>, tol: f32) -> Option<f32> {
+    let mut vals = Vec::with_capacity(history.len());
+    for h in history {
+        vals.push((*h)?);
+    }
+    if vals.is_empty() {
+        return None;
+    }
+    let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+    if mean <= 0.0 {
+        return None;
+    }
+    let max_dev = vals.iter().map(|v| (v - mean).abs() / mean).fold(0.0f32, f32::max);
+    (max_dev <= tol).then_some(mean)
 }
 
 /// Blend a color toward dark gray by `amt` in `[0, 1]` — used to recede the
@@ -1015,15 +1351,96 @@ fn resource_activity(node_ids: &[TileId], frac: &HashMap<TileId, f32>) -> f32 {
     node_ids.iter().filter_map(|id| frac.get(id).copied()).filter(|&v| v > CONTENTION_THRESHOLD).sum()
 }
 
+/// Sum of `cpu_jiffies` per comm over EVERY sample this resample saw —
+/// deliberately uncapped (unlike `build_graph`'s MAX_NODES-limited nodes),
+/// so the real detector (iteration 4b) can be fed activity for comms that
+/// don't currently make the shown top-12, and still name one as the culprit.
+fn cpu_by_comm(samples: &[ProcSample]) -> HashMap<String, u64> {
+    let mut out: HashMap<String, u64> = HashMap::new();
+    for s in samples {
+        *out.entry(s.comm.clone()).or_insert(0) += s.cpu_jiffies;
+    }
+    out
+}
+
+/// Iteration 4b, item 2: if the real detector's culprit isn't among the
+/// shown (MAX_NODES-capped) nodes, force it on-screen so it's visible, can
+/// flare, and can be dived — same principle as the earlier "culprit must be
+/// on-screen" fix for the synthetic injector. Aggregates the culprit's own
+/// `GNode` straight from this resample's raw `samples` (same aggregation
+/// `build_graph` does internally), then either fills a free slot or swaps out
+/// the current lowest-significance node to keep the shown set at MAX_NODES.
+/// A no-op if the culprit is already shown, or if it vanished from this
+/// sample (its process(es) exited between the detector's analysis and now).
+fn force_include_culprit(cons: &mut Constellation, ids: &mut CommIds, samples: &[ProcSample], culprit_comm: &str) {
+    if cons.nodes.iter().any(|n| n.comm == culprit_comm) {
+        return; // already on-screen
+    }
+    let mut cpu_jiffies = 0u64;
+    let mut rss_pages = 0u64;
+    let mut blkio_ticks = 0u64;
+    let mut found = false;
+    for s in samples {
+        if s.comm == culprit_comm {
+            cpu_jiffies += s.cpu_jiffies;
+            rss_pages += s.rss_pages;
+            blkio_ticks += s.blkio_ticks;
+            found = true;
+        }
+    }
+    if !found {
+        return; // culprit's process(es) are gone this sample; nothing to force
+    }
+    let id = ids.id(culprit_comm);
+    let culprit_node = GNode { id, comm: culprit_comm.to_string(), cpu_jiffies, rss_pages, blkio_ticks };
+
+    if cons.nodes.len() < MAX_NODES {
+        cons.nodes.push(culprit_node);
+    } else {
+        // Swap out the current lowest-significance node (min cpu_jiffies,
+        // then min rss_pages as a tiebreak — the mirror of build_graph's own
+        // significance ordering) so the shown set stays at MAX_NODES.
+        let lo_idx = cons
+            .nodes
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.cpu_jiffies.cmp(&b.1.cpu_jiffies).then(a.1.rss_pages.cmp(&b.1.rss_pages)))
+            .map(|(i, _)| i)
+            .expect("cons.nodes is non-empty (len >= MAX_NODES > 0)");
+        cons.nodes[lo_idx] = culprit_node;
+    }
+    cons.nodes.sort_by_key(|n| n.id); // deterministic order for stable layout
+
+    // Drop any edges that no longer have both endpoints among the survivors
+    // (mirrors build_graph's own post-cap edge filter).
+    let survivors: HashSet<TileId> = cons.nodes.iter().map(|n| n.id).collect();
+    cons.edges.retain(|&(a, b)| survivors.contains(&a) && survivors.contains(&b));
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
         return Ok(());
     }
-    let stall = args.iter().any(|a| a == "--stall");
+    let demo = args.iter().any(|a| a == "--demo");
+    // Iteration 4d STEP-0: temporary, gated diagnostic dump (see
+    // `detect::Detector::debug_dump`) — eprintln's the raw overshoot
+    // samples, extracted event onsets, and resulting period once per
+    // resample so a real induced stall's numbers can be read directly
+    // instead of guessed at. No-op unless passed.
+    let probe_debug = args.iter().any(|a| a == "--probe-debug");
 
-    let mut state = State::new(stall);
+    // Iteration 4b: the real detector spawns its background latency-probe
+    // thread here, before entering the TUI, under a single shared `epoch` so
+    // its own sample timestamps and every `now_secs` we later pass it stay
+    // aligned. Skipped entirely under --demo, which drives its visuals from
+    // the synthetic injector instead.
+    let epoch = Instant::now();
+    let detector = if demo { None } else { Some(detect::Detector::spawn()) };
+
+    let mut state = State::new(demo, detector, epoch);
+    state.probe_debug = probe_debug;
     let mut backend = CrosstermBackend::new(io::stdout());
     backend.apply_capabilities(&Capabilities::detect());
     let mut terminal = Terminal::new(backend)?;
@@ -1343,6 +1760,966 @@ impl Injector {
         let phase = (t_s / self.period_s).fract();
         let d = phase.min(1.0 - phase); // 0 at a peak, 0.5 at the trough
         gaussian(d, self.sigma).clamp(0.0, 1.0)
+    }
+}
+
+// ── Detector: a real, self-contained stall detector (Iteration 4a/4b) ──────
+//
+// Ported (not imported — this example is standalone and cannot `use
+// crate::diag`) from aerie's `src/diag.rs`: `LatencyProbe` (a background
+// cyclictest measuring its own wakeup overshoot), the PSI reader, the
+// autocorrelation/DFT periodicity analyzer, and a simplified periodic-
+// offender attributor built on the same analyzer.
+//
+// Iteration 4a built and unit-tested the detection core (`Detector` /
+// `DetectionReport`); iteration 4b wires it into `main`'s loop and the
+// render path (see `State::detector`/`resample`/`render`), so the module is
+// no longer dead code and no longer carries a blanket allow. The one
+// remaining genuinely-unused pair of fields (`Periodicity::freq_lo`/`freq_hi`,
+// echoed from the analysis config for a spectrum display this example never
+// draws) keeps its own narrow `#[allow(dead_code)]` instead.
+mod detect {
+    use super::Resource;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    /// One wakeup-latency sample produced by [`LatencyProbe`]. Ported from
+    /// `diag::Sample`.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Sample {
+        /// Seconds since the probe thread started.
+        pub t: f64,
+        /// How much longer than the requested tick this wakeup actually
+        /// took, in milliseconds. ~0 is on time; spikes are the stalls.
+        pub overshoot_ms: f32,
+    }
+
+    /// Configuration for [`LatencyProbe`]. Ported from `diag::ProbeConfig`.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct ProbeConfig {
+        pub tick: Duration,
+        pub capacity: usize,
+    }
+
+    impl Default for ProbeConfig {
+        fn default() -> Self {
+            // 2 ms tick -> 500 Hz. 60_000 samples ~= 120 s of rolling
+            // history, enough for the analyzer to resolve periods up to
+            // tens of seconds while staying cheap. Same as diag.rs.
+            Self { tick: Duration::from_millis(2), capacity: 60_000 }
+        }
+    }
+
+    struct ProbeShared {
+        ring: VecDeque<Sample>,
+        capacity: usize,
+    }
+
+    /// A built-in `cyclictest`: a thread that measures its own wakeup
+    /// latency. Ported from `diag::LatencyProbe`. Measuring the *probe
+    /// thread's* own scheduling delay is the right signal: it is subject to
+    /// the same system-wide preemption that stalls every other realtime
+    /// thread, independent of any one application.
+    pub(super) struct LatencyProbe {
+        shared: Arc<Mutex<ProbeShared>>,
+        stop: Arc<AtomicBool>,
+        _handle: JoinHandle<()>,
+    }
+
+    impl LatencyProbe {
+        pub fn spawn(cfg: ProbeConfig) -> Self {
+            let shared = Arc::new(Mutex::new(ProbeShared {
+                ring: VecDeque::with_capacity(cfg.capacity.min(4096)),
+                capacity: cfg.capacity.max(1),
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let tick = cfg.tick;
+            let shared_t = Arc::clone(&shared);
+            let stop_t = Arc::clone(&stop);
+            let handle = std::thread::Builder::new()
+                .name("constellation-latency-probe".into())
+                .spawn(move || probe_loop(shared_t, stop_t, tick))
+                .expect("spawn latency probe thread");
+            Self { shared, stop, _handle: handle }
+        }
+
+        /// Copy the current ring contents (oldest -> newest) for analysis.
+        pub fn snapshot(&self) -> Vec<Sample> {
+            let g = self.shared.lock().unwrap();
+            g.ring.iter().copied().collect()
+        }
+    }
+
+    impl Drop for LatencyProbe {
+        fn drop(&mut self) {
+            // Signal the thread to exit; we don't join (it may be mid-sleep
+            // for up to `tick`), letting the process tear it down.
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The probe thread body: sleep `tick`, measure overshoot, record, repeat.
+    fn probe_loop(shared: Arc<Mutex<ProbeShared>>, stop: Arc<AtomicBool>, tick: Duration) {
+        let start = Instant::now();
+        while !stop.load(Ordering::Relaxed) {
+            let t0 = Instant::now();
+            std::thread::sleep(tick);
+            let elapsed = t0.elapsed();
+            let overshoot = elapsed.saturating_sub(tick);
+            let sample = Sample {
+                t: t0.duration_since(start).as_secs_f64(),
+                overshoot_ms: overshoot.as_secs_f32() * 1000.0,
+            };
+            let mut g = shared.lock().unwrap();
+            if g.ring.len() >= g.capacity {
+                g.ring.pop_front();
+            }
+            g.ring.push_back(sample);
+        }
+    }
+
+    // ── PSI reader ─────────────────────────────────────────────────────
+
+    /// Parse the `some ... total=NNN` microsecond counter from a PSI
+    /// pressure file. Ported from `diag::read_psi_some_total`. Returns
+    /// `None` on any missing file/field (older kernels, no PSI mounted) —
+    /// callers must treat that as "unavailable", not "zero".
+    fn read_psi_some_total(path: &str) -> Option<u64> {
+        let data = std::fs::read_to_string(path).ok()?;
+        let line = data.lines().find(|l| l.starts_with("some"))?;
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix("total=").and_then(|v| v.parse::<u64>().ok()))
+    }
+
+    /// Which PSI channel is contended. Ported from `diag::PressureChannel`,
+    /// trimmed to the three PSI resources and mapped onto the example's own
+    /// [`Resource`] (`Io` -> `Disk`) rather than duplicating names.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PressureChannel {
+        Cpu,
+        Mem,
+        Io,
+    }
+
+    impl PressureChannel {
+        fn resource(self) -> Resource {
+            match self {
+                PressureChannel::Cpu => Resource::Cpu,
+                PressureChannel::Mem => Resource::Mem,
+                PressureChannel::Io => Resource::Disk,
+            }
+        }
+    }
+
+    // ── Periodicity analyzer ───────────────────────────────────────────
+
+    /// Configuration for [`analyze_periodicity`]. Ported from
+    /// `diag::AnalysisConfig`.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct AnalysisConfig {
+        pub freq_lo: f64,
+        pub freq_hi: f64,
+        pub freq_bins: usize,
+    }
+
+    impl Default for AnalysisConfig {
+        fn default() -> Self {
+            // 0.05 Hz (20 s period) up to 25 Hz covers the band where a
+            // periodic system stall plausibly lives. Same as diag.rs.
+            Self { freq_lo: 0.05, freq_hi: 25.0, freq_bins: 240 }
+        }
+    }
+
+    /// Result of periodicity analysis over a latency series. Ported from
+    /// `diag::Periodicity`.
+    #[derive(Clone, Debug, Default)]
+    pub(super) struct Periodicity {
+        pub period_s: Option<f64>,
+        pub freq_hz: Option<f64>,
+        pub confidence: f32,
+        pub spectrum: Vec<f32>,
+        // Echoed from the analysis config for a would-be spectrum display
+        // (axis labeling); this example never renders `spectrum`, so these
+        // two are legitimately write-only here — narrow allow rather than
+        // the whole module losing dead-code visibility for it.
+        #[allow(dead_code)]
+        pub freq_lo: f64,
+        #[allow(dead_code)]
+        pub freq_hi: f64,
+        pub bin_dt: f64,
+    }
+
+    /// Resample an (approximately uniform but jittered) sample series onto a
+    /// strictly uniform time grid of step `bin_dt`, taking the **max**
+    /// overshoot in each bin so a single-tick spike is never averaged away.
+    /// Ported from `diag::resample_uniform`.
+    fn resample_uniform(samples: &[Sample], bin_dt: f64) -> Vec<f32> {
+        if samples.len() < 2 || bin_dt <= 0.0 {
+            return Vec::new();
+        }
+        let t0 = samples[0].t;
+        let span = samples[samples.len() - 1].t - t0;
+        let n = ((span / bin_dt).floor() as usize) + 1;
+        if n < 4 {
+            return Vec::new();
+        }
+        let mut grid = vec![0.0f32; n];
+        for s in samples {
+            let b = (((s.t - t0) / bin_dt).floor() as usize).min(n - 1);
+            if s.overshoot_ms > grid[b] {
+                grid[b] = s.overshoot_ms;
+            }
+        }
+        grid
+    }
+
+    /// Find the period of a latency series via autocorrelation, plus a
+    /// narrow-band DFT spectrum for display. Ported ~verbatim from
+    /// `diag::analyze_periodicity` — this is the key correctness gate (see
+    /// the `recovers_known_period` test below), so the algorithm is
+    /// unchanged from the proven original.
+    pub(super) fn analyze_periodicity(samples: &[Sample], cfg: AnalysisConfig) -> Periodicity {
+        let mut out = Periodicity {
+            freq_lo: cfg.freq_lo,
+            freq_hi: cfg.freq_hi,
+            spectrum: vec![0.0; cfg.freq_bins.max(1)],
+            ..Default::default()
+        };
+        if samples.len() < 8 {
+            return out;
+        }
+
+        let span = samples[samples.len() - 1].t - samples[0].t;
+        let mean_spacing = span / (samples.len() - 1) as f64;
+        let bin_dt = (1.0 / (cfg.freq_hi * 4.0)).max(span / 6000.0).max(mean_spacing * 1.5);
+        out.bin_dt = bin_dt;
+
+        let mut grid = resample_uniform(samples, bin_dt);
+        let n = grid.len();
+        if n < 16 {
+            return out;
+        }
+        let mean = grid.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        for v in &mut grid {
+            *v -= mean as f32;
+        }
+        let energy: f64 = grid.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        if energy < 1e-12 {
+            return out; // flat series, nothing periodic
+        }
+
+        // ── Autocorrelation over the feasible lag band ──────────────
+        let lag_min = ((1.0 / cfg.freq_hi) / bin_dt).floor().max(1.0) as usize;
+        let lag_max = (((1.0 / cfg.freq_lo) / bin_dt).floor() as usize).min(n / 3).max(lag_min + 1);
+        let mut corr = vec![0.0f64; lag_max + 1];
+        for (lag, slot) in corr.iter_mut().enumerate().take(lag_max + 1).skip(lag_min) {
+            let mut acc = 0.0f64;
+            for i in 0..(n - lag) {
+                acc += grid[i] as f64 * grid[i + lag] as f64;
+            }
+            *slot = acc / energy;
+        }
+        let search_from = corr
+            .iter()
+            .enumerate()
+            .take(lag_max)
+            .skip(lag_min)
+            .find(|(_, &r)| r <= 0.0)
+            .map(|(lag, _)| lag)
+            .unwrap_or(lag_min);
+        let best_corr = (search_from..=lag_max).map(|l| corr[l]).fold(0.0f64, f64::max);
+        const PERIOD_MIN_CORR: f64 = 0.20;
+        if best_corr > PERIOD_MIN_CORR {
+            let thresh = best_corr * 0.9;
+            let mut fundamental = (search_from..=lag_max).find(|&lag| corr[lag] >= thresh).unwrap_or(0);
+            if fundamental > 0 {
+                // Fix 2 (safety net): reject supra-harmonics. If the
+                // candidate lag has a sub-multiple (/2, /3) that ALSO
+                // lands within the feasible lag band and correlates
+                // comparably strongly, prefer the smaller (truer
+                // fundamental) — a real Nx period must not display as a
+                // multiple of itself just because the subsampled/aliased
+                // event series happens to correlate best at the larger
+                // lag. Checked /3 before /2 so the most-reduced valid
+                // candidate wins. This is a backstop: the primary cure for
+                // the observed 3x supra-harmonic is catching every real
+                // burst as an event upstream (see EVENT_THRESHOLD_MS).
+                const SUPRA_HARMONIC_REJECT_FRACTION: f64 = 0.8;
+                for divisor in [3usize, 2usize] {
+                    let candidate = fundamental / divisor;
+                    if candidate >= lag_min
+                        && candidate <= lag_max
+                        && corr[candidate] >= best_corr * SUPRA_HARMONIC_REJECT_FRACTION
+                    {
+                        fundamental = candidate;
+                        break;
+                    }
+                }
+                let period = fundamental as f64 * bin_dt;
+                out.period_s = Some(period);
+                out.freq_hz = Some(1.0 / period);
+                out.confidence = best_corr.clamp(0.0, 1.0) as f32;
+            }
+        }
+
+        // ── Log-spaced DFT for the displayed spectrum ───────────────
+        let bins = cfg.freq_bins.max(1);
+        let ln_lo = cfg.freq_lo.ln();
+        let ln_hi = cfg.freq_hi.ln();
+        let mut max_power = 0.0f64;
+        for k in 0..bins {
+            let frac = if bins > 1 { k as f64 / (bins - 1) as f64 } else { 0.0 };
+            let f = (ln_lo + (ln_hi - ln_lo) * frac).exp();
+            let w = 2.0 * std::f64::consts::PI * f * bin_dt;
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &v) in grid.iter().enumerate() {
+                let ang = w * i as f64;
+                re += v as f64 * ang.cos();
+                im -= v as f64 * ang.sin();
+            }
+            let power = re * re + im * im;
+            out.spectrum[k] = power as f32;
+            if power > max_power {
+                max_power = power;
+            }
+        }
+        if max_power > 0.0 {
+            for p in &mut out.spectrum {
+                *p = (*p as f64 / max_power) as f32;
+            }
+        }
+
+        out
+    }
+
+    // ── Stall-event clock (fix: lock the inter-burst period) ────────────
+    //
+    // `analyze_periodicity` is proven correct on a clean spike series (see
+    // `recovers_known_period`), but a REAL stall burst isn't a single clean
+    // spike: the probe is ~500 Hz, so one ~250ms scheduler stall shows up as
+    // dozens of densely-elevated samples with their own jittery intra-burst
+    // texture. Autocorrelation over the raw series locks onto that
+    // intra-burst harmonic (recurring ~50x within the recording) rather than
+    // the true inter-burst clock (recurring only a handful of times), so it
+    // reported ~0.1s instead of ~3s. Fix: collapse each burst into a single
+    // EVENT onset first, grid the onsets onto a coarse uniform impulse
+    // series, and run the same proven `analyze_periodicity` on THAT.
+
+    /// Overshoot magnitude that counts as "stalled" for event-extraction.
+    ///
+    /// STEP-0 diagnosis (iteration 4d), read via `--probe-debug` under a
+    /// real induced ~3.0s/250ms 16-core stall (41 phase-aligned burners):
+    /// the probe DOES overshoot on every single burst (onsets landed at
+    /// 0.85/3.85/6.85/9.87/12.87/15.88/18.86s — a clean 3.0s train, exactly
+    /// as expected), but the per-burst PEAK overshoot on this box was only
+    /// ~1.0-5.7ms (typically 1.3-2.9ms; only occasionally topping 4ms) —
+    /// nowhere near the "dozens of ms" a synthetic 20ms-amplitude test
+    /// burst assumes. The old 4.0ms threshold cleared just 1 of 7 real
+    /// bursts in a 20s window, leaving a sparse subsampled onset train that
+    /// `analyze_periodicity` correctly, but uselessly, read as a ~9s clock.
+    /// Lowered to comfortably UNDER the smallest observed real-burst peak
+    /// (1.6ms) while staying well above ordinary idle jitter (a small
+    /// fraction of the 2ms probe tick), so every real burst clears it.
+    const EVENT_THRESHOLD_MS: f32 = 1.0;
+    /// A rising edge only starts a NEW event if the series has been below
+    /// `EVENT_THRESHOLD_MS` for at least this long; briefer dips are still
+    /// "inside" the same burst (avoids splitting one burst into several
+    /// onsets on intra-burst jitter).
+    const EVENT_DEBOUNCE_S: f64 = 0.4;
+    /// Bin width for the coarse onset-impulse grid. Coarse enough that
+    /// dense intra-burst texture collapses away, fine enough to still
+    /// resolve periods down to a few hundred ms.
+    const EVENT_BIN_S: f64 = 0.05;
+
+    /// Collapse a raw overshoot series into stall-EVENT onset timestamps:
+    /// one rising-edge-after-a-debounce-gap per burst, however many
+    /// densely-elevated samples that burst actually contains.
+    pub(super) fn extract_event_onsets(
+        samples: &[Sample],
+        threshold_ms: f32,
+        debounce_s: f64,
+    ) -> Vec<f64> {
+        let mut onsets = Vec::new();
+        if samples.is_empty() {
+            return onsets;
+        }
+        let mut above = false;
+        // Pretend we've been quiet since before the series started, so a
+        // burst right at the first sample still counts as a genuine onset.
+        let mut below_since = samples[0].t - debounce_s;
+        for s in samples {
+            let is_above = s.overshoot_ms >= threshold_ms;
+            if is_above {
+                if !above && (s.t - below_since) >= debounce_s {
+                    onsets.push(s.t);
+                }
+                above = true;
+            } else {
+                if above {
+                    below_since = s.t;
+                }
+                above = false;
+            }
+        }
+        onsets
+    }
+
+    /// Grid stall-event onsets onto a coarse uniform impulse series (1.0 in
+    /// any bin containing an onset, 0.0 elsewhere) spanning
+    /// `[span_start, span_end]`, shaped as a `Sample` series so the proven
+    /// `analyze_periodicity` can run on it directly.
+    pub(super) fn build_event_impulse_series(
+        onsets: &[f64],
+        span_start: f64,
+        span_end: f64,
+        bin_s: f64,
+    ) -> Vec<Sample> {
+        if bin_s <= 0.0 || span_end <= span_start {
+            return Vec::new();
+        }
+        let n = ((span_end - span_start) / bin_s).floor() as usize + 1;
+        let mut grid = vec![0.0f32; n.max(1)];
+        for &t in onsets {
+            if t < span_start {
+                continue;
+            }
+            let b = (((t - span_start) / bin_s).floor() as usize).min(grid.len() - 1);
+            grid[b] = 1.0;
+        }
+        grid.iter()
+            .enumerate()
+            .map(|(i, &v)| Sample { t: span_start + i as f64 * bin_s, overshoot_ms: v })
+            .collect()
+    }
+
+    /// The stall's own clock, at the event scale: collapse bursts to onsets,
+    /// grid them, and find the period of THAT — see the module comment
+    /// above for why running `analyze_periodicity` on the raw per-tick
+    /// series gets the wrong (intra-burst) answer.
+    pub(super) fn event_clock(samples: &[Sample]) -> Periodicity {
+        if samples.len() < 2 {
+            return Periodicity::default();
+        }
+        let onsets = extract_event_onsets(samples, EVENT_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+        let impulse =
+            build_event_impulse_series(&onsets, samples[0].t, samples[samples.len() - 1].t, EVENT_BIN_S);
+        analyze_periodicity(&impulse, AnalysisConfig::default())
+    }
+
+    // ── Offender attribution (simplified) ───────────────────────────────
+    //
+    // Simplified from `diag::OffenderProbe` + `diag::analyze_offenders`:
+    // CPU-jiffy-delta periodicity is the core signal we port; child-spawn
+    // tracking is dropped per the brief ("skip if it bloats") since the
+    // example already computes per-comm CPU deltas each resample and feeding
+    // those in is exactly the cheap, no-second-/proc-scanner path the brief
+    // asks for.
+
+    const MIN_GROUP_SAMPLES: usize = 24; // matches diag.rs's analyze_offenders floor
+    const OFFENDER_MIN_CONFIDENCE: f32 = 0.25; // matches diag.rs's MIN_CONF
+    const PERIOD_MATCH_TOLERANCE: f64 = 0.25; // fractional tolerance vs the stall clock
+
+    /// Find the process group whose CPU-delta activity is both convincingly
+    /// periodic (via [`analyze_periodicity`]) and lands on `clock_period_s`
+    /// — the stall's own clock. `None` when no group is a convincing match
+    /// (honest "unattributed"), matching `diag::analyze_offenders`'s
+    /// `MIN_CONF` gate.
+    fn find_periodic_offender(
+        group_history: &HashMap<String, VecDeque<(f64, u64)>>,
+        clock_period_s: f64,
+    ) -> Option<String> {
+        if clock_period_s <= 0.0 {
+            return None;
+        }
+        group_history
+            .iter()
+            .filter(|(_, hist)| hist.len() >= MIN_GROUP_SAMPLES)
+            .filter_map(|(name, hist)| {
+                let series: Vec<Sample> =
+                    hist.iter().map(|&(t, d)| Sample { t, overshoot_ms: d as f32 }).collect();
+                let p = analyze_periodicity(&series, AnalysisConfig::default());
+                let period = p.period_s?;
+                if p.confidence < OFFENDER_MIN_CONFIDENCE {
+                    return None;
+                }
+                if ((period - clock_period_s).abs() / clock_period_s) > PERIOD_MATCH_TOLERANCE {
+                    return None;
+                }
+                Some((name.clone(), p.confidence))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(name, _)| name)
+    }
+
+    // ── Detector: the interface 4b will consume ─────────────────────────
+
+    /// One frame's worth of stall diagnosis, assembled from the latency
+    /// probe, PSI, and offender attribution above.
+    #[derive(Clone, Debug)]
+    pub(super) struct DetectionReport {
+        /// 0..1 weather intensity from recent max overshoot (decays); 0 when calm.
+        pub pulse: f32,
+        /// True when a stall is currently felt (pulse above a threshold).
+        pub active: bool,
+        /// Detected clock; `None` = irregular / no clear period.
+        pub period_s: Option<f32>,
+        /// Recent max overshoot, in ms.
+        pub magnitude_ms: f32,
+        /// Contended resource from PSI during the stall; `None` if PSI is
+        /// unavailable or nothing is currently elevated.
+        pub resource: Option<Resource>,
+        /// Periodic-offender group name; `None` = unattributed.
+        pub culprit_comm: Option<String>,
+        /// Recent (t_secs, overshoot_ms) pairs for the bedrock timeline.
+        pub overshoot_series: Vec<(f64, f32)>,
+    }
+
+    const PULSE_DECAY_S: f32 = 1.5; // time constant for the weather-intensity decay
+    const PULSE_LOOKBACK_S: f32 = PULSE_DECAY_S * 6.0; // ~7 half-lives; negligible beyond this
+    /// Overshoot that saturates the weather pulse to ~1.0.
+    ///
+    /// Additional STEP-0 finding (iteration 4d), beyond the event-onset
+    /// threshold: the old 20.0ms norm assumed a real stall shows up as
+    /// tens-of-ms overshoot. On the box used for the real induced-stall
+    /// re-proof, idle/ambient overshoot (890 background tasks, no induced
+    /// stall) sat at a steady ~0.2-0.4ms, while every real 3.0s/250ms burst
+    /// peaked at ~1.0-5.7ms — a clean >4x separation, but one the old
+    /// 20.0ms norm mostly couldn't SEE: `active`'s pulse gate
+    /// (`overshoot_ms / PULSE_NORM_MS > PULSE_ACTIVE_THRESHOLD`) rarely
+    /// crossed 0.15 (needs ≥3.0ms at the old norm), leaving fix 3/4 (period
+    /// debounce + hold extension) almost nothing to work with — `active`
+    /// has to fire at least occasionally for a hold to have something to
+    /// extend. Lowered to sit inside the observed real gap (idle ~0.4ms ->
+    /// ratio 0.07, comfortably below threshold; burst floor ~1.6ms -> ratio
+    /// 0.27, comfortably above it) so `active` fires on real bursts of this
+    /// magnitude without false-triggering on ordinary background jitter.
+    const PULSE_NORM_MS: f32 = 6.0;
+    const PULSE_ACTIVE_THRESHOLD: f32 = 0.15;
+    const MAGNITUDE_WINDOW_S: f64 = 1.0; // window for "recent max overshoot"
+    const SERIES_WINDOW_S: f64 = 30.0; // bedrock timeline span
+
+    /// Owns the probe thread(s) and the rolling per-group activity history.
+    /// Spawn once; feed it observations each frame; read a report whenever
+    /// the render path wants one (not wired up until 4b).
+    pub(super) struct Detector {
+        probe: LatencyProbe,
+        /// Per-group CPU-jiffy-delta history, fed by [`Detector::observe`]
+        /// from the example's own per-comm deltas — no second /proc scanner.
+        group_history: HashMap<String, VecDeque<(f64, u64)>>,
+        group_cap: usize,
+        /// Previous (cpu, mem, io) cumulative PSI "some" totals + when, to
+        /// derive per-second stall rates on each `observe`.
+        psi_prev: Option<(u64, u64, u64, f64)>,
+        /// Most recently identified contended resource. Sticky across PSI
+        /// reads that come back "nothing elevated" so a brief dip doesn't
+        /// erase the reading mid-stall; only a hard PSI-unavailable clears it.
+        resource: Option<Resource>,
+    }
+
+    impl Detector {
+        /// Start the real latency-probe thread (+ read PSI on demand).
+        pub fn spawn() -> Self {
+            Detector {
+                probe: LatencyProbe::spawn(ProbeConfig::default()),
+                group_history: HashMap::new(),
+                group_cap: 300, // ~5 min at the example's ~1 Hz resample cadence
+                psi_prev: None,
+                resource: None,
+            }
+        }
+
+        /// Feed the latest per-group CPU-jiffy deltas (as the example
+        /// already computes each `resample`) and refresh the PSI reading.
+        pub fn observe(&mut self, now_secs: f64, group_cpu_deltas: &[(String, u64)]) {
+            for (name, delta) in group_cpu_deltas {
+                let ring = self.group_history.entry(name.clone()).or_default();
+                if ring.len() >= self.group_cap {
+                    ring.pop_front();
+                }
+                ring.push_back((now_secs, *delta));
+            }
+
+            // PSI: rate the three channels since the previous observe() and
+            // remember whichever is currently most elevated. A read failure
+            // (any file missing — no PSI on this kernel) clears `resource`
+            // outright rather than reporting a stale one.
+            match (
+                read_psi_some_total("/proc/pressure/cpu"),
+                read_psi_some_total("/proc/pressure/memory"),
+                read_psi_some_total("/proc/pressure/io"),
+            ) {
+                (Some(cpu), Some(mem), Some(io)) => {
+                    if let Some((pc, pm, pi, pt)) = self.psi_prev {
+                        let dt = (now_secs - pt).max(1e-3);
+                        let rate = |c: u64, p: u64| (c.saturating_sub(p) as f64 / dt) as f32;
+                        let candidates = [
+                            (PressureChannel::Cpu, rate(cpu, pc)),
+                            (PressureChannel::Mem, rate(mem, pm)),
+                            (PressureChannel::Io, rate(io, pi)),
+                        ];
+                        let best = candidates
+                            .into_iter()
+                            .fold((PressureChannel::Cpu, 0.0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
+                        self.resource = if best.1 > 0.0 { Some(best.0.resource()) } else { None };
+                    }
+                    self.psi_prev = Some((cpu, mem, io, now_secs));
+                }
+                _ => {
+                    self.psi_prev = None;
+                    self.resource = None;
+                }
+            }
+        }
+
+        /// STEP-0 diagnostic scaffolding (iteration 4d), gated behind
+        /// `--probe-debug`: dumps the raw elevated-tick overshoot
+        /// magnitudes, the extracted event-onset timestamps (and their
+        /// spacing), and the resulting event-clock period to stderr for a
+        /// window of recent history. Exists to let a real induced stall's
+        /// numbers be READ (not guessed at) to explain why the displayed
+        /// period was drifting to a 3x supra-harmonic. Temporary; kept
+        /// cleanly gated rather than ripped out so the next regression can
+        /// be diagnosed the same way.
+        pub fn debug_dump(&self, now_secs: f64, window_s: f64) {
+            let samples = self.probe.snapshot();
+            let recent: Vec<Sample> =
+                samples.iter().copied().filter(|s| now_secs - s.t <= window_s).collect();
+            if recent.len() < 2 {
+                eprintln!("[probe-debug] t={now_secs:.2} not enough samples yet ({})", recent.len());
+                return;
+            }
+            let elevated: Vec<(f64, f32)> = recent
+                .iter()
+                .filter(|s| s.overshoot_ms > 1.0)
+                .map(|s| (s.t, s.overshoot_ms))
+                .collect();
+            eprintln!(
+                "[probe-debug] t={now_secs:.2} window={window_s}s samples={} elevated_ticks={}",
+                recent.len(),
+                elevated.len()
+            );
+            for (t, ms) in &elevated {
+                eprintln!("[probe-debug]   tick t={t:.3} overshoot={ms:.1}ms");
+            }
+            let onsets = extract_event_onsets(&recent, EVENT_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+            let onset_strs: Vec<String> = onsets.iter().map(|t| format!("{t:.2}")).collect();
+            eprintln!("[probe-debug] onsets ({}): {:?}", onsets.len(), onset_strs);
+            if onsets.len() >= 2 {
+                let gaps: Vec<String> =
+                    onsets.windows(2).map(|w| format!("{:.2}", w[1] - w[0])).collect();
+                eprintln!("[probe-debug] onset gaps (s): {:?}", gaps);
+            }
+            let clock = event_clock(&recent);
+            eprintln!(
+                "[probe-debug] event_clock period_s={:?} confidence={:.2}",
+                clock.period_s, clock.confidence
+            );
+        }
+
+        /// Assemble the current diagnosis. Pure w.r.t. `self` — recomputes
+        /// pulse/period/culprit from the probe snapshot and group history
+        /// each call rather than caching, since 4a doesn't yet call this
+        /// every render frame.
+        pub fn report(&self, now_secs: f64) -> DetectionReport {
+            let samples = self.probe.snapshot();
+
+            let magnitude_ms = samples
+                .iter()
+                .rev()
+                .take_while(|s| now_secs - s.t <= MAGNITUDE_WINDOW_S)
+                .map(|s| s.overshoot_ms)
+                .fold(0.0f32, f32::max);
+
+            // Pulse: an exponentially-decayed "weather intensity" driven by
+            // every recent overshoot (not just the latest tick), so a spike
+            // is still felt for a moment after it passes.
+            let pulse = samples
+                .iter()
+                .rev()
+                .take_while(|s| now_secs - s.t <= PULSE_LOOKBACK_S as f64)
+                .map(|s| {
+                    let age = (now_secs - s.t).max(0.0) as f32;
+                    (s.overshoot_ms / PULSE_NORM_MS).clamp(0.0, 1.0) * (-age / PULSE_DECAY_S).exp()
+                })
+                .fold(0.0f32, f32::max);
+
+            // The stall's own clock: periodicity of stall-EVENT onsets, not
+            // the raw per-tick series (see `event_clock`'s doc comment —
+            // the raw series' intra-burst texture drowns the true clock).
+            let clock = event_clock(&samples);
+            let culprit_comm =
+                clock.period_s.and_then(|cp| find_periodic_offender(&self.group_history, cp));
+
+            let mut overshoot_series: Vec<(f64, f32)> = samples
+                .iter()
+                .rev()
+                .take_while(|s| now_secs - s.t <= SERIES_WINDOW_S)
+                .map(|s| (s.t, s.overshoot_ms))
+                .collect();
+            overshoot_series.reverse(); // oldest -> newest, for the timeline
+
+            DetectionReport {
+                pulse,
+                active: pulse > PULSE_ACTIVE_THRESHOLD,
+                period_s: clock.period_s.map(|p| p as f32),
+                magnitude_ms,
+                resource: self.resource,
+                culprit_comm,
+                overshoot_series,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn mk(series: &[(f64, f32)]) -> Vec<Sample> {
+            series.iter().map(|&(t, o)| Sample { t, overshoot_ms: o }).collect()
+        }
+
+        /// Build a synthetic spike train: a baseline tick with a tall spike
+        /// every `period_s`, sampled at `tick_s`. Ported from diag.rs's test helper.
+        fn spike_train(tick_s: f64, period_s: f64, dur_s: f64) -> Vec<Sample> {
+            let n = (dur_s / tick_s) as usize;
+            let spike_every = (period_s / tick_s).round() as usize;
+            (0..n)
+                .map(|i| {
+                    let o = if spike_every > 0 && i % spike_every == 0 { 40.0 } else { 0.2 };
+                    Sample { t: i as f64 * tick_s, overshoot_ms: o }
+                })
+                .collect()
+        }
+
+        /// THE key correctness gate: `analyze_periodicity` must recover a
+        /// known period from a synthetic periodic overshoot series. Ported
+        /// verbatim from `diag.rs`'s `recovers_known_period`.
+        #[test]
+        fn recovers_known_period() {
+            // Spike every 2.0 s, 2 ms ticks, 60 s long.
+            let s = spike_train(0.002, 2.0, 60.0);
+            let p = analyze_periodicity(&s, AnalysisConfig::default());
+            let period = p.period_s.expect("should find a period");
+            assert!((period - 2.0).abs() < 0.1, "recovered period {period}");
+            assert!(p.confidence > 0.4, "confidence {} too low", p.confidence);
+        }
+
+        /// Ported verbatim from `diag.rs`'s `recovers_fast_period`.
+        #[test]
+        fn recovers_fast_period() {
+            // Spike every 0.25 s (4 Hz).
+            let s = spike_train(0.002, 0.25, 30.0);
+            let p = analyze_periodicity(&s, AnalysisConfig::default());
+            let f = p.freq_hz.expect("should find a frequency");
+            assert!((f - 4.0).abs() < 0.3, "recovered freq {f} Hz");
+        }
+
+        /// Build a synthetic *bursty* stall series that models a REAL
+        /// scheduler stall, not a clean spike: every `period_s`, overshoot
+        /// is elevated in a `burst_s`-long window made of many discrete
+        /// narrow sub-spikes (repeated "wakeup was late" events) spaced
+        /// `intra_spacing_s` apart — the intra-burst texture a raw
+        /// autocorrelation locks onto — separated by long calm stretches at
+        /// the true `period_s` clock.
+        fn bursty_stall_train(
+            tick_s: f64,
+            period_s: f64,
+            burst_s: f64,
+            intra_spacing_s: f64,
+            dur_s: f64,
+        ) -> Vec<Sample> {
+            let n = (dur_s / tick_s) as usize;
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 * tick_s;
+                    let phase = t % period_s;
+                    let in_burst = phase < burst_s && (phase % intra_spacing_s) < tick_s * 1.5;
+                    let o = if in_burst { 20.0 } else { 0.2 };
+                    Sample { t, overshoot_ms: o }
+                })
+                .collect()
+        }
+
+        /// THE key correctness gate for fix 1. With only 5 repeats of the
+        /// true 3.0s clock in a 15s window but 50 repeats/cycle of a 20ms
+        /// intra-burst spike spacing, the raw (unfixed) autocorrelation's
+        /// correlation estimate for the sparse 3s clock is weak enough that
+        /// it locks onto the intra-burst spacing instead — reproducing the
+        /// real reported bug (period ~0.06s, i.e. "~0.1s") verbatim. The
+        /// event-collapsed clock (`event_clock`) must recover the true
+        /// ~3.0s inter-burst period from the exact same series.
+        #[test]
+        fn event_clock_locks_onto_inter_burst_period_not_intra_burst_texture() {
+            // 250ms dense burst (20ms-spaced sub-spikes, ~13 per burst) every
+            // 3.0s, 2ms probe tick, 15s long -> 5 bursts.
+            let s = bursty_stall_train(0.002, 3.0, 0.25, 0.02, 15.0);
+
+            // Reproduce the bug: raw analyze_periodicity over the per-tick
+            // series locks onto the intra-burst ~20ms-scale harmonic, not
+            // the true 3.0s clock.
+            let raw = analyze_periodicity(&s, AnalysisConfig::default());
+            let raw_period = raw.period_s.expect("raw series should still find *a* period");
+            assert!(
+                raw_period < 0.5,
+                "test setup check: raw period {raw_period} should reproduce the intra-burst-lock bug (~0.1s), \
+                 not the true 3.0s clock — otherwise this input no longer demonstrates the bug"
+            );
+
+            // The fix: event-collapse first, then find the period of THAT.
+            let clock = event_clock(&s);
+            let period = clock.period_s.expect("event clock should find a period");
+            assert!((period - 3.0).abs() < 0.5, "event-clock period {period}, expected ~3.0s");
+        }
+
+        /// THE key correctness gate for iteration 4d, fix 1. STEP-0
+        /// diagnosis on a real 16-core box under a real induced 3.0s/250ms
+        /// stall (41 phase-aligned burners) read via `--probe-debug`: the
+        /// probe overshot on EVERY single burst (a clean 3.0s onset train:
+        /// 0.85, 3.85, 6.85, 9.87, 12.87, 15.88, 18.86), but the per-burst
+        /// PEAK was only ~1.0-5.7ms (typically 1.3-2.9ms) — nowhere near
+        /// the tens-of-ms the old fixed 4.0ms `EVENT_THRESHOLD_MS` assumed.
+        /// That threshold cleared just 1 of those 7 real bursts, leaving a
+        /// sparse onset train that (correctly, but uselessly) resolved to
+        /// a ~9s supra-harmonic. This test reproduces the diagnosed shape
+        /// with the exact observed peak magnitudes and demonstrates both
+        /// the bug (at the old threshold) and the fix (at the new one).
+        #[test]
+        fn event_clock_catches_modest_real_burst_peaks_not_just_the_rare_tall_one() {
+            // Peaks (ms) observed per-burst in the real STEP-0 diagnosis,
+            // one per 3.0s-spaced burst, over a 21s window (7 bursts).
+            const OLD_THRESHOLD_MS: f32 = 4.0;
+            let peaks = [2.3f32, 4.0, 2.5, 1.6, 5.7, 4.0, 2.3];
+            let tick_s = 0.002;
+            let period_s = 3.0;
+            let dur_s = period_s * peaks.len() as f64;
+            let n = (dur_s / tick_s) as usize;
+            let samples: Vec<Sample> = (0..n)
+                .map(|i| {
+                    let t = i as f64 * tick_s;
+                    let burst_idx = (t / period_s).floor() as usize;
+                    let phase = t % period_s;
+                    // A brief (~30ms) elevated window per burst, peaking at
+                    // that burst's diagnosed magnitude — modeling how few
+                    // real ticks within a 250ms burst actually cleared even
+                    // a low ms-scale gate on this box.
+                    let o = if phase < 0.03 && burst_idx < peaks.len() { peaks[burst_idx] } else { 0.2 };
+                    Sample { t, overshoot_ms: o }
+                })
+                .collect();
+
+            // Reproduce the bug: the OLD threshold drops most of these
+            // modest, real-shaped bursts.
+            let old_onsets = extract_event_onsets(&samples, OLD_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+            assert!(
+                old_onsets.len() <= 3,
+                "test setup check: the old {OLD_THRESHOLD_MS}ms threshold should drop most of \
+                 these modest real-shaped bursts (got {} of {} onsets) — otherwise this no \
+                 longer demonstrates the diagnosed bug",
+                old_onsets.len(),
+                peaks.len()
+            );
+
+            // The fix: the new (lower) EVENT_THRESHOLD_MS catches every
+            // single burst -> a clean 3.0s onset train, not a subsampled one.
+            let onsets = extract_event_onsets(&samples, EVENT_THRESHOLD_MS, EVENT_DEBOUNCE_S);
+            assert_eq!(
+                onsets.len(),
+                peaks.len(),
+                "should catch every one of the {} real bursts, not just the rare tall one",
+                peaks.len()
+            );
+            for w in onsets.windows(2) {
+                let gap = w[1] - w[0];
+                assert!(
+                    (gap - period_s).abs() < 0.2,
+                    "onset gap {gap} should be ~3.0s, not a supra-harmonic multiple of it"
+                );
+            }
+
+            let clock = event_clock(&samples);
+            let period = clock.period_s.expect("event clock should find a period");
+            assert!(
+                (period - period_s).abs() < 0.5,
+                "event-clock period {period}, expected ~3.0s (not a 9s supra-harmonic)"
+            );
+        }
+
+        /// Fix 2 (safety net) correctness gate: even when event extraction
+        /// misses an occasional burst (not systematically every Nth, just a
+        /// couple of real-world drops), the fundamental must still win over
+        /// a supra-harmonic that the sparser onset pattern could otherwise
+        /// make look comparably strong.
+        #[test]
+        fn event_clock_prefers_fundamental_over_supra_harmonic_with_occasional_misses() {
+            // True 3.0s clock, 9 onsets, but drop 2 of them (indices 2 and
+            // 5) to model occasional real-world misses rather than a clean
+            // train — the scenario fix 1 alone doesn't fully guarantee away.
+            let all_onsets: Vec<f64> = (0..9).map(|i| i as f64 * 3.0).collect();
+            let onsets: Vec<f64> = all_onsets
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 2 && *i != 5)
+                .map(|(_, &t)| t)
+                .collect();
+            let impulse = build_event_impulse_series(&onsets, 0.0, 26.0, EVENT_BIN_S);
+            let p = analyze_periodicity(&impulse, AnalysisConfig::default());
+            let period = p.period_s.expect("should find a period");
+            assert!(
+                (period - 3.0).abs() < 0.5,
+                "period {period}, expected the fundamental ~3.0s even with occasional missed onsets, \
+                 not a supra-harmonic (~6s/~9s)"
+            );
+        }
+
+        /// Ported verbatim from `diag.rs`'s `flat_series_has_no_period`.
+        #[test]
+        fn flat_series_has_no_period() {
+            let s: Vec<Sample> =
+                (0..10_000).map(|i| Sample { t: i as f64 * 0.002, overshoot_ms: 0.2 }).collect();
+            let p = analyze_periodicity(&s, AnalysisConfig::default());
+            assert!(p.period_s.is_none(), "flat series should not report a period");
+        }
+
+        /// Ported verbatim from `diag.rs`'s `resample_keeps_spikes`.
+        #[test]
+        fn resample_keeps_spikes() {
+            // A lone spike between two calm samples must survive max-binning.
+            let s = mk(&[(0.0, 0.1), (0.05, 30.0), (0.10, 0.1), (0.15, 0.1), (0.20, 0.1)]);
+            let grid = resample_uniform(&s, 0.05);
+            assert!(grid.len() >= 4);
+            assert_eq!(grid[1], 30.0, "spike must land in its bin");
+            assert_eq!(grid[0], 0.1);
+        }
+
+        /// Offender attribution: a group whose CPU-delta activity is
+        /// periodic at the same period as the stall clock gets flagged.
+        /// Parameters mirror diag.rs's `offender_detects_periodic_spawner`
+        /// (300 samples @ 0.2 s, burst every 15 ticks = 3.0 s).
+        #[test]
+        fn finds_periodic_offender_matching_clock() {
+            let mut groups: HashMap<String, VecDeque<(f64, u64)>> = HashMap::new();
+            let poller: VecDeque<(f64, u64)> =
+                (0..300).map(|i| (i as f64 * 0.2, if i % 15 == 0 { 50 } else { 0 })).collect();
+            let steady: VecDeque<(f64, u64)> = (0..300).map(|i| (i as f64 * 0.2, 5)).collect();
+            groups.insert("poller".to_string(), poller);
+            groups.insert("steady".to_string(), steady);
+
+            let culprit = find_periodic_offender(&groups, 3.0);
+            assert_eq!(culprit.as_deref(), Some("poller"));
+        }
+
+        /// No group periodic at the clock's period -> honest "unattributed".
+        #[test]
+        fn no_offender_when_nothing_matches_clock() {
+            let mut groups: HashMap<String, VecDeque<(f64, u64)>> = HashMap::new();
+            let steady: VecDeque<(f64, u64)> = (0..300).map(|i| (i as f64 * 0.2, 5)).collect();
+            groups.insert("steady".to_string(), steady);
+
+            assert_eq!(find_periodic_offender(&groups, 3.0), None);
+        }
     }
 }
 
