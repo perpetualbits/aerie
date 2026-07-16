@@ -1244,8 +1244,9 @@ const DETAIL_ID:  TileId = 12;
 /// Layout + shared-border focus via `mullion::border::render_shared` (census
 /// `dit.rs` idiom); spine via `mullion::outline::render_tree_row`; primary
 /// reuses the existing `render_body` into its sub-rect. The detail sub-rect
-/// is a deliberate placeholder (it calls `render_threads`, which hard-returns
-/// unless `view == Threads`) pending Plan 2's per-group thread pipeline.
+/// draws the selected group's live per-thread heatmap via `render_thread_heat`,
+/// fed by `fleet_detail_samples` (refreshed each tick for the primary
+/// selection).
 fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     if area.width < 20 || area.height < 3 { render_body(buf, area, state); return; }
 
@@ -1283,8 +1284,19 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     // Primary: the existing group table into its rect.
     if let Some(primary) = rect_of(PRIMARY_ID) { render_body(buf, primary, state); }
 
-    // Detail: the selected group's threads into its rect (monitor lens).
-    if let Some(detail) = rect_of(DETAIL_ID) { render_threads(buf, detail, state); }
+    // Detail: the selected group's live per-thread heatmap (monitor lens).
+    if let Some(detail) = rect_of(DETAIL_ID) {
+        if detail.height >= 2 {
+            let header = match &state.fleet_detail_label {
+                Some(l) => format!(" {l} · {} threads", state.fleet_detail_samples.len()),
+                None => " (no group selected)".to_string(),
+            };
+            buf.set_string(detail.x, detail.y, &header.chars().take(detail.width as usize).collect::<String>(),
+                Style::default().fg(Color::Gray));
+            let heat = Rect::new(detail.x, detail.y + 1, detail.width, detail.height - 1);
+            render_thread_heat(buf, heat, &state.fleet_detail_samples);
+        }
+    }
 }
 
 /// Render the main group list (Groups and Remote views).
