@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 mod diag;
+mod fleet;
 mod local;
 mod proxmox;
 mod remote;
@@ -361,6 +362,25 @@ pub enum AppMode {
     },
 }
 
+/// Which of the three Fleet-face regions currently has keyboard focus.
+/// `left is where, right is why`: Spine (scope) → Primary (groups) → Detail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Region {
+    Spine,
+    #[default]
+    Primary,
+    Detail,
+}
+
+impl Region {
+    pub fn next(self) -> Region {
+        match self { Region::Spine => Region::Primary, Region::Primary => Region::Detail, Region::Detail => Region::Spine }
+    }
+    pub fn prev(self) -> Region {
+        match self { Region::Spine => Region::Detail, Region::Primary => Region::Spine, Region::Detail => Region::Primary }
+    }
+}
+
 /// Which screen is currently shown.
 #[derive(Clone)]
 pub enum AppView {
@@ -378,6 +398,9 @@ pub enum AppView {
     /// Latency scope: the wakeup-jitter diagnostic (Instruments subsystem).
     /// Full-body view driven by the `diag::LatencyProbe`; toggled with `d`.
     Scope,
+    /// The navigable "fleet face": spine (places) │ primary (groups) │ detail.
+    /// Additive — toggled with `f`, leaves the other views untouched.
+    Fleet,
 }
 
 /// Grouping strategy for local /proc scanning.
@@ -904,6 +927,11 @@ pub struct AppState {
     pub manual_scroll: usize,
     /// Height of the last-rendered body area in rows; used to bound histogram sampling.
     pub last_body_height: usize,
+    // ── fleet ─────────────────────────────────────────────────────────────
+    /// Which of the three Fleet regions (spine/primary/detail) has focus.
+    pub fleet_region: Region,
+    /// Selected row in the Fleet spine place-tree.
+    pub spine_cursor: usize,
     // ── thread detail ────────────────────────────────────────────────────
     /// Previous per-thread snapshot for CPU delta computation in thread view.
     pub thread_snap: Option<local::ThreadSnapshot>,
@@ -1528,6 +1556,8 @@ impl AppState {
             thread_snap: None,
             thread_samples: vec![],
             last_body_height: 30,
+            fleet_region: Region::default(),
+            spine_cursor: 0,
             group_snaps: HashMap::new(),
             group_member_vals: HashMap::new(),
             last_hist_sample: None,
@@ -2304,7 +2334,8 @@ impl AppState {
             | AppView::Manual
             | AppView::Connecting { .. }
             | AppView::Remote { .. }
-            | AppView::Scope => None,
+            | AppView::Scope
+            | AppView::Fleet => None,
         };
         if let (Some(label), AppMode::Local) = (thread_label, &self.mode) {
             let pids = self
@@ -3064,6 +3095,8 @@ fn main() -> Result<()> {
                             }
                             // Esc closes the scope and returns to the group list.
                             AppView::Scope => state.view = AppView::Groups,
+                            // Esc closes the fleet view and returns to the group list.
+                            AppView::Fleet => state.view = AppView::Groups,
                             // Pressing Esc on the top-level group list exits the app.
                             AppView::Groups => break 'main,
                         }
@@ -3110,6 +3143,16 @@ fn main() -> Result<()> {
                             state.view = AppView::Scope;
                         }
                     }
+                    // Toggle the Fleet three-region face (spine / primary / detail).
+                    KeyCode::Char('f') => {
+                        state.view = if matches!(state.view, AppView::Fleet) {
+                            AppView::Groups
+                        } else {
+                            state.fleet_region = Region::default();
+                            state.spine_cursor = 0;
+                            AppView::Fleet
+                        };
+                    }
                     // Cycle grouping strategy (Groups view, local or Proxmox mode)
                     KeyCode::Char('g') if matches!(state.view, AppView::Groups) => {
                         if matches!(state.mode, AppMode::Local) {
@@ -3132,9 +3175,33 @@ fn main() -> Result<()> {
                         }
                         // Fleet / Kube / Nomad: no grouping to cycle; ignore silently.
                     }
+                    // Fleet region-focus grammar: ←/→ move region focus, ↑/↓ move within
+                    // the focused region. These arms are guarded on AppView::Fleet and
+                    // must come before the generic arrow-key arms below so Fleet
+                    // intercepts them first.
+                    KeyCode::Left if matches!(state.view, AppView::Fleet) => {
+                        state.fleet_region = state.fleet_region.prev();
+                    }
+                    KeyCode::Right if matches!(state.view, AppView::Fleet) => {
+                        state.fleet_region = state.fleet_region.next();
+                    }
+                    KeyCode::Up if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Spine => {
+                        state.spine_cursor = state.spine_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Spine => {
+                        let n = fleet::local_places().len();
+                        if n > 0 { state.spine_cursor = (state.spine_cursor + 1).min(n - 1); }
+                    }
                     // Navigation: arrow keys (and vim j/k) route through the carousel focus.
+                    // Widened to also fire when Fleet's focus is on the Primary region, so
+                    // ↑/↓ there drives the same group-selection as the Groups view.
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
+                            || (matches!(state.view, AppView::Fleet)
+                                && state.fleet_region == Region::Primary)
+                        {
                             if let Some(tree) = &mut state.body_tree {
                                 tree.focus_dir(Direction::Up);
                             }
@@ -3143,7 +3210,10 @@ fn main() -> Result<()> {
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
+                            || (matches!(state.view, AppView::Fleet)
+                                && state.fleet_region == Region::Primary)
+                        {
                             if let Some(tree) = &mut state.body_tree {
                                 tree.focus_dir(Direction::Down);
                             }
@@ -3210,6 +3280,10 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
+                    }
+                    // Fleet: Tab cycles region focus forward, same direction as →.
+                    KeyCode::Tab if matches!(state.view, AppView::Fleet) => {
+                        state.fleet_region = state.fleet_region.next();
                     }
                     // Toggle active side
                     KeyCode::Tab => {
@@ -3539,5 +3613,20 @@ mod tests {
     fn derive_app_label_no_hash_returns_full() {
         // Bare pod with no hash suffix
         assert_eq!(derive_app_label("mypod"), "mypod");
+    }
+}
+
+#[cfg(test)]
+mod fleet_tests {
+    use super::Region;
+
+    #[test]
+    fn region_cycles_forward_and_back() {
+        assert_eq!(Region::Spine.next(), Region::Primary);
+        assert_eq!(Region::Primary.next(), Region::Detail);
+        assert_eq!(Region::Detail.next(), Region::Spine);
+        assert_eq!(Region::Spine.prev(), Region::Detail);
+        assert_eq!(Region::Primary.prev(), Region::Spine);
+        assert_eq!(Region::Detail.prev(), Region::Primary);
     }
 }

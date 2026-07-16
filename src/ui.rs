@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState};
+use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, fleet, Region};
 use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
-use mullion::border::{draw_box, render_rim, Borders, BorderStyle, CornerStyle, LineWeight};
+use mullion::border::{draw_box, render_rim, render_shared, Borders, BorderStyle, CornerStyle, LineWeight};
 use mullion::field::Field;
-use mullion::layout::TileId;
+use mullion::layout::{TileId, Node, Orientation, Constraint, Size};
 use mullion::label::Align;
+use mullion::outline::render_tree_row;
 use mullion::style::{Color, Modifier, Style};
 use mullion::table::{ColumnDef, ColumnGrid, ColumnKind};
+use mullion::text::TextCtx;
 use mullion::Table;
+use mullion::Theme;
 use std::collections::HashMap;
 
 pub const BODY_ID: TileId = 2;
@@ -51,6 +54,7 @@ pub fn render(buf: &mut Buffer, state: &mut AppState) {
         AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
         AppView::Scope if state.scope_detect => render_verdict(buf, body_rect, state),
         AppView::Scope => render_scope(buf, body_rect, state),
+        AppView::Fleet => render_fleet(buf, body_rect, state),
     }
 }
 
@@ -61,6 +65,7 @@ fn has_header_content(state: &AppState) -> bool {
         AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Manual => true,
         AppView::Threads { .. } => false, // thread info lives in the right pane
         AppView::Scope => false,          // scope draws its own header rows in the body
+        AppView::Fleet => false,          // Fleet draws its own regions; no separate header strip.
     }
 }
 
@@ -97,7 +102,7 @@ fn render_header_content(buf: &mut Buffer, area: Rect, state: &AppState) {
             x = buf.set_string(x, area.y,
                 "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", dim);
         }
-        AppView::Threads { .. } | AppView::Scope => {}
+        AppView::Threads { .. } | AppView::Scope | AppView::Fleet => {}
     }
     let _ = x;
 }
@@ -781,6 +786,8 @@ fn border_keys(state: &AppState) -> String {
             let other = if state.scope_detect { "observe" } else { "detect" };
             format!("[Tab] {other} [d]/[Esc] close [q] quit")
         }
+        AppView::Fleet =>
+            "[←/→ Tab] region  [↑/↓] select  [f] close  [q] quit".to_string(),
     }
 }
 
@@ -1227,6 +1234,57 @@ fn metric_frac(e: &BarEntry, m: Metric, total_ram: u64, peaks: &PeakVals) -> f64
         Metric::Vram        => if peaks.gpu_vram_bytes > 0.0 { e.gpu_vram_bytes as f64 / peaks.gpu_vram_bytes } else { 0.0 },
     }
     .clamp(0.0, 1.0)
+}
+
+const SPINE_ID:   TileId = 10;
+const PRIMARY_ID: TileId = 11;
+const DETAIL_ID:  TileId = 12;
+
+/// The additive three-region "fleet face": spine │ primary │ detail.
+/// Layout + shared-border focus via `mullion::border::render_shared` (census
+/// `dit.rs` idiom); spine via `mullion::outline::render_tree_row`; primary
+/// reuses the existing `render_body` into its sub-rect. The detail sub-rect
+/// is a deliberate placeholder (it calls `render_threads`, which hard-returns
+/// unless `view == Threads`) pending Plan 2's per-group thread pipeline.
+fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
+    if area.width < 20 || area.height < 3 { render_body(buf, area, state); return; }
+
+    // Which region's border to thicken.
+    let focused = match state.fleet_region {
+        Region::Spine => SPINE_ID,
+        Region::Primary => PRIMARY_ID,
+        Region::Detail => DETAIL_ID,
+    };
+
+    let mut tree = Node::Split {
+        orientation: Orientation::Horizontal,
+        children: vec![
+            (Constraint::new(Size::Percent(20)).with_min(16), Node::Tile(SPINE_ID)),
+            (Constraint::new(Size::Fill(1)),                   Node::Tile(PRIMARY_ID)),
+            (Constraint::new(Size::Percent(38)).with_min(24),  Node::Tile(DETAIL_ID)),
+        ],
+    };
+    let style = BorderStyle { weight: LineWeight::Light, corners: CornerStyle::Rounded, style: Style::default().fg(Color::DarkGray) };
+    let rects = render_shared(buf, &mut tree, area, &style, &[(focused, LineWeight::Heavy)]);
+    let rect_of = |id: TileId| rects.iter().find(|(t, _)| *t == id).map(|(_, r)| *r);
+
+    // Spine: flatten places, paint one row each.
+    if let Some(spine) = rect_of(SPINE_ID) {
+        let theme = Theme::default();
+        let places = fleet::local_places();
+        for (i, p) in places.iter().enumerate() {
+            let row = Rect::new(spine.x, spine.y + i as u16, spine.width, 1);
+            if row.y >= spine.y + spine.height { break; }
+            render_tree_row(buf, row, &p.ancestor_last, p.is_last, p.expanded,
+                &p.label, i == state.spine_cursor, &theme, TextCtx::default());
+        }
+    }
+
+    // Primary: the existing group table into its rect.
+    if let Some(primary) = rect_of(PRIMARY_ID) { render_body(buf, primary, state); }
+
+    // Detail: the selected group's threads into its rect (monitor lens).
+    if let Some(detail) = rect_of(DETAIL_ID) { render_threads(buf, detail, state); }
 }
 
 /// Render the main group list (Groups and Remote views).
