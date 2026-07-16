@@ -3141,6 +3141,16 @@ fn main() -> Result<()> {
                             state.view = AppView::Scope;
                         }
                     }
+                    // Toggle the Fleet three-region face (spine / primary / detail).
+                    KeyCode::Char('f') => {
+                        state.view = if matches!(state.view, AppView::Fleet) {
+                            AppView::Groups
+                        } else {
+                            state.fleet_region = Region::default();
+                            state.spine_cursor = 0;
+                            AppView::Fleet
+                        };
+                    }
                     // Cycle grouping strategy (Groups view, local or Proxmox mode)
                     KeyCode::Char('g') if matches!(state.view, AppView::Groups) => {
                         if matches!(state.mode, AppMode::Local) {
@@ -3163,9 +3173,33 @@ fn main() -> Result<()> {
                         }
                         // Fleet / Kube / Nomad: no grouping to cycle; ignore silently.
                     }
+                    // Fleet region-focus grammar: ←/→ move region focus, ↑/↓ move within
+                    // the focused region. These arms are guarded on AppView::Fleet and
+                    // must come before the generic arrow-key arms below so Fleet
+                    // intercepts them first.
+                    KeyCode::Left if matches!(state.view, AppView::Fleet) => {
+                        state.fleet_region = state.fleet_region.prev();
+                    }
+                    KeyCode::Right if matches!(state.view, AppView::Fleet) => {
+                        state.fleet_region = state.fleet_region.next();
+                    }
+                    KeyCode::Up if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Spine => {
+                        state.spine_cursor = state.spine_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Spine => {
+                        let n = fleet::local_places().len();
+                        if n > 0 { state.spine_cursor = (state.spine_cursor + 1).min(n - 1); }
+                    }
                     // Navigation: arrow keys (and vim j/k) route through the carousel focus.
+                    // Widened to also fire when Fleet's focus is on the Primary region, so
+                    // ↑/↓ there drives the same group-selection as the Groups view.
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
+                            || (matches!(state.view, AppView::Fleet)
+                                && state.fleet_region == Region::Primary)
+                        {
                             if let Some(tree) = &mut state.body_tree {
                                 tree.focus_dir(Direction::Up);
                             }
@@ -3174,7 +3208,10 @@ fn main() -> Result<()> {
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
+                            || (matches!(state.view, AppView::Fleet)
+                                && state.fleet_region == Region::Primary)
+                        {
                             if let Some(tree) = &mut state.body_tree {
                                 tree.focus_dir(Direction::Down);
                             }
