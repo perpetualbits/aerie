@@ -10,6 +10,9 @@
 pub struct Place {
     /// Stable identity (hostname / VM id / container id) — used for a stable
     /// `TileId` via `mullion::tree::id_from_key`, never derived from position.
+    /// Not yet read: reserved for per-place `TileId`s once the spine grows
+    /// beyond the single local host (SSH hosts, VMs, containers).
+    #[allow(dead_code)]
     pub key: String,
     /// Human-readable label shown in the spine.
     pub label: String,
