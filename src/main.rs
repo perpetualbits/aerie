@@ -937,6 +937,16 @@ pub struct AppState {
     pub thread_snap: Option<local::ThreadSnapshot>,
     /// Sorted list of per-thread CPU/fault/etc samples for the current group.
     pub thread_samples: Vec<local::ThreadSample>,
+    // ── fleet detail (monitor lens) ──────────────────────────────────────
+    // The selected primary group's live per-thread samples, with a dedicated
+    // prev-snapshot (reset when the selection changes) so cpu% deltas are
+    // computed against the right basis.
+    /// Comm-label of the group `fleet_detail_samples` currently describes.
+    pub fleet_detail_label: Option<String>,
+    /// Prev thread snapshot for the selected group (delta basis for sample_threads).
+    pub fleet_detail_snap: Option<local::ThreadSnapshot>,
+    /// The selected group's per-thread samples, hottest-first, for the detail heatmap.
+    pub fleet_detail_samples: Vec<local::ThreadSample>,
     // ── group histogram overlay ───────────────────────────────────────────
     /// Per-group thread snapshots used for CPU+fault delta computation.
     pub group_snaps: HashMap<String, local::ThreadSnapshot>,
@@ -1555,6 +1565,9 @@ impl AppState {
             manual_scroll: 0,
             thread_snap: None,
             thread_samples: vec![],
+            fleet_detail_label: None,
+            fleet_detail_snap: None,
+            fleet_detail_samples: Vec::new(),
             last_body_height: 30,
             fleet_region: Region::default(),
             spine_cursor: 0,
@@ -1619,6 +1632,14 @@ impl AppState {
     pub fn focused_entry_idx(&self) -> Option<usize> {
         let fid = self.body_tree.as_ref()?.focus()?;
         self.entries.iter().position(|e| id_from_key(&e.label) == fid)
+    }
+
+    /// The comm-label of the group currently selected in the Fleet primary
+    /// region — the `body_tree` focus mapped back to an entry label. `None`
+    /// when nothing is focused or no entry matches.
+    fn selected_fleet_group_label(&self) -> Option<String> {
+        let focused = self.body_tree.as_ref()?.focus()?;
+        self.entries.iter().find(|e| id_from_key(&e.label) == focused).map(|e| e.label.clone())
     }
 
     /// Reconcile the body carousel with the current entry list.
@@ -2364,6 +2385,39 @@ impl AppState {
                         self.thread_samples = samples;
                     }
                     Err(e) => self.error = Some(e.to_string()),
+                }
+            }
+        }
+
+        // Fleet detail (monitor lens): compute the selected primary group's
+        // per-thread samples each refresh, mirroring the Threads block above but
+        // keyed to the Fleet selection. Reset the delta basis when the selection
+        // changes so cpu% isn't computed across two different groups.
+        if matches!(self.view, AppView::Fleet) && matches!(self.mode, AppMode::Local) {
+            match self.selected_fleet_group_label() {
+                Some(label) => {
+                    if self.fleet_detail_label.as_deref() != Some(label.as_str()) {
+                        self.fleet_detail_snap = None;
+                        self.fleet_detail_label = Some(label.clone());
+                    }
+                    let pids = self.snap.as_ref().and_then(|s| s.groups.get(&label))
+                        .map(|g| g.pids.clone()).unwrap_or_default();
+                    if pids.is_empty() {
+                        self.fleet_detail_samples.clear();
+                    } else {
+                        let cpu_total = self.snap.as_ref().map_or(0, |s| s.total);
+                        if let Ok((mut samples, snap)) = local::sample_threads(
+                            &pids, self.fleet_detail_snap.take(), &local::ThreadFields::all(), cpu_total,
+                        ) {
+                            self.fleet_detail_snap = Some(snap);
+                            samples.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+                            self.fleet_detail_samples = samples;
+                        }
+                    }
+                }
+                None => {
+                    self.fleet_detail_label = None;
+                    self.fleet_detail_samples.clear();
                 }
             }
         }
@@ -3628,5 +3682,16 @@ mod fleet_tests {
         assert_eq!(Region::Spine.prev(), Region::Detail);
         assert_eq!(Region::Primary.prev(), Region::Spine);
         assert_eq!(Region::Detail.prev(), Region::Primary);
+    }
+
+    #[test]
+    fn selected_label_matches_focused_tile() {
+        use mullion::tree::id_from_key;
+        // Two entries; the focused tile id is entry "beta"'s id.
+        let labels = ["alpha", "beta", "gamma"];
+        let focused = id_from_key(&"beta");
+        // Mirror selected_fleet_group_label's core: find the label whose id matches.
+        let found = labels.iter().find(|l| id_from_key(l) == focused).map(|l| l.to_string());
+        assert_eq!(found, Some("beta".to_string()));
     }
 }
