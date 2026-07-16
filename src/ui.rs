@@ -51,6 +51,7 @@ pub fn render(buf: &mut Buffer, state: &mut AppState) {
         AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
         AppView::Scope if state.scope_detect => render_verdict(buf, body_rect, state),
         AppView::Scope => render_scope(buf, body_rect, state),
+        AppView::Fleet => render_body(buf, body_rect, state),
     }
 }
 
@@ -61,6 +62,7 @@ fn has_header_content(state: &AppState) -> bool {
         AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Manual => true,
         AppView::Threads { .. } => false, // thread info lives in the right pane
         AppView::Scope => false,          // scope draws its own header rows in the body
+        AppView::Fleet => false,          // TODO: fleet header content
     }
 }
 
@@ -97,7 +99,7 @@ fn render_header_content(buf: &mut Buffer, area: Rect, state: &AppState) {
             x = buf.set_string(x, area.y,
                 "  ·  ↑/↓ to scroll  ·  [m] or [Esc] to close", dim);
         }
-        AppView::Threads { .. } | AppView::Scope => {}
+        AppView::Threads { .. } | AppView::Scope | AppView::Fleet => {}
     }
     let _ = x;
 }
@@ -781,6 +783,8 @@ fn border_keys(state: &AppState) -> String {
             let other = if state.scope_detect { "observe" } else { "detect" };
             format!("[Tab] {other} [d]/[Esc] close [q] quit")
         }
+        AppView::Fleet =>
+            "[←/→] navigate [Tab] region [f] close [q] quit".to_string(),
     }
 }
 
