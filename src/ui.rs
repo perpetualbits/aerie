@@ -1288,7 +1288,11 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     if let Some(detail) = rect_of(DETAIL_ID) {
         if detail.height >= 2 {
             let header = match &state.fleet_detail_label {
-                Some(l) => format!(" {l} · {} threads", state.fleet_detail_samples.len()),
+                Some(l) => {
+                    let n = state.fleet_detail_samples.len();
+                    let unit = if n == 1 { "thread" } else { "threads" };
+                    format!(" {l} · {n} {unit}")
+                }
                 None => " (no group selected)".to_string(),
             };
             buf.set_string(detail.x, detail.y, &header.chars().take(detail.width as usize).collect::<String>(),
@@ -1544,15 +1548,7 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
     let max_cpu = state.thread_samples.iter()
         .map(|t| t.cpu_pct).fold(0.0f64, f64::max).max(1e-6);
     let w = area.width as usize;
-    let cells_per_row = (w / 2).max(1);
-    const MAX_HEAT_ROWS: usize = 4;
-    let max_cells = MAX_HEAT_ROWS * cells_per_row;
-    let mut group_size = 1usize;
-    while n > 0 && n.div_ceil(group_size) > max_cells { group_size *= 2; }
-    let num_cells = if n == 0 { 0 } else { n.div_ceil(group_size) };
-    let heat_rows = if num_cells == 0 { 1 } else {
-        num_cells.div_ceil(cells_per_row).clamp(1, MAX_HEAT_ROWS)
-    };
+    let (group_size, heat_rows) = heat_layout(n, area.width);
 
     // Manual rect split: info / heat / divider / list
     let mut y = area.y;
@@ -1622,6 +1618,25 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
     }
 }
 
+/// Grid layout for the per-thread heat cells: given the thread count `n` and the
+/// available `width`, returns (group_size, heat_rows) — how many threads each cell
+/// aggregates, and how many rows of cells the grid occupies. Shared by
+/// `render_threads` (to size its layout split) and `render_thread_heat` (to draw),
+/// so the two can never drift.
+fn heat_layout(n: usize, width: u16) -> (usize, usize) {
+    let w = width as usize;
+    let cells_per_row = (w / 2).max(1);
+    const MAX_HEAT_ROWS: usize = 4;
+    let max_cells = MAX_HEAT_ROWS * cells_per_row;
+    let mut group_size = 1usize;
+    while n > 0 && n.div_ceil(group_size) > max_cells { group_size *= 2; }
+    let num_cells = if n == 0 { 0 } else { n.div_ceil(group_size) };
+    let heat_rows = if num_cells == 0 { 1 } else {
+        num_cells.div_ceil(cells_per_row).clamp(1, MAX_HEAT_ROWS)
+    };
+    (group_size, heat_rows)
+}
+
 /// Draw the per-thread heat grid — cells of `group_size` threads each, coloured
 /// by cpu% via [`planck_color`] — into `area`. Extracted from [`render_threads`]
 /// so the identical heatmap can be reused by the Fleet detail region.
@@ -1629,21 +1644,14 @@ fn render_thread_heat(buf: &mut Buffer, area: Rect, samples: &[crate::local::Thr
     let n = samples.len();
     let max_cpu = samples.iter()
         .map(|t| t.cpu_pct).fold(0.0f64, f64::max).max(1e-6);
-    let w = area.width as usize;
-    let cells_per_row = (w / 2).max(1);
-    const MAX_HEAT_ROWS: usize = 4;
-    let max_cells = MAX_HEAT_ROWS * cells_per_row;
-    let mut group_size = 1usize;
-    while n > 0 && n.div_ceil(group_size) > max_cells { group_size *= 2; }
+    let cells_per_row = ((area.width as usize) / 2).max(1);
+    let (group_size, heat_rows) = heat_layout(n, area.width);
     let num_cells = if n == 0 { 0 } else { n.div_ceil(group_size) };
     let cell_cpus: Vec<f64> = (0..num_cells).map(|i| {
         let start = i * group_size;
         let end = (start + group_size).min(n);
         samples[start..end].iter().map(|t| t.cpu_pct).fold(0.0f64, f64::max)
     }).collect();
-    let heat_rows = if num_cells == 0 { 1 } else {
-        num_cells.div_ceil(cells_per_row).clamp(1, MAX_HEAT_ROWS)
-    };
 
     let dim = Style::default().fg(Color::DarkGray);
     if samples.is_empty() {
