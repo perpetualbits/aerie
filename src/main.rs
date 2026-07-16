@@ -928,7 +928,9 @@ pub struct AppState {
     /// Height of the last-rendered body area in rows; used to bound histogram sampling.
     pub last_body_height: usize,
     // ── fleet ─────────────────────────────────────────────────────────────
+    /// Which of the three Fleet regions (spine/primary/detail) has focus.
     pub fleet_region: Region,
+    /// Selected row in the Fleet spine place-tree.
     pub spine_cursor: usize,
     // ── thread detail ────────────────────────────────────────────────────
     /// Previous per-thread snapshot for CPU delta computation in thread view.
@@ -3278,6 +3280,10 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
+                    }
+                    // Fleet: Tab cycles region focus forward, same direction as →.
+                    KeyCode::Tab if matches!(state.view, AppView::Fleet) => {
+                        state.fleet_region = state.fleet_region.next();
                     }
                     // Toggle active side
                     KeyCode::Tab => {

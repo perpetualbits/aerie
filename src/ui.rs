@@ -65,7 +65,7 @@ fn has_header_content(state: &AppState) -> bool {
         AppView::Remote { .. } | AppView::Connecting { .. } | AppView::Manual => true,
         AppView::Threads { .. } => false, // thread info lives in the right pane
         AppView::Scope => false,          // scope draws its own header rows in the body
-        AppView::Fleet => false,          // TODO: fleet header content
+        AppView::Fleet => false,          // Fleet draws its own regions; no separate header strip.
     }
 }
 
@@ -787,7 +787,7 @@ fn border_keys(state: &AppState) -> String {
             format!("[Tab] {other} [d]/[Esc] close [q] quit")
         }
         AppView::Fleet =>
-            "[←/→] navigate [Tab] region [f] close [q] quit".to_string(),
+            "[←/→ Tab] region  [↑/↓] select  [f] close  [q] quit".to_string(),
     }
 }
 
@@ -1242,8 +1242,10 @@ const DETAIL_ID:  TileId = 12;
 
 /// The additive three-region "fleet face": spine │ primary │ detail.
 /// Layout + shared-border focus via `mullion::border::render_shared` (census
-/// `dit.rs` idiom); spine via `mullion::outline::render_tree_row`; primary/detail
-/// reuse the existing `render_body`/`render_threads` into their sub-rects.
+/// `dit.rs` idiom); spine via `mullion::outline::render_tree_row`; primary
+/// reuses the existing `render_body` into its sub-rect. The detail sub-rect
+/// is a deliberate placeholder (it calls `render_threads`, which hard-returns
+/// unless `view == Threads`) pending Plan 2's per-group thread pipeline.
 fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     if area.width < 20 || area.height < 3 { render_body(buf, area, state); return; }
 
