@@ -1715,6 +1715,24 @@ impl AppState {
         }
     }
 
+    /// The (group label, per-thread samples) for the Fleet detail of the
+    /// currently-selected place: the local sampler's output in Local mode, or
+    /// the spine-selected remote host's streamed `focus_threads` in Fleet mode.
+    /// Empty when nothing is focused or the remote host has no focused sample yet.
+    fn selected_place_threads(&self) -> (Option<&str>, &[local::ThreadSample]) {
+        if let AppMode::Fleet { .. } = self.mode {
+            match self.fleet_clients.get(self.spine_cursor)
+                .and_then(|c| c.snap.as_ref())
+                .and_then(|s| s.focus_threads.as_ref())
+            {
+                Some((label, samples)) => (Some(label.as_str()), samples.as_slice()),
+                None => (None, &[]),
+            }
+        } else {
+            (self.fleet_detail_label.as_deref(), self.fleet_detail_samples.as_slice())
+        }
+    }
+
     /// Reconcile the body carousel with the current entry list.
     ///
     /// Must be called whenever `self.entries` changes — both from `refresh()` and
@@ -1955,6 +1973,17 @@ impl AppState {
                 };
                 if !alive && conn.client.is_some() {
                     conn.err = Some("connection lost".into());
+                }
+            }
+            // Focused-stream routing (Slice C): tell the spine-selected remote
+            // daemon which group to stream per-thread data for; tell the others
+            // to stop. `send_focus` dedups, so this is cheap every tick, and it
+            // only ever asks ONE host to sample threads.
+            let focus_group = self.selected_fleet_group_label(); // owned Option<String>
+            let sel = self.spine_cursor;
+            for (i, conn) in self.fleet_clients.iter_mut().enumerate() {
+                if let Some(FleetClient::Daemon(rc)) = conn.client.as_mut() {
+                    rc.send_focus(if i == sel { focus_group.as_deref() } else { None });
                 }
             }
             // Build BarEntries: one per fleet member.
