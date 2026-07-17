@@ -932,6 +932,9 @@ pub struct AppState {
     pub fleet_region: Region,
     /// Selected row in the Fleet spine place-tree.
     pub spine_cursor: usize,
+    /// Selected row in the Fleet face's primary group table (index into the
+    /// selected place's entries). Reset to 0 when the selected place changes.
+    pub fleet_primary_cursor: usize,
     // ── thread detail ────────────────────────────────────────────────────
     /// Previous per-thread snapshot for CPU delta computation in thread view.
     pub thread_snap: Option<local::ThreadSnapshot>,
@@ -1571,6 +1574,7 @@ impl AppState {
             last_body_height: 30,
             fleet_region: Region::default(),
             spine_cursor: 0,
+            fleet_primary_cursor: 0,
             group_snaps: HashMap::new(),
             group_member_vals: HashMap::new(),
             last_hist_sample: None,
@@ -1635,11 +1639,10 @@ impl AppState {
     }
 
     /// The comm-label of the group currently selected in the Fleet primary
-    /// region — the `body_tree` focus mapped back to an entry label. `None`
-    /// when nothing is focused or no entry matches.
+    /// region — `fleet_primary_cursor` mapped back to an entry label. `None`
+    /// when the cursor is out of range (e.g. no entries yet).
     fn selected_fleet_group_label(&self) -> Option<String> {
-        let focused = self.body_tree.as_ref()?.focus()?;
-        self.entries.iter().find(|e| id_from_key(&e.label) == focused).map(|e| e.label.clone())
+        self.entries.get(self.fleet_primary_cursor).map(|e| e.label.clone())
     }
 
     /// Reconcile the body carousel with the current entry list.
@@ -3297,27 +3300,33 @@ fn main() -> Result<()> {
                         if n > 0 { state.spine_cursor = (state.spine_cursor + 1).min(n - 1); }
                     }
                     // Navigation: arrow keys (and vim j/k) route through the carousel focus.
-                    // Widened to also fire when Fleet's focus is on the Primary region, so
-                    // ↑/↓ there drives the same group-selection as the Groups view.
+                    // Also fires when Fleet's focus is on the Primary region, but there it
+                    // drives `fleet_primary_cursor` (the dedicated per-place cursor for
+                    // `render_fleet_primary`) rather than the classic `body_tree` focus.
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
-                            || (matches!(state.view, AppView::Fleet)
-                                && state.fleet_region == Region::Primary)
-                        {
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
                             if let Some(tree) = &mut state.body_tree {
                                 tree.focus_dir(Direction::Up);
                             }
+                        } else if matches!(state.view, AppView::Fleet)
+                            && state.fleet_region == Region::Primary
+                        {
+                            state.fleet_primary_cursor = state.fleet_primary_cursor.saturating_sub(1);
                         } else if matches!(state.view, AppView::Manual) {
                             state.manual_scroll = state.manual_scroll.saturating_sub(1);
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if matches!(state.view, AppView::Groups | AppView::Remote { .. })
-                            || (matches!(state.view, AppView::Fleet)
-                                && state.fleet_region == Region::Primary)
-                        {
+                        if matches!(state.view, AppView::Groups | AppView::Remote { .. }) {
                             if let Some(tree) = &mut state.body_tree {
                                 tree.focus_dir(Direction::Down);
+                            }
+                        } else if matches!(state.view, AppView::Fleet)
+                            && state.fleet_region == Region::Primary
+                        {
+                            let n = state.entries.len();
+                            if n > 0 {
+                                state.fleet_primary_cursor = (state.fleet_primary_cursor + 1).min(n - 1);
                             }
                         } else if matches!(state.view, AppView::Manual) {
                             let max_scroll = ui::manual_line_count()
@@ -3733,13 +3742,19 @@ mod fleet_tests {
     }
 
     #[test]
-    fn selected_label_matches_focused_tile() {
-        use mullion::tree::id_from_key;
-        // Two entries; the focused tile id is entry "beta"'s id.
+    fn selected_label_matches_cursor() {
+        // Mirror selected_fleet_group_label's core: the label at the cursor index.
         let labels = ["alpha", "beta", "gamma"];
-        let focused = id_from_key(&"beta");
-        // Mirror selected_fleet_group_label's core: find the label whose id matches.
-        let found = labels.iter().find(|l| id_from_key(l) == focused).map(|l| l.to_string());
+        let cursor = 1usize;
+        let found = labels.get(cursor).map(|l| l.to_string());
         assert_eq!(found, Some("beta".to_string()));
+    }
+
+    #[test]
+    fn selected_label_none_when_cursor_out_of_range() {
+        let labels: [&str; 2] = ["alpha", "beta"];
+        let cursor = 5usize;
+        let found = labels.get(cursor).map(|l| l.to_string());
+        assert_eq!(found, None);
     }
 }

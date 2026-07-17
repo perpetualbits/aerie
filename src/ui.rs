@@ -1281,8 +1281,11 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         }
     }
 
-    // Primary: the existing group table into its rect.
-    if let Some(primary) = rect_of(PRIMARY_ID) { render_body(buf, primary, state); }
+    // Primary: the Fleet face's own group table (local entries for now; Task 2
+    // swaps in the selected place's entries once remote places exist).
+    if let Some(primary) = rect_of(PRIMARY_ID) {
+        render_fleet_primary(buf, primary, &state.entries, state.fleet_primary_cursor);
+    }
 
     // Detail: the selected group's live per-thread heatmap (monitor lens).
     if let Some(detail) = rect_of(DETAIL_ID) {
@@ -1300,6 +1303,43 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
             let heat = Rect::new(detail.x, detail.y + 1, detail.width, detail.height - 1);
             render_thread_heat(buf, heat, &state.fleet_detail_samples);
         }
+    }
+}
+
+/// Dedicated group-table renderer for the Fleet face's primary region. Works on
+/// ANY place's entries (local `state.entries` or, from Task 2 onward, a remote
+/// host's snapshot entries) — a clean label | cpu% | bar | mem% table on the
+/// same mullion primitives `render_body` uses, driven by a single selection
+/// cursor. (The face owns this the way it owns `render_thread_heat` for the
+/// detail region.)
+fn render_fleet_primary(buf: &mut Buffer, area: Rect, entries: &[BarEntry], selected: usize) {
+    if area.height == 0 { return; }
+    if entries.is_empty() {
+        buf.set_string(area.x, area.y, "(no data yet)", Style::default().fg(Color::DarkGray));
+        return;
+    }
+    let label_w = entries.iter().map(|e| e.label.len()).max().unwrap_or(8).clamp(8, 28) as u16;
+    let grid = ColumnGrid::new(vec![
+        ColumnDef::fixed(label_w, ColumnKind::Text),
+        ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // cpu%
+        ColumnDef::fill(1, ColumnKind::Bar).with_min(8),                // cpu bar
+        ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // mem%
+    ]);
+    // Scroll window: keep `selected` visible within `area.height` rows.
+    let rows = area.height as usize;
+    let offset = if selected >= rows { selected + 1 - rows } else { 0 };
+    for (row_i, e) in entries.iter().enumerate().skip(offset).take(rows) {
+        let y = area.y + (row_i - offset) as u16;
+        let cols = grid.resolve(Rect::new(area.x, y, area.width, 1));
+        let is_sel = row_i == selected;
+        let base = if is_sel { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default() };
+        // Selection highlight spans the whole row.
+        if is_sel { buf.set_string(area.x, y, &" ".repeat(area.width as usize), base); }
+        ColumnGrid::write_text(buf, cols[0], y, &e.label, Align::Start, base);
+        ColumnGrid::write_text(buf, cols[1], y, &format!("{:.1}%", e.value), Align::End, base);
+        ColumnGrid::write_bar(buf, cols[2], y, (e.value / 100.0).clamp(0.0, 1.0) as f32,
+            '█', Style::default().fg(Color::Green), '░', Style::default().fg(Color::DarkGray), None);
+        ColumnGrid::write_text(buf, cols[3], y, &format!("{:.0}%", e.mem_pct), Align::End, base);
     }
 }
 
