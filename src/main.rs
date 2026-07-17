@@ -817,6 +817,15 @@ pub struct FleetConn {
     pub thin: bool,
 }
 
+/// Find the `FleetConn` whose hostname matches `label`. Fleet host rows must be
+/// mapped to their connection BY NAME, not by position: `state.entries` is
+/// reordered by `stable_order`/sort-metric while `fleet_clients` stays in
+/// `--hosts` order, so a position-based lookup (`fleet_clients.get(idx)`) selects
+/// the wrong host when the two orders diverge (the "swapped hostname" bug).
+fn fleet_conn_for_label<'a>(label: &str, conns: &'a [FleetConn]) -> Option<&'a FleetConn> {
+    conns.iter().find(|c| c.hostname == label)
+}
+
 /// One Kubernetes pod connection in --kube mode.
 ///
 /// Analogous to `FleetConn` but keyed by pod name. The `app_label` field groups
@@ -1636,6 +1645,16 @@ impl AppState {
     pub fn focused_entry_idx(&self) -> Option<usize> {
         let fid = self.body_tree.as_ref()?.focus()?;
         self.entries.iter().position(|e| id_from_key(&e.label) == fid)
+    }
+
+    /// The `FleetConn` for the currently-selected fleet-host row — matched by
+    /// hostname (the selected entry's label), NOT by position, because
+    /// `entries` is reordered relative to `fleet_clients`. See
+    /// [`fleet_conn_for_label`].
+    fn selected_fleet_conn(&self) -> Option<&FleetConn> {
+        let idx = self.focused_entry_idx()?;
+        let label = self.entries.get(idx)?.label.as_str();
+        fleet_conn_for_label(label, &self.fleet_clients)
     }
 
     /// The comm-label of the group currently selected in the Fleet primary
@@ -3540,13 +3559,16 @@ fn main() -> Result<()> {
                                 }
                             } else if matches!(state.mode, AppMode::Fleet { .. }) {
                                 // Fleet: drill into the selected host's per-process view.
-                                if let Some(conn) = state.focused_entry_idx().and_then(|i| state.fleet_clients.get(i)) {
+                                if let Some(conn) = state.selected_fleet_conn() {
                                     if conn.thin {
                                         state.error = Some(
                                             "thin probe mode — no per-process drill-down; remove --thin to enable".into()
                                         );
                                     } else if conn.client.is_none() {
-                                        state.error = Some(format!("not connected to {}", conn.hostname));
+                                        // Surface the real connect error (e.g. "aerie not in PATH on
+                                        // the remote") instead of a generic "not connected".
+                                        state.error = Some(conn.err.clone()
+                                            .unwrap_or_else(|| format!("not connected to {}", conn.hostname)));
                                     } else if !state.enable_remote {
                                         state.error = Some("remote drill-down disabled — re-run with --enable-remote".into());
                                     } else {
@@ -3756,7 +3778,24 @@ mod tests {
 
 #[cfg(test)]
 mod fleet_tests {
-    use super::Region;
+    use super::{Region, FleetConn, fleet_conn_for_label};
+
+    fn conn(hostname: &str) -> FleetConn {
+        FleetConn { hostname: hostname.into(), client: None, snap: None, err: None, thin: false }
+    }
+
+    #[test]
+    fn fleet_conn_matched_by_hostname_not_position() {
+        // fleet_clients keeps --hosts order; `entries` (and thus the selected row)
+        // is reordered by sort. Selecting the row labeled "milkv" must resolve to
+        // the milkv conn — even though milkv is at index 1 here, a stale position
+        // lookup at index 0 would wrongly return apollo (the swapped-hostname bug).
+        let conns = vec![conn("apollo"), conn("milkv")];
+        assert_eq!(conns[0].hostname, "apollo", "position 0 is apollo — a position lookup would mis-select it");
+        assert_eq!(fleet_conn_for_label("milkv", &conns).map(|c| c.hostname.as_str()), Some("milkv"));
+        assert_eq!(fleet_conn_for_label("apollo", &conns).map(|c| c.hostname.as_str()), Some("apollo"));
+        assert!(fleet_conn_for_label("nope", &conns).is_none());
+    }
 
     #[test]
     fn region_cycles_forward_and_back() {
