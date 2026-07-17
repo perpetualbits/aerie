@@ -1957,6 +1957,17 @@ impl AppState {
                     conn.err = Some("connection lost".into());
                 }
             }
+            // Focused-stream routing (Slice C): tell the spine-selected remote
+            // daemon which group to stream per-thread data for; tell the others
+            // to stop. `send_focus` dedups, so this is cheap every tick, and it
+            // only ever asks ONE host to sample threads.
+            let focus_group = self.selected_fleet_group_label(); // owned Option<String>
+            let sel = self.spine_cursor;
+            for (i, conn) in self.fleet_clients.iter_mut().enumerate() {
+                if let Some(FleetClient::Daemon(rc)) = conn.client.as_mut() {
+                    rc.send_focus(if i == sel { focus_group.as_deref() } else { None });
+                }
+            }
             // Build BarEntries: one per fleet member.
             let raw: Vec<BarEntry> = self.fleet_clients.iter().map(|conn| {
                 let (cpu, mem_pct, mem_used, net_rx, net_tx, count, has_data) =
