@@ -1244,8 +1244,9 @@ const DETAIL_ID:  TileId = 12;
 /// Layout + shared-border focus via `mullion::border::render_shared` (census
 /// `dit.rs` idiom); spine via `mullion::outline::render_tree_row`; primary
 /// reuses the existing `render_body` into its sub-rect. The detail sub-rect
-/// is a deliberate placeholder (it calls `render_threads`, which hard-returns
-/// unless `view == Threads`) pending Plan 2's per-group thread pipeline.
+/// draws the selected group's live per-thread heatmap via `render_thread_heat`,
+/// fed by `fleet_detail_samples` (refreshed each tick for the primary
+/// selection).
 fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     if area.width < 20 || area.height < 3 { render_body(buf, area, state); return; }
 
@@ -1283,8 +1284,23 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     // Primary: the existing group table into its rect.
     if let Some(primary) = rect_of(PRIMARY_ID) { render_body(buf, primary, state); }
 
-    // Detail: the selected group's threads into its rect (monitor lens).
-    if let Some(detail) = rect_of(DETAIL_ID) { render_threads(buf, detail, state); }
+    // Detail: the selected group's live per-thread heatmap (monitor lens).
+    if let Some(detail) = rect_of(DETAIL_ID) {
+        if detail.height >= 2 {
+            let header = match &state.fleet_detail_label {
+                Some(l) => {
+                    let n = state.fleet_detail_samples.len();
+                    let unit = if n == 1 { "thread" } else { "threads" };
+                    format!(" {l} · {n} {unit}")
+                }
+                None => " (no group selected)".to_string(),
+            };
+            buf.set_string(detail.x, detail.y, &header.chars().take(detail.width as usize).collect::<String>(),
+                Style::default().fg(Color::Gray));
+            let heat = Rect::new(detail.x, detail.y + 1, detail.width, detail.height - 1);
+            render_thread_heat(buf, heat, &state.fleet_detail_samples);
+        }
+    }
 }
 
 /// Render the main group list (Groups and Remote views).
@@ -1532,20 +1548,7 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
     let max_cpu = state.thread_samples.iter()
         .map(|t| t.cpu_pct).fold(0.0f64, f64::max).max(1e-6);
     let w = area.width as usize;
-    let cells_per_row = (w / 2).max(1);
-    const MAX_HEAT_ROWS: usize = 4;
-    let max_cells = MAX_HEAT_ROWS * cells_per_row;
-    let mut group_size = 1usize;
-    while n > 0 && n.div_ceil(group_size) > max_cells { group_size *= 2; }
-    let num_cells = if n == 0 { 0 } else { n.div_ceil(group_size) };
-    let cell_cpus: Vec<f64> = (0..num_cells).map(|i| {
-        let start = i * group_size;
-        let end = (start + group_size).min(n);
-        state.thread_samples[start..end].iter().map(|t| t.cpu_pct).fold(0.0f64, f64::max)
-    }).collect();
-    let heat_rows = if num_cells == 0 { 1 } else {
-        num_cells.div_ceil(cells_per_row).clamp(1, MAX_HEAT_ROWS)
-    };
+    let (group_size, heat_rows) = heat_layout(n, area.width);
 
     // Manual rect split: info / heat / divider / list
     let mut y = area.y;
@@ -1566,24 +1569,8 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
     }
 
     // Heat-map grid
-    if state.thread_samples.is_empty() {
-        if heat_y < area.bottom() {
-            buf.set_string(area.x, heat_y, "  waiting for second sample…", dim);
-        }
-    } else {
-        let mut idx = 0;
-        'outer: for row in 0..heat_rows {
-            let ry = heat_y + row as u16;
-            if ry >= area.bottom() { break; }
-            let mut x = area.x;
-            for _ in 0..cells_per_row {
-                if idx >= cell_cpus.len() { break 'outer; }
-                x = buf.set_string(x, ry, "◻ ",
-                    Style::default().fg(planck_color(cell_cpus[idx] / max_cpu)));
-                idx += 1;
-            }
-        }
-    }
+    let heat_rect = Rect::new(area.x, heat_y, area.width, area.bottom().saturating_sub(heat_y));
+    render_thread_heat(buf, heat_rect, &state.thread_samples);
 
     // Horizontal divider
     if div_y < area.bottom() {
@@ -1627,6 +1614,62 @@ fn render_threads(buf: &mut Buffer, area: Rect, state: &AppState) {
                 &format!("{:>5.1}", t.cpu_pct), gray, "%", dim, 1);
             ColumnGrid::write_text(buf, Rect::new(tcols[4].x, ty, tcols[4].width, 1),
                 ty, &format!("{}:{}", t.pid, t.tid), Align::Start, gray);
+        }
+    }
+}
+
+/// Grid layout for the per-thread heat cells: given the thread count `n` and the
+/// available `width`, returns (group_size, heat_rows) — how many threads each cell
+/// aggregates, and how many rows of cells the grid occupies. Shared by
+/// `render_threads` (to size its layout split) and `render_thread_heat` (to draw),
+/// so the two can never drift.
+fn heat_layout(n: usize, width: u16) -> (usize, usize) {
+    let w = width as usize;
+    let cells_per_row = (w / 2).max(1);
+    const MAX_HEAT_ROWS: usize = 4;
+    let max_cells = MAX_HEAT_ROWS * cells_per_row;
+    let mut group_size = 1usize;
+    while n > 0 && n.div_ceil(group_size) > max_cells { group_size *= 2; }
+    let num_cells = if n == 0 { 0 } else { n.div_ceil(group_size) };
+    let heat_rows = if num_cells == 0 { 1 } else {
+        num_cells.div_ceil(cells_per_row).clamp(1, MAX_HEAT_ROWS)
+    };
+    (group_size, heat_rows)
+}
+
+/// Draw the per-thread heat grid — cells of `group_size` threads each, coloured
+/// by cpu% via [`planck_color`] — into `area`. Extracted from [`render_threads`]
+/// so the identical heatmap can be reused by the Fleet detail region.
+fn render_thread_heat(buf: &mut Buffer, area: Rect, samples: &[crate::local::ThreadSample]) {
+    let n = samples.len();
+    let max_cpu = samples.iter()
+        .map(|t| t.cpu_pct).fold(0.0f64, f64::max).max(1e-6);
+    let cells_per_row = ((area.width as usize) / 2).max(1);
+    let (group_size, heat_rows) = heat_layout(n, area.width);
+    let num_cells = if n == 0 { 0 } else { n.div_ceil(group_size) };
+    let cell_cpus: Vec<f64> = (0..num_cells).map(|i| {
+        let start = i * group_size;
+        let end = (start + group_size).min(n);
+        samples[start..end].iter().map(|t| t.cpu_pct).fold(0.0f64, f64::max)
+    }).collect();
+
+    let dim = Style::default().fg(Color::DarkGray);
+    if samples.is_empty() {
+        if area.y < area.bottom() {
+            buf.set_string(area.x, area.y, "  waiting for second sample…", dim);
+        }
+    } else {
+        let mut idx = 0;
+        'outer: for row in 0..heat_rows {
+            let ry = area.y + row as u16;
+            if ry >= area.bottom() { break; }
+            let mut x = area.x;
+            for _ in 0..cells_per_row {
+                if idx >= cell_cpus.len() { break 'outer; }
+                x = buf.set_string(x, ry, "◻ ",
+                    Style::default().fg(planck_color(cell_cpus[idx] / max_cpu)));
+                idx += 1;
+            }
         }
     }
 }
