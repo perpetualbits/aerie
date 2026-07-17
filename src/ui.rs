@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, fleet, Region};
+use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, Region};
 use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
 use mullion::border::{draw_box, render_rim, render_shared, Borders, BorderStyle, CornerStyle, LineWeight};
 use mullion::field::Field;
@@ -1272,7 +1272,7 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     // Spine: flatten places, paint one row each.
     if let Some(spine) = rect_of(SPINE_ID) {
         let theme = Theme::default();
-        let places = fleet::local_places();
+        let places = state.fleet_spine_places();
         for (i, p) in places.iter().enumerate() {
             let row = Rect::new(spine.x, spine.y + i as u16, spine.width, 1);
             if row.y >= spine.y + spine.height { break; }
@@ -1281,10 +1281,12 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         }
     }
 
-    // Primary: the Fleet face's own group table (local entries for now; Task 2
-    // swaps in the selected place's entries once remote places exist).
+    // Primary: the spine-selected place's own group table (local entries in
+    // Local mode; the selected fleet host's latest snapshot entries in Fleet
+    // mode — see `AppState::selected_place_entries`).
     if let Some(primary) = rect_of(PRIMARY_ID) {
-        render_fleet_primary(buf, primary, &state.entries, state.fleet_primary_cursor);
+        let entries = state.selected_place_entries();
+        render_fleet_primary(buf, primary, entries, state.fleet_primary_cursor);
     }
 
     // Detail: the selected group's live per-thread heatmap (monitor lens).
@@ -1307,11 +1309,11 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
 }
 
 /// Dedicated group-table renderer for the Fleet face's primary region. Works on
-/// ANY place's entries (local `state.entries` or, from Task 2 onward, a remote
-/// host's snapshot entries) — a clean label | cpu% | bar | mem% table on the
-/// same mullion primitives `render_body` uses, driven by a single selection
-/// cursor. (The face owns this the way it owns `render_thread_heat` for the
-/// detail region.)
+/// ANY place's entries (local `state.entries` or a remote host's snapshot
+/// entries, via `AppState::selected_place_entries`) — a clean
+/// label | cpu% | bar | mem table on the same mullion primitives `render_body`
+/// uses, driven by a single selection cursor. (The face owns this the way it
+/// owns `render_thread_heat` for the detail region.)
 fn render_fleet_primary(buf: &mut Buffer, area: Rect, entries: &[BarEntry], selected: usize) {
     if area.height == 0 { return; }
     if entries.is_empty() {
@@ -1323,7 +1325,7 @@ fn render_fleet_primary(buf: &mut Buffer, area: Rect, entries: &[BarEntry], sele
         ColumnDef::fixed(label_w, ColumnKind::Text),
         ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // cpu%
         ColumnDef::fill(1, ColumnKind::Bar).with_min(8),                // cpu bar
-        ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // mem%
+        ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // mem (rss, human bytes)
     ]);
     // Scroll window: keep `selected` visible within `area.height` rows.
     let rows = area.height as usize;
@@ -1339,7 +1341,9 @@ fn render_fleet_primary(buf: &mut Buffer, area: Rect, entries: &[BarEntry], sele
         ColumnGrid::write_text(buf, cols[1], y, &format!("{:.1}%", e.value), Align::End, base);
         ColumnGrid::write_bar(buf, cols[2], y, (e.value / 100.0).clamp(0.0, 1.0) as f32,
             '█', Style::default().fg(Color::Green), '░', Style::default().fg(Color::DarkGray), None);
-        ColumnGrid::write_text(buf, cols[3], y, &format!("{:.0}%", e.mem_pct), Align::End, base);
+        // `mem_pct` is Proxmox-only (always 0 for local/remote group entries);
+        // show RSS as a human-readable byte size instead, same as `render_body`.
+        ColumnGrid::write_text(buf, cols[3], y, &human_bytes(e.rss_bytes), Align::End, base);
     }
 }
 

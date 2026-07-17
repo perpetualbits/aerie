@@ -35,9 +35,39 @@ pub fn local_places() -> Vec<Place> {
     vec![Place { key: hostname.clone(), label: hostname, ancestor_last: Vec::new(), is_last: true, expanded: None }]
 }
 
+/// One spine place per fleet host (from `--hosts`). Flat siblings, no local
+/// root for this slice — `local_places` remains the local-mode builder; this
+/// is the fleet-mode builder.
+pub fn fleet_places(hostnames: &[String]) -> Vec<Place> {
+    let n = hostnames.len();
+    hostnames.iter().enumerate().map(|(i, h)| Place {
+        key: h.clone(), label: h.clone(), ancestor_last: Vec::new(),
+        is_last: i + 1 == n, expanded: None,
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_places_one_leaf_per_host() {
+        let hosts = vec!["apollo".to_string(), "milkv".to_string(), "vega".to_string()];
+        let places = fleet_places(&hosts);
+        assert_eq!(places.len(), 3);
+        for (i, p) in places.iter().enumerate() {
+            assert_eq!(p.label, hosts[i]);
+            assert_eq!(p.key, hosts[i]);
+            assert!(p.ancestor_last.is_empty(), "flat siblings have no ancestors");
+            assert_eq!(p.expanded, None, "a leaf host has no expander");
+            assert_eq!(p.is_last, i + 1 == hosts.len());
+        }
+    }
+
+    #[test]
+    fn fleet_places_empty_for_no_hosts() {
+        assert!(fleet_places(&[]).is_empty());
+    }
 
     #[test]
     fn local_places_has_one_leaf_host() {

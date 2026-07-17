@@ -1645,6 +1645,30 @@ impl AppState {
         self.entries.get(self.fleet_primary_cursor).map(|e| e.label.clone())
     }
 
+    /// Spine places for the current mode: the local host in Local mode, or one
+    /// per fleet host in Fleet mode.
+    fn fleet_spine_places(&self) -> Vec<fleet::Place> {
+        if let AppMode::Fleet { .. } = self.mode {
+            fleet::fleet_places(&self.fleet_clients.iter().map(|c| c.hostname.clone()).collect::<Vec<_>>())
+        } else {
+            fleet::local_places()
+        }
+    }
+
+    /// The selected place's group entries: local `entries` in Local mode, else
+    /// the spine-selected fleet host's latest snapshot entries (empty if that
+    /// host has no snapshot yet).
+    fn selected_place_entries(&self) -> &[BarEntry] {
+        if let AppMode::Fleet { .. } = self.mode {
+            self.fleet_clients.get(self.spine_cursor)
+                .and_then(|c| c.snap.as_ref())
+                .map(|s| s.entries.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &self.entries
+        }
+    }
+
     /// Reconcile the body carousel with the current entry list.
     ///
     /// Must be called whenever `self.entries` changes — both from `refresh()` and
@@ -3293,11 +3317,13 @@ fn main() -> Result<()> {
                     KeyCode::Up if matches!(state.view, AppView::Fleet)
                         && state.fleet_region == Region::Spine => {
                         state.spine_cursor = state.spine_cursor.saturating_sub(1);
+                        state.fleet_primary_cursor = 0;
                     }
                     KeyCode::Down if matches!(state.view, AppView::Fleet)
                         && state.fleet_region == Region::Spine => {
-                        let n = fleet::local_places().len();
+                        let n = state.fleet_spine_places().len();
                         if n > 0 { state.spine_cursor = (state.spine_cursor + 1).min(n - 1); }
+                        state.fleet_primary_cursor = 0;
                     }
                     // Navigation: arrow keys (and vim j/k) route through the carousel focus.
                     // Also fires when Fleet's focus is on the Primary region, but there it
@@ -3324,7 +3350,7 @@ fn main() -> Result<()> {
                         } else if matches!(state.view, AppView::Fleet)
                             && state.fleet_region == Region::Primary
                         {
-                            let n = state.entries.len();
+                            let n = state.selected_place_entries().len();
                             if n > 0 {
                                 state.fleet_primary_cursor = (state.fleet_primary_cursor + 1).min(n - 1);
                             }
