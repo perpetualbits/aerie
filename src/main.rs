@@ -2540,6 +2540,7 @@ impl AppState {
 /// the CLI so remote refresh rate matches the parent's setting.
 fn run_daemon(interval: Duration) -> Result<()> {
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
     let total_ram_bytes = local::total_ram_bytes();
     // Enable all metrics so the consumer can show any combination.
     let opts = local::CollectOpts::default();
@@ -2550,10 +2551,56 @@ fn run_daemon(interval: Duration) -> Result<()> {
     let mut prev_cpu_total: Option<u64> = None;
     let mut prev_cpu_idle: Option<u64> = None;
 
+    // Non-blocking stdin focus reader: the remote UI writes a focus-group name
+    // (or a blank line to clear it) on stdin; this thread pushes it into a
+    // shared cell so the emit loop below never blocks waiting on stdin.
+    let focus: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let focus = Arc::clone(&focus);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let g = line.trim();
+                *focus.lock().unwrap() = if g.is_empty() { None } else { Some(g.to_string()) };
+            }
+        });
+    }
+    // Delta basis for focused-thread sampling; reset whenever the requested
+    // focus group changes so cpu% isn't computed across two different groups.
+    let mut prev_focus_snap: Option<local::ThreadSnapshot> = None;
+    let mut prev_focus_label: Option<String> = None;
+
     loop {
         let (mut entries, new_snap) = local::sample(snap, &opts, GroupBy::Comm)?;
-        snap = Some(new_snap);
         snap_count += 1;
+
+        let focus_label = focus.lock().unwrap().clone();
+        // Reset the delta basis when the focused group changes (else cpu% is
+        // computed across two different groups' counters).
+        if prev_focus_label != focus_label {
+            prev_focus_snap = None;
+            prev_focus_label = focus_label.clone();
+        }
+        let focus_threads = match &focus_label {
+            Some(label) => {
+                let pids = new_snap.groups.get(label).map(|g| g.pids.clone()).unwrap_or_default();
+                if pids.is_empty() { None } else {
+                    match local::sample_threads(&pids, prev_focus_snap.take(), &local::ThreadFields::all(), new_snap.total) {
+                        Ok((mut samples, tsnap)) => {
+                            prev_focus_snap = Some(tsnap);
+                            samples.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+                            Some((label.clone(), samples))
+                        }
+                        Err(_) => None,
+                    }
+                }
+            }
+            None => None,
+        };
+
+        snap = Some(new_snap);
 
         let new_sys = local::sample_sys();
         let (rx_s, tx_s, gpu, rapl_w, psi_cpu, psi_mem, psi_io) = if let Some(ref ps) = prev_sys {
@@ -2619,7 +2666,7 @@ fn run_daemon(interval: Duration) -> Result<()> {
             sys_psi_io: psi_io,
             sys_cpu_pct,
             sys_mem_used_bytes,
-            focus_threads: None,
+            focus_threads,
         };
 
         // Emit the snapshot as a single JSON line, then flush immediately so the
