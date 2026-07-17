@@ -1245,8 +1245,9 @@ const DETAIL_ID:  TileId = 12;
 /// `dit.rs` idiom); spine via `mullion::outline::render_tree_row`; primary
 /// reuses the existing `render_body` into its sub-rect. The detail sub-rect
 /// draws the selected group's live per-thread heatmap via `render_thread_heat`,
-/// fed by `fleet_detail_samples` (refreshed each tick for the primary
-/// selection).
+/// fed by `AppState::selected_place_threads` — the local sampler's output in
+/// Local mode, or the spine-selected remote host's streamed `focus_threads` in
+/// Fleet mode.
 fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     if area.width < 20 || area.height < 3 { render_body(buf, area, state); return; }
 
@@ -1289,12 +1290,14 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         render_fleet_primary(buf, primary, entries, state.fleet_primary_cursor);
     }
 
-    // Detail: the selected group's live per-thread heatmap (monitor lens).
+    // Detail: the selected group's live per-thread heatmap (monitor lens) —
+    // local sampler in Local mode, remote focus_threads in Fleet mode.
     if let Some(detail) = rect_of(DETAIL_ID) {
         if detail.height >= 2 {
-            let header = match &state.fleet_detail_label {
+            let (label, samples) = state.selected_place_threads();
+            let header = match label {
                 Some(l) => {
-                    let n = state.fleet_detail_samples.len();
+                    let n = samples.len();
                     let unit = if n == 1 { "thread" } else { "threads" };
                     format!(" {l} · {n} {unit}")
                 }
@@ -1303,7 +1306,7 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
             buf.set_string(detail.x, detail.y, &header.chars().take(detail.width as usize).collect::<String>(),
                 Style::default().fg(Color::Gray));
             let heat = Rect::new(detail.x, detail.y + 1, detail.width, detail.height - 1);
-            render_thread_heat(buf, heat, &state.fleet_detail_samples);
+            render_thread_heat(buf, heat, samples);
         }
     }
 }
