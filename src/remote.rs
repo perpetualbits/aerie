@@ -4,7 +4,7 @@
 // JSON snapshots to stdout. This module handles host discovery, SSH spawn,
 // and the reader thread that feeds a channel consumed by the main event loop.
 
-use crate::{proxmox, BarEntry};
+use crate::{local, proxmox, BarEntry};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,7 +24,7 @@ use std::{
 ///
 /// The `*_complete` fields in each `BarEntry` use `#[serde(default = "default_true")]`
 /// so old daemon versions that lacked these fields decode as fully complete.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DaemonSnapshot {
     /// One entry per active process group on the remote machine.
     pub entries: Vec<BarEntry>,
@@ -57,6 +57,11 @@ pub struct DaemonSnapshot {
     /// 0 when unavailable (old daemon version, or parse failure).
     #[serde(default)]
     pub sys_mem_used_bytes: u64,
+    /// Focused-stream: per-thread samples for ONE group the viewer asked the
+    /// daemon to focus (group label, samples). `None` when no focus is set or
+    /// from an old daemon. `#[serde(default)]` keeps old JSON decoding.
+    #[serde(default)]
+    pub focus_threads: Option<(String, Vec<local::ThreadSample>)>,
 }
 
 /// SSH host-key checking policy.
@@ -91,6 +96,11 @@ pub struct RemoteClient {
     _thread: JoinHandle<()>,
     /// The hostname or IP that `ssh` is connected to (e.g. "10.0.0.5").
     pub host: String,
+    /// Stdin of the remote `aerie --daemon`, for sending focused-stream requests
+    /// (`connect_direct` only; `None` for kube/nomad daemons which keep stdin null).
+    focus_stdin: Option<std::process::ChildStdin>,
+    /// Last focus group sent, to avoid rewriting the same line every tick.
+    last_focus: Option<String>,
 }
 
 impl RemoteClient {
@@ -122,6 +132,23 @@ impl RemoteClient {
     pub fn close(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Ask the remote daemon to focus (stream per-thread data for) `group`, or
+    /// clear focus with `None`. No-op when unchanged or when there is no stdin
+    /// pipe (non-`connect_direct` clients). Best-effort: write errors are ignored
+    /// (a dead pipe surfaces via `is_alive`).
+    pub fn send_focus(&mut self, group: Option<&str>) {
+        let want = group.map(|s| s.to_string());
+        if want == self.last_focus { return; }
+        self.last_focus = want.clone();
+        if let Some(stdin) = self.focus_stdin.as_mut() {
+            use std::io::Write;
+            // Empty line clears focus; a group name sets it (matches the daemon reader).
+            let line = want.unwrap_or_default();
+            let _ = writeln!(stdin, "{line}");
+            let _ = stdin.flush();
+        }
     }
 }
 
@@ -359,12 +386,13 @@ pub fn connect_direct(host: &str, user: &str, policy: SshHostKeyPolicy) -> Resul
             "aerie",
             "--daemon",
         ])
-        .stdin(Stdio::null())   // no input needed from the remote daemon
+        .stdin(Stdio::piped())  // for sending focused-stream requests to the daemon
         .stdout(Stdio::piped()) // we read JSON snapshots from stdout
         .stderr(Stdio::null())  // suppress SSH banners and warnings
         .spawn()
         .map_err(|e| anyhow!("could not run ssh: {e}"))?;
 
+    let focus_stdin = child.stdin.take();
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
     let (tx, rx) = mpsc::channel();
     // Spawn a background thread to read JSON lines from SSH stdout.
@@ -395,7 +423,7 @@ pub fn connect_direct(host: &str, user: &str, policy: SshHostKeyPolicy) -> Resul
         Ok(None) => {} // process is still running — connection looks good
     }
 
-    Ok(RemoteClient { child, recv: rx, _thread: thread, host: host.to_string() })
+    Ok(RemoteClient { child, recv: rx, _thread: thread, host: host.to_string(), focus_stdin, last_focus: None })
 }
 
 /// Parse one block of /proc/stat + /proc/meminfo output from the thin probe.
@@ -485,6 +513,7 @@ fn parse_thin_block(
         sys_psi_io: None,
         sys_cpu_pct,
         sys_mem_used_bytes,
+        focus_threads: None,
     })
 }
 
@@ -612,7 +641,7 @@ pub fn connect_kube_daemon(pod: &str, namespace: &str, context: Option<&str>) ->
             "kubectl exec exited immediately ({status}) — check RBAC and that aerie is in the container image"
         )),
         Err(e) => Err(anyhow!("process error: {e}")),
-        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: pod.to_string() }),
+        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: pod.to_string(), focus_stdin: None, last_focus: None }),
     }
 }
 
@@ -836,7 +865,7 @@ pub fn connect_nomad_daemon(
             "nomad alloc exec exited immediately ({status}) — check ACL token, alloc ID, and that aerie is installed in the task"
         )),
         Err(e) => Err(anyhow!("process error: {e}")),
-        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: alloc_id.to_string() }),
+        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: alloc_id.to_string(), focus_stdin: None, last_focus: None }),
     }
 }
 
@@ -930,6 +959,7 @@ mod tests {
             sys_psi_io: None,
             sys_cpu_pct: Some(42.5),
             sys_mem_used_bytes: 1024 * 1024 * 512,
+            focus_threads: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: DaemonSnapshot = serde_json::from_str(&json).unwrap();
@@ -938,6 +968,18 @@ mod tests {
         assert!(back.entries[0].disk_complete);
         assert_eq!(back.sys_cpu_pct, Some(42.5));
         assert_eq!(back.sys_mem_used_bytes, 1024 * 1024 * 512);
+        // focused-stream: the field round-trips...
+        let mut snap2 = snap.clone();
+        snap2.focus_threads = Some(("nginx".to_string(), vec![local::ThreadSample {
+            pid: 1, tid: 2, name: "nginx".into(), cpu_pct: 3.0, faults_per_s: 0.0,
+            disk_read_s: 0.0, disk_write_s: 0.0, ctx_switches_s: 0.0, sched_wait_pct: 0.0 }]));
+        let j2 = serde_json::to_string(&snap2).unwrap();
+        let back2: DaemonSnapshot = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back2.focus_threads.as_ref().unwrap().0, "nginx");
+        // ...and old JSON without the field decodes as None (backward compat).
+        let old_json = r#"{"entries":[],"total_ram_bytes":0,"snap_count":0,"sys_net_rx_s":0.0,"sys_net_tx_s":0.0,"sys_gpu_pct":null,"sys_rapl_w":0.0}"#;
+        let old: DaemonSnapshot = serde_json::from_str(old_json).unwrap();
+        assert!(old.focus_threads.is_none());
         // suppress unused import warning
         let _ = default_true();
     }
