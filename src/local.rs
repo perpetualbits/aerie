@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{BarEntry, GroupBy, Metric};
 use anyhow::Result;
+use serde::{Serialize, Deserialize};
 use std::{
     collections::HashMap,
     fmt::Write as FmtWrite,
@@ -148,6 +149,7 @@ pub struct ThreadSnapshot {
 }
 
 /// One thread's computed per-second metrics for the thread-detail view.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ThreadSample {
     pub pid: u32,
     pub tid: i32,
@@ -1548,6 +1550,8 @@ pub fn sample_nvidia_pmon() -> HashMap<u32, (f64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use super::ThreadSample;
+
     fn cgroup_key_from_str(s: &str) -> Option<String> {
         // Inline the parsing logic from read_cgroup_key for test purposes
         let path = s.lines()
@@ -1885,5 +1889,17 @@ drm-memory-vram:\t52428800 B\n";
         let (total, idle) = parse_cpu_total_and_idle(content).expect("should parse");
         assert_eq!(total, 1000, "total jiffies");
         assert_eq!(idle, 850, "idle + iowait jiffies");
+    }
+
+    #[test]
+    fn thread_sample_json_round_trip() {
+        let s = ThreadSample { pid: 42, tid: 43, name: "worker".into(),
+            cpu_pct: 12.5, faults_per_s: 1.0, disk_read_s: 2.0, disk_write_s: 3.0,
+            ctx_switches_s: 4.0, sched_wait_pct: 5.5 };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ThreadSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pid, 42);
+        assert_eq!(back.name, "worker");
+        assert!((back.cpu_pct - 12.5).abs() < 1e-9);
     }
 }
