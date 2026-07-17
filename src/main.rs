@@ -1642,7 +1642,7 @@ impl AppState {
     /// region — `fleet_primary_cursor` mapped back to an entry label. `None`
     /// when the cursor is out of range (e.g. no entries yet).
     fn selected_fleet_group_label(&self) -> Option<String> {
-        self.entries.get(self.fleet_primary_cursor).map(|e| e.label.clone())
+        self.selected_place_entries().get(self.fleet_primary_cursor).map(|e| e.label.clone())
     }
 
     /// Spine places for the current mode: the local host in Local mode, or one
@@ -3279,6 +3279,7 @@ fn main() -> Result<()> {
                         } else {
                             state.fleet_region = Region::default();
                             state.spine_cursor = 0;
+                            state.fleet_primary_cursor = 0;
                             AppView::Fleet
                         };
                     }

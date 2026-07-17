@@ -1327,6 +1327,9 @@ fn render_fleet_primary(buf: &mut Buffer, area: Rect, entries: &[BarEntry], sele
         ColumnDef::fill(1, ColumnKind::Bar).with_min(8),                // cpu bar
         ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // mem (rss, human bytes)
     ]);
+    // Clamp a stale/oversized cursor (e.g. from a shrinking async remote
+    // table) so it can't skip past all rows and render blank.
+    let selected = selected.min(entries.len().saturating_sub(1));
     // Scroll window: keep `selected` visible within `area.height` rows.
     let rows = area.height as usize;
     let offset = if selected >= rows { selected + 1 - rows } else { 0 };
