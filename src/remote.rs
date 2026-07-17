@@ -4,7 +4,7 @@
 // JSON snapshots to stdout. This module handles host discovery, SSH spawn,
 // and the reader thread that feeds a channel consumed by the main event loop.
 
-use crate::{proxmox, BarEntry};
+use crate::{local, proxmox, BarEntry};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,7 +24,7 @@ use std::{
 ///
 /// The `*_complete` fields in each `BarEntry` use `#[serde(default = "default_true")]`
 /// so old daemon versions that lacked these fields decode as fully complete.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DaemonSnapshot {
     /// One entry per active process group on the remote machine.
     pub entries: Vec<BarEntry>,
@@ -57,6 +57,11 @@ pub struct DaemonSnapshot {
     /// 0 when unavailable (old daemon version, or parse failure).
     #[serde(default)]
     pub sys_mem_used_bytes: u64,
+    /// Focused-stream: per-thread samples for ONE group the viewer asked the
+    /// daemon to focus (group label, samples). `None` when no focus is set or
+    /// from an old daemon. `#[serde(default)]` keeps old JSON decoding.
+    #[serde(default)]
+    pub focus_threads: Option<(String, Vec<local::ThreadSample>)>,
 }
 
 /// SSH host-key checking policy.
@@ -485,6 +490,7 @@ fn parse_thin_block(
         sys_psi_io: None,
         sys_cpu_pct,
         sys_mem_used_bytes,
+        focus_threads: None,
     })
 }
 
@@ -930,6 +936,7 @@ mod tests {
             sys_psi_io: None,
             sys_cpu_pct: Some(42.5),
             sys_mem_used_bytes: 1024 * 1024 * 512,
+            focus_threads: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: DaemonSnapshot = serde_json::from_str(&json).unwrap();
@@ -938,6 +945,18 @@ mod tests {
         assert!(back.entries[0].disk_complete);
         assert_eq!(back.sys_cpu_pct, Some(42.5));
         assert_eq!(back.sys_mem_used_bytes, 1024 * 1024 * 512);
+        // focused-stream: the field round-trips...
+        let mut snap2 = snap.clone();
+        snap2.focus_threads = Some(("nginx".to_string(), vec![local::ThreadSample {
+            pid: 1, tid: 2, name: "nginx".into(), cpu_pct: 3.0, faults_per_s: 0.0,
+            disk_read_s: 0.0, disk_write_s: 0.0, ctx_switches_s: 0.0, sched_wait_pct: 0.0 }]));
+        let j2 = serde_json::to_string(&snap2).unwrap();
+        let back2: DaemonSnapshot = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back2.focus_threads.as_ref().unwrap().0, "nginx");
+        // ...and old JSON without the field decodes as None (backward compat).
+        let old_json = r#"{"entries":[],"total_ram_bytes":0,"snap_count":0,"sys_net_rx_s":0.0,"sys_net_tx_s":0.0,"sys_gpu_pct":null,"sys_rapl_w":0.0}"#;
+        let old: DaemonSnapshot = serde_json::from_str(old_json).unwrap();
+        assert!(old.focus_threads.is_none());
         // suppress unused import warning
         let _ = default_true();
     }

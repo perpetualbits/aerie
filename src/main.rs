@@ -2619,6 +2619,7 @@ fn run_daemon(interval: Duration) -> Result<()> {
             sys_psi_io: psi_io,
             sys_cpu_pct,
             sys_mem_used_bytes,
+            focus_threads: None,
         };
 
         // Emit the snapshot as a single JSON line, then flush immediately so the
