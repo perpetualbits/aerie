@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, fleet, Region};
+use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, Region};
 use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
 use mullion::border::{draw_box, render_rim, render_shared, Borders, BorderStyle, CornerStyle, LineWeight};
 use mullion::field::Field;
@@ -1272,7 +1272,7 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
     // Spine: flatten places, paint one row each.
     if let Some(spine) = rect_of(SPINE_ID) {
         let theme = Theme::default();
-        let places = fleet::local_places();
+        let places = state.fleet_spine_places();
         for (i, p) in places.iter().enumerate() {
             let row = Rect::new(spine.x, spine.y + i as u16, spine.width, 1);
             if row.y >= spine.y + spine.height { break; }
@@ -1281,8 +1281,13 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         }
     }
 
-    // Primary: the existing group table into its rect.
-    if let Some(primary) = rect_of(PRIMARY_ID) { render_body(buf, primary, state); }
+    // Primary: the spine-selected place's own group table (local entries in
+    // Local mode; the selected fleet host's latest snapshot entries in Fleet
+    // mode — see `AppState::selected_place_entries`).
+    if let Some(primary) = rect_of(PRIMARY_ID) {
+        let entries = state.selected_place_entries();
+        render_fleet_primary(buf, primary, entries, state.fleet_primary_cursor);
+    }
 
     // Detail: the selected group's live per-thread heatmap (monitor lens).
     if let Some(detail) = rect_of(DETAIL_ID) {
@@ -1300,6 +1305,48 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
             let heat = Rect::new(detail.x, detail.y + 1, detail.width, detail.height - 1);
             render_thread_heat(buf, heat, &state.fleet_detail_samples);
         }
+    }
+}
+
+/// Dedicated group-table renderer for the Fleet face's primary region. Works on
+/// ANY place's entries (local `state.entries` or a remote host's snapshot
+/// entries, via `AppState::selected_place_entries`) — a clean
+/// label | cpu% | bar | mem table on the same mullion primitives `render_body`
+/// uses, driven by a single selection cursor. (The face owns this the way it
+/// owns `render_thread_heat` for the detail region.)
+fn render_fleet_primary(buf: &mut Buffer, area: Rect, entries: &[BarEntry], selected: usize) {
+    if area.height == 0 { return; }
+    if entries.is_empty() {
+        buf.set_string(area.x, area.y, "(no data yet)", Style::default().fg(Color::DarkGray));
+        return;
+    }
+    let label_w = entries.iter().map(|e| e.label.len()).max().unwrap_or(8).clamp(8, 28) as u16;
+    let grid = ColumnGrid::new(vec![
+        ColumnDef::fixed(label_w, ColumnKind::Text),
+        ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // cpu%
+        ColumnDef::fill(1, ColumnKind::Bar).with_min(8),                // cpu bar
+        ColumnDef::fixed(7, ColumnKind::Text).with_align(Align::End),   // mem (rss, human bytes)
+    ]);
+    // Clamp a stale/oversized cursor (e.g. from a shrinking async remote
+    // table) so it can't skip past all rows and render blank.
+    let selected = selected.min(entries.len().saturating_sub(1));
+    // Scroll window: keep `selected` visible within `area.height` rows.
+    let rows = area.height as usize;
+    let offset = if selected >= rows { selected + 1 - rows } else { 0 };
+    for (row_i, e) in entries.iter().enumerate().skip(offset).take(rows) {
+        let y = area.y + (row_i - offset) as u16;
+        let cols = grid.resolve(Rect::new(area.x, y, area.width, 1));
+        let is_sel = row_i == selected;
+        let base = if is_sel { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default() };
+        // Selection highlight spans the whole row.
+        if is_sel { buf.set_string(area.x, y, &" ".repeat(area.width as usize), base); }
+        ColumnGrid::write_text(buf, cols[0], y, &e.label, Align::Start, base);
+        ColumnGrid::write_text(buf, cols[1], y, &format!("{:.1}%", e.value), Align::End, base);
+        ColumnGrid::write_bar(buf, cols[2], y, (e.value / 100.0).clamp(0.0, 1.0) as f32,
+            '█', Style::default().fg(Color::Green), '░', Style::default().fg(Color::DarkGray), None);
+        // `mem_pct` is Proxmox-only (always 0 for local/remote group entries);
+        // show RSS as a human-readable byte size instead, same as `render_body`.
+        ColumnGrid::write_text(buf, cols[3], y, &human_bytes(e.rss_bytes), Align::End, base);
     }
 }
 
