@@ -826,6 +826,18 @@ fn fleet_conn_for_label<'a>(label: &str, conns: &'a [FleetConn]) -> Option<&'a F
     conns.iter().find(|c| c.hostname == label)
 }
 
+/// Kube analogue of [`fleet_conn_for_label`]: match by pod name, since the kube
+/// row label is `conn.pod_name`. Same position-vs-sort-order bug otherwise.
+fn kube_conn_for_label<'a>(label: &str, conns: &'a [KubeConn]) -> Option<&'a KubeConn> {
+    conns.iter().find(|c| c.pod_name == label)
+}
+
+/// Nomad analogue of [`fleet_conn_for_label`]: the nomad row label is
+/// `"{job_id}[{alloc_short}]"`, so reconstruct and match that.
+fn nomad_conn_for_label<'a>(label: &str, conns: &'a [NomadConn]) -> Option<&'a NomadConn> {
+    conns.iter().find(|c| format!("{}[{}]", c.job_id, c.alloc_short) == label)
+}
+
 /// One Kubernetes pod connection in --kube mode.
 ///
 /// Analogous to `FleetConn` but keyed by pod name. The `app_label` field groups
@@ -1655,6 +1667,21 @@ impl AppState {
         let idx = self.focused_entry_idx()?;
         let label = self.entries.get(idx)?.label.as_str();
         fleet_conn_for_label(label, &self.fleet_clients)
+    }
+
+    /// The `KubeConn` for the selected pod row — matched by pod name, not position.
+    fn selected_kube_conn(&self) -> Option<&KubeConn> {
+        let idx = self.focused_entry_idx()?;
+        let label = self.entries.get(idx)?.label.as_str();
+        kube_conn_for_label(label, &self.kube_conns)
+    }
+
+    /// The `NomadConn` for the selected allocation row — matched by the
+    /// `"{job_id}[{alloc_short}]"` row label, not position.
+    fn selected_nomad_conn(&self) -> Option<&NomadConn> {
+        let idx = self.focused_entry_idx()?;
+        let label = self.entries.get(idx)?.label.as_str();
+        nomad_conn_for_label(label, &self.nomad_conns)
     }
 
     /// The comm-label of the group currently selected in the Fleet primary
@@ -3480,13 +3507,14 @@ fn main() -> Result<()> {
                     KeyCode::Enter => {
                         if matches!(state.view, AppView::Groups) {
                             if matches!(state.mode, AppMode::Nomad { .. }) {
-                                if let Some(conn) = state.focused_entry_idx().and_then(|i| state.nomad_conns.get(i)) {
+                                if let Some(conn) = state.selected_nomad_conn() {
                                     if conn.thin {
                                         state.error = Some(
                                             "thin probe mode — no per-process drill-down; remove --nomad-thin to enable".into()
                                         );
                                     } else if conn.client.is_none() {
-                                        state.error = Some(format!("not connected to alloc {}", conn.alloc_short));
+                                        state.error = Some(conn.err.clone()
+                                            .unwrap_or_else(|| format!("not connected to alloc {}", conn.alloc_short)));
                                     } else {
                                         let alloc_id = conn.alloc_id.clone();
                                         let task = conn.task_name.clone();
@@ -3520,13 +3548,14 @@ fn main() -> Result<()> {
                                 }
                             } else if matches!(state.mode, AppMode::Kube { .. }) {
                                 // Kube drill-down: connect to the selected pod for per-process detail.
-                                if let Some(conn) = state.focused_entry_idx().and_then(|i| state.kube_conns.get(i)) {
+                                if let Some(conn) = state.selected_kube_conn() {
                                     if conn.thin {
                                         state.error = Some(
                                             "thin probe mode — no per-process drill-down; remove --kube-thin to enable".into()
                                         );
                                     } else if conn.client.is_none() {
-                                        state.error = Some(format!("not connected to pod {}", conn.pod_name));
+                                        state.error = Some(conn.err.clone()
+                                            .unwrap_or_else(|| format!("not connected to pod {}", conn.pod_name)));
                                     } else {
                                         let pod = conn.pod_name.clone();
                                         // Extract namespace and context from the current AppMode.
@@ -3778,10 +3807,33 @@ mod tests {
 
 #[cfg(test)]
 mod fleet_tests {
-    use super::{Region, FleetConn, fleet_conn_for_label};
+    use super::{Region, FleetConn, KubeConn, NomadConn,
+        fleet_conn_for_label, kube_conn_for_label, nomad_conn_for_label};
 
     fn conn(hostname: &str) -> FleetConn {
         FleetConn { hostname: hostname.into(), client: None, snap: None, err: None, thin: false }
+    }
+
+    #[test]
+    fn kube_conn_matched_by_pod_name() {
+        let conns = vec![
+            KubeConn { pod_name: "web-0".into(), app_label: "web".into(), client: None, snap: None, err: None, thin: false },
+            KubeConn { pod_name: "db-0".into(),  app_label: "db".into(),  client: None, snap: None, err: None, thin: false },
+        ];
+        assert_eq!(kube_conn_for_label("db-0", &conns).map(|c| c.pod_name.as_str()), Some("db-0"));
+        assert!(kube_conn_for_label("nope", &conns).is_none());
+    }
+
+    #[test]
+    fn nomad_conn_matched_by_job_alloc_label() {
+        let mk = |job: &str, short: &str| NomadConn {
+            alloc_id: format!("{short}-full"), alloc_short: short.into(), task_name: "t".into(),
+            job_id: job.into(), task_group: "g".into(), client: None, snap: None, err: None, thin: false,
+        };
+        let conns = vec![mk("api", "aaaa1111"), mk("worker", "bbbb2222")];
+        // The row label is "{job_id}[{alloc_short}]".
+        assert_eq!(nomad_conn_for_label("worker[bbbb2222]", &conns).map(|c| c.job_id.as_str()), Some("worker"));
+        assert!(nomad_conn_for_label("api[wrong]", &conns).is_none());
     }
 
     #[test]
