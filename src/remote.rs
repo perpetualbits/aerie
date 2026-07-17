@@ -96,6 +96,11 @@ pub struct RemoteClient {
     _thread: JoinHandle<()>,
     /// The hostname or IP that `ssh` is connected to (e.g. "10.0.0.5").
     pub host: String,
+    /// Stdin of the remote `aerie --daemon`, for sending focused-stream requests
+    /// (`connect_direct` only; `None` for kube/nomad daemons which keep stdin null).
+    focus_stdin: Option<std::process::ChildStdin>,
+    /// Last focus group sent, to avoid rewriting the same line every tick.
+    last_focus: Option<String>,
 }
 
 impl RemoteClient {
@@ -127,6 +132,23 @@ impl RemoteClient {
     pub fn close(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Ask the remote daemon to focus (stream per-thread data for) `group`, or
+    /// clear focus with `None`. No-op when unchanged or when there is no stdin
+    /// pipe (non-`connect_direct` clients). Best-effort: write errors are ignored
+    /// (a dead pipe surfaces via `is_alive`).
+    pub fn send_focus(&mut self, group: Option<&str>) {
+        let want = group.map(|s| s.to_string());
+        if want == self.last_focus { return; }
+        self.last_focus = want.clone();
+        if let Some(stdin) = self.focus_stdin.as_mut() {
+            use std::io::Write;
+            // Empty line clears focus; a group name sets it (matches the daemon reader).
+            let line = want.unwrap_or_default();
+            let _ = writeln!(stdin, "{line}");
+            let _ = stdin.flush();
+        }
     }
 }
 
@@ -364,12 +386,13 @@ pub fn connect_direct(host: &str, user: &str, policy: SshHostKeyPolicy) -> Resul
             "aerie",
             "--daemon",
         ])
-        .stdin(Stdio::null())   // no input needed from the remote daemon
+        .stdin(Stdio::piped())  // for sending focused-stream requests to the daemon
         .stdout(Stdio::piped()) // we read JSON snapshots from stdout
         .stderr(Stdio::null())  // suppress SSH banners and warnings
         .spawn()
         .map_err(|e| anyhow!("could not run ssh: {e}"))?;
 
+    let focus_stdin = child.stdin.take();
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout pipe"))?;
     let (tx, rx) = mpsc::channel();
     // Spawn a background thread to read JSON lines from SSH stdout.
@@ -400,7 +423,7 @@ pub fn connect_direct(host: &str, user: &str, policy: SshHostKeyPolicy) -> Resul
         Ok(None) => {} // process is still running — connection looks good
     }
 
-    Ok(RemoteClient { child, recv: rx, _thread: thread, host: host.to_string() })
+    Ok(RemoteClient { child, recv: rx, _thread: thread, host: host.to_string(), focus_stdin, last_focus: None })
 }
 
 /// Parse one block of /proc/stat + /proc/meminfo output from the thin probe.
@@ -618,7 +641,7 @@ pub fn connect_kube_daemon(pod: &str, namespace: &str, context: Option<&str>) ->
             "kubectl exec exited immediately ({status}) — check RBAC and that aerie is in the container image"
         )),
         Err(e) => Err(anyhow!("process error: {e}")),
-        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: pod.to_string() }),
+        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: pod.to_string(), focus_stdin: None, last_focus: None }),
     }
 }
 
@@ -842,7 +865,7 @@ pub fn connect_nomad_daemon(
             "nomad alloc exec exited immediately ({status}) — check ACL token, alloc ID, and that aerie is installed in the task"
         )),
         Err(e) => Err(anyhow!("process error: {e}")),
-        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: alloc_id.to_string() }),
+        Ok(None) => Ok(RemoteClient { child, recv: rx, _thread: thread, host: alloc_id.to_string(), focus_stdin: None, last_focus: None }),
     }
 }
 
