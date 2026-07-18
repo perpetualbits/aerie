@@ -815,6 +815,11 @@ pub struct FleetConn {
     pub err: Option<String>,
     /// Whether this connection uses thin probe (affects drill-down availability).
     pub thin: bool,
+    /// Per-host running order of group labels, so the primary rows don't hop as
+    /// the daemon re-sorts its entries each tick. Applied to each incoming
+    /// snapshot via [`stabilize_fleet_entries`] (the remote analogue of the
+    /// local `stable_order`).
+    pub stable_order: Vec<String>,
 }
 
 /// Find the `FleetConn` whose hostname matches `label`. Fleet host rows must be
@@ -857,6 +862,35 @@ fn resolve_fleet_primary(
             Some((idx, Some(labels[idx].to_string())))
         }
     }
+}
+
+/// Reorder a remote host's freshly-received group entries into a STABLE order so
+/// the primary rows don't hop as the daemon re-sorts its output each tick.
+/// Mirrors the local `stable_order` discipline in [`AppState::refresh`]: labels
+/// already in `order` keep their position; labels that vanished are dropped; and
+/// newly-appeared labels are sorted by CPU% (`value`) descending and appended,
+/// so newcomers enter in a sensible spot without disturbing established rows.
+/// `order` is the per-[`FleetConn`] running order, updated in place. Unlike local
+/// mode there is no fade/retention window — remote snapshots are transient and
+/// the daemon owns group membership.
+fn stabilize_fleet_entries(order: &mut Vec<String>, entries: Vec<BarEntry>) -> Vec<BarEntry> {
+    let mut map: HashMap<String, BarEntry> =
+        entries.into_iter().map(|e| (e.label.clone(), e)).collect();
+    // Keep established labels in place; drop those no longer present.
+    order.retain(|label| map.contains_key(label));
+    // Append newcomers (present but not yet ordered), CPU%-desc for a sane entry.
+    let existing: std::collections::HashSet<&str> = order.iter().map(String::as_str).collect();
+    let mut newcomers: Vec<&String> =
+        map.keys().filter(|k| !existing.contains(k.as_str())).collect();
+    newcomers.sort_by(|a, b| {
+        let va = map.get(*a).map(|e| e.value).unwrap_or(0.0);
+        let vb = map.get(*b).map(|e| e.value).unwrap_or(0.0);
+        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let newcomers: Vec<String> = newcomers.into_iter().cloned().collect();
+    order.extend(newcomers);
+    // Rebuild the entries in the stabilized order.
+    order.iter().filter_map(|label| map.remove(label)).collect()
 }
 
 /// One Kubernetes pod connection in --kube mode.
@@ -1487,6 +1521,7 @@ impl AppState {
                         snap: None,
                         err: None,
                         thin: thin_flag,
+                        stable_order: vec![],
                     },
                     Err(e) => FleetConn {
                         hostname,
@@ -1494,6 +1529,7 @@ impl AppState {
                         snap: None,
                         err: Some(e.to_string()),
                         thin: thin_flag,
+                        stable_order: vec![],
                     },
                 }
             }).collect()
@@ -2025,7 +2061,10 @@ impl AppState {
                     Some(FleetClient::Thin(t))   => t.try_recv(),
                     None => None,
                 };
-                if let Some(snap) = new_snap {
+                if let Some(mut snap) = new_snap {
+                    // Stabilize the row order per host so the primary list (and
+                    // the label-pinned cursor) don't hop as the daemon re-sorts.
+                    snap.entries = stabilize_fleet_entries(&mut conn.stable_order, snap.entries);
                     conn.snap = Some(snap);
                     conn.err = None;
                 }
@@ -3920,12 +3959,13 @@ mod tests {
 
 #[cfg(test)]
 mod fleet_tests {
-    use super::{Region, FleetConn, KubeConn, NomadConn,
+    use super::{Region, FleetConn, KubeConn, NomadConn, BarEntry,
         fleet_conn_for_label, kube_conn_for_label, nomad_conn_for_label,
-        resolve_fleet_primary};
+        resolve_fleet_primary, stabilize_fleet_entries};
 
     fn conn(hostname: &str) -> FleetConn {
-        FleetConn { hostname: hostname.into(), client: None, snap: None, err: None, thin: false }
+        FleetConn { hostname: hostname.into(), client: None, snap: None, err: None, thin: false,
+            stable_order: vec![] }
     }
 
     #[test]
@@ -4019,5 +4059,33 @@ mod fleet_tests {
     fn fleet_primary_none_on_empty_entries() {
         // No entries yet: caller leaves the cursor at 0 and keeps the label.
         assert!(resolve_fleet_primary(&[], Some("beta"), 3).is_none());
+    }
+
+    // Build BarEntries carrying only the fields stabilize_fleet_entries reads.
+    fn entries(pairs: &[(&str, f64)]) -> Vec<BarEntry> {
+        pairs.iter().map(|(l, v)| BarEntry { label: l.to_string(), value: *v,
+            ..Default::default() }).collect()
+    }
+    fn labels(es: &[BarEntry]) -> Vec<&str> { es.iter().map(|e| e.label.as_str()).collect() }
+
+    #[test]
+    fn fleet_entries_keep_order_across_resort() {
+        let mut order: Vec<String> = vec![];
+        // First snapshot: newcomers sorted CPU-desc establish the order.
+        let out = stabilize_fleet_entries(&mut order, entries(&[("b", 1.0), ("a", 5.0), ("c", 3.0)]));
+        assert_eq!(labels(&out), ["a", "c", "b"]);
+        assert_eq!(order, ["a", "c", "b"]);
+        // Daemon re-sorts wildly next tick; established rows keep their positions.
+        let out2 = stabilize_fleet_entries(&mut order, entries(&[("c", 9.0), ("a", 0.1), ("b", 4.0)]));
+        assert_eq!(labels(&out2), ["a", "c", "b"], "no hop despite the re-sort");
+    }
+
+    #[test]
+    fn fleet_entries_drop_gone_and_append_new() {
+        let mut order: Vec<String> = vec!["a".into(), "b".into()];
+        // 'b' vanished; 'c' and 'd' are new → appended CPU-desc (c=7 before d=2).
+        let out = stabilize_fleet_entries(&mut order, entries(&[("a", 1.0), ("d", 2.0), ("c", 7.0)]));
+        assert_eq!(labels(&out), ["a", "c", "d"]);
+        assert_eq!(order, ["a", "c", "d"]);
     }
 }
