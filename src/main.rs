@@ -838,6 +838,27 @@ fn nomad_conn_for_label<'a>(label: &str, conns: &'a [NomadConn]) -> Option<&'a N
     conns.iter().find(|c| format!("{}[{}]", c.job_id, c.alloc_short) == label)
 }
 
+/// Pure core of [`AppState::sync_fleet_primary_to_label`]. Given the current
+/// entry `labels`, the persisted focus `label`, and the current `cursor`,
+/// return `(index_to_use, label_to_adopt)`:
+/// - `label` still present  → its current index, nothing to adopt.
+/// - `label` unset/missing  → the cursor clamped to the entries, and the label
+///   at that clamped position to adopt as the new focus.
+/// Returns `None` when there are no entries (leave the cursor at 0, keep the
+/// label so it can be re-pinned when data returns).
+fn resolve_fleet_primary(
+    labels: &[&str], label: Option<&str>, cursor: usize,
+) -> Option<(usize, Option<String>)> {
+    if labels.is_empty() { return None; }
+    match label.and_then(|l| labels.iter().position(|x| *x == l)) {
+        Some(idx) => Some((idx, None)),
+        None => {
+            let idx = cursor.min(labels.len() - 1);
+            Some((idx, Some(labels[idx].to_string())))
+        }
+    }
+}
+
 /// One Kubernetes pod connection in --kube mode.
 ///
 /// Analogous to `FleetConn` but keyed by pod name. The `app_label` field groups
@@ -955,7 +976,17 @@ pub struct AppState {
     pub spine_cursor: usize,
     /// Selected row in the Fleet face's primary group table (index into the
     /// selected place's entries). Reset to 0 when the selected place changes.
+    /// NB: this is a derived, per-frame value — the *source of truth* for the
+    /// selection is `fleet_primary_label`. Remote snapshots aren't
+    /// order-stabilized, so entries re-sort each tick; the cursor is re-pinned
+    /// to the label's current position each refresh (`sync_fleet_primary_to_label`).
     pub fleet_primary_cursor: usize,
+    /// The comm-label of the group focused in the Fleet primary region — the
+    /// stable identity the cursor tracks across entry re-sorts. `None` until a
+    /// group is selected (then adopted from the cursor on the next refresh).
+    /// Keeping focus pinned by label (not index) stops the remote thread detail
+    /// from restarting its per-thread warm-up every tick.
+    pub fleet_primary_label: Option<String>,
     // ── thread detail ────────────────────────────────────────────────────
     /// Previous per-thread snapshot for CPU delta computation in thread view.
     pub thread_snap: Option<local::ThreadSnapshot>,
@@ -1596,6 +1627,7 @@ impl AppState {
             fleet_region: Region::default(),
             spine_cursor: 0,
             fleet_primary_cursor: 0,
+            fleet_primary_label: None,
             group_snaps: HashMap::new(),
             group_member_vals: HashMap::new(),
             last_hist_sample: None,
@@ -1686,9 +1718,41 @@ impl AppState {
 
     /// The comm-label of the group currently selected in the Fleet primary
     /// region — `fleet_primary_cursor` mapped back to an entry label. `None`
-    /// when the cursor is out of range (e.g. no entries yet).
+    /// when the cursor is out of range (e.g. no entries yet). Callers that
+    /// drive per-thread focus (`send_focus`, the local sampler) rely on this
+    /// being stable across entry re-sorts; `sync_fleet_primary_to_label` keeps
+    /// the cursor pinned to `fleet_primary_label` so it is.
     fn selected_fleet_group_label(&self) -> Option<String> {
         self.selected_place_entries().get(self.fleet_primary_cursor).map(|e| e.label.clone())
+    }
+
+    /// Record the current Fleet-primary cursor position as the focused group
+    /// label (the identity the cursor tracks across re-sorts). Call after any
+    /// user cursor move so the newly-selected group becomes the pinned one.
+    fn set_fleet_primary_label_from_cursor(&mut self) {
+        self.fleet_primary_label = self.selected_place_entries()
+            .get(self.fleet_primary_cursor)
+            .map(|e| e.label.clone());
+    }
+
+    /// Re-pin `fleet_primary_cursor` to `fleet_primary_label`'s current index
+    /// in the (possibly just-resorted) entries, so the Fleet-primary selection
+    /// follows its group by identity rather than by position. If the label is
+    /// unset or its group has vanished, clamp the cursor to the entries and
+    /// adopt whatever it now points at. This is what keeps the focus target —
+    /// and hence the remote per-thread stream — stable across ticks.
+    fn sync_fleet_primary_to_label(&mut self) {
+        let labels: Vec<&str> =
+            self.selected_place_entries().iter().map(|e| e.label.as_str()).collect();
+        match resolve_fleet_primary(
+            &labels, self.fleet_primary_label.as_deref(), self.fleet_primary_cursor)
+        {
+            None => self.fleet_primary_cursor = 0,
+            Some((idx, adopt)) => {
+                self.fleet_primary_cursor = idx;
+                if let Some(lbl) = adopt { self.fleet_primary_label = Some(lbl); }
+            }
+        }
     }
 
     /// Spine places for the current mode: the local host in Local mode, or one
@@ -1975,6 +2039,13 @@ impl AppState {
                     conn.err = Some("connection lost".into());
                 }
             }
+            // Pin the primary selection to its group by LABEL before routing
+            // focus: remote snapshots aren't order-stabilized, so entries
+            // re-sort each tick and a fixed index would drift to a different
+            // group — changing the focus target every tick and restarting the
+            // daemon's per-thread warm-up (the "waiting for second sample"
+            // flicker). Re-deriving the cursor from the label keeps it stable.
+            self.sync_fleet_primary_to_label();
             // Focused-stream routing (Slice C): tell the spine-selected remote
             // daemon which group to stream per-thread data for; tell the others
             // to stop. `send_focus` dedups, so this is cheap every tick, and it
@@ -3355,6 +3426,9 @@ fn main() -> Result<()> {
                             state.fleet_region = Region::default();
                             state.spine_cursor = 0;
                             state.fleet_primary_cursor = 0;
+                            // Drop any stale pin; the first group is adopted on
+                            // the next refresh (sync_fleet_primary_to_label).
+                            state.fleet_primary_label = None;
                             AppView::Fleet
                         };
                     }
@@ -3394,12 +3468,16 @@ fn main() -> Result<()> {
                         && state.fleet_region == Region::Spine => {
                         state.spine_cursor = state.spine_cursor.saturating_sub(1);
                         state.fleet_primary_cursor = 0;
+                        // New place → drop the pin; next refresh adopts its first group.
+                        state.fleet_primary_label = None;
                     }
                     KeyCode::Down if matches!(state.view, AppView::Fleet)
                         && state.fleet_region == Region::Spine => {
                         let n = state.fleet_spine_places().len();
                         if n > 0 { state.spine_cursor = (state.spine_cursor + 1).min(n - 1); }
                         state.fleet_primary_cursor = 0;
+                        // New place → drop the pin; next refresh adopts its first group.
+                        state.fleet_primary_label = None;
                     }
                     // Navigation: arrow keys (and vim j/k) route through the carousel focus.
                     // Also fires when Fleet's focus is on the Primary region, but there it
@@ -3414,6 +3492,9 @@ fn main() -> Result<()> {
                             && state.fleet_region == Region::Primary
                         {
                             state.fleet_primary_cursor = state.fleet_primary_cursor.saturating_sub(1);
+                            // Pin the newly-selected group so the cursor tracks
+                            // it by identity across the next re-sort.
+                            state.set_fleet_primary_label_from_cursor();
                         } else if matches!(state.view, AppView::Manual) {
                             state.manual_scroll = state.manual_scroll.saturating_sub(1);
                         }
@@ -3430,6 +3511,9 @@ fn main() -> Result<()> {
                             if n > 0 {
                                 state.fleet_primary_cursor = (state.fleet_primary_cursor + 1).min(n - 1);
                             }
+                            // Pin the newly-selected group so the cursor tracks
+                            // it by identity across the next re-sort.
+                            state.set_fleet_primary_label_from_cursor();
                         } else if matches!(state.view, AppView::Manual) {
                             let max_scroll = ui::manual_line_count()
                                 .saturating_sub(state.last_body_height);
@@ -3837,7 +3921,8 @@ mod tests {
 #[cfg(test)]
 mod fleet_tests {
     use super::{Region, FleetConn, KubeConn, NomadConn,
-        fleet_conn_for_label, kube_conn_for_label, nomad_conn_for_label};
+        fleet_conn_for_label, kube_conn_for_label, nomad_conn_for_label,
+        resolve_fleet_primary};
 
     fn conn(hostname: &str) -> FleetConn {
         FleetConn { hostname: hostname.into(), client: None, snap: None, err: None, thin: false }
@@ -3903,5 +3988,36 @@ mod fleet_tests {
         let cursor = 5usize;
         let found = labels.get(cursor).map(|l| l.to_string());
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn fleet_primary_follows_label_across_resort() {
+        // Focus "beta" (index 1); resolve adopts the label at the cursor.
+        let before = ["alpha", "beta", "gamma"];
+        let (idx, adopt) = resolve_fleet_primary(&before, None, 1).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(adopt.as_deref(), Some("beta"));
+        // Entries re-sort so "beta" moves to index 2. Label-tracking follows it.
+        let after = ["gamma", "alpha", "beta"];
+        let (idx2, adopt2) = resolve_fleet_primary(&after, Some("beta"), 1).unwrap();
+        assert_eq!(idx2, 2, "cursor follows 'beta' to its new position");
+        assert_eq!(adopt2, None, "label already valid — nothing to re-adopt");
+        // A fixed index 1 would now point at 'alpha' — the drift that flickered.
+        assert_eq!(after[1], "alpha");
+    }
+
+    #[test]
+    fn fleet_primary_readopts_when_label_missing() {
+        // The focused group vanished: clamp the cursor and adopt what it hits.
+        let entries = ["alpha", "beta"];
+        let (idx, adopt) = resolve_fleet_primary(&entries, Some("gamma"), 5).unwrap();
+        assert_eq!(idx, 1, "cursor clamped to the last entry");
+        assert_eq!(adopt.as_deref(), Some("beta"), "re-adopted the clamped group");
+    }
+
+    #[test]
+    fn fleet_primary_none_on_empty_entries() {
+        // No entries yet: caller leaves the cursor at 0 and keeps the label.
+        assert!(resolve_fleet_primary(&[], Some("beta"), 3).is_none());
     }
 }
