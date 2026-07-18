@@ -1899,7 +1899,6 @@ impl AppState {
 
     /// The cached coarse health tier for a spine place (updated each refresh in
     /// `refresh`). `Calm` when the place is unknown or has no data yet.
-    #[allow(dead_code)]
     fn place_health_tier(&self, place_label: &str) -> HealthTier {
         self.health_tiers.get(place_label).copied().unwrap_or_default()
     }
