@@ -904,29 +904,20 @@ pub enum HealthTier {
 }
 
 // PSI "some avg10" thresholds (balanced). On = escalate; Off = clear (hysteresis).
-#[allow(dead_code)]
 const PSI_WARN_ON: f64 = 25.0;
-#[allow(dead_code)]
 const PSI_WARN_OFF: f64 = 15.0;
-#[allow(dead_code)]
 const PSI_CRIT_ON: f64 = 50.0;
-#[allow(dead_code)]
 const PSI_CRIT_OFF: f64 = 40.0;
 // CPU% fallback thresholds (used only when no PSI is available).
-#[allow(dead_code)]
 const CPU_WARN_ON: f64 = 85.0;
-#[allow(dead_code)]
 const CPU_WARN_OFF: f64 = 78.0;
-#[allow(dead_code)]
 const CPU_CRIT_ON: f64 = 97.0;
-#[allow(dead_code)]
 const CPU_CRIT_OFF: f64 = 93.0;
 
 /// Map one signal value `v` through on/off thresholds with hysteresis against
 /// `prev`: escalate immediately when `v` crosses an *on* threshold, but only
 /// de-escalate once `v` falls below the (lower) *off* threshold — so a value
 /// hovering at a boundary does not strobe the tier.
-#[allow(dead_code)]
 fn stepped_tier(prev: HealthTier, v: f64,
     warn_on: f64, warn_off: f64, crit_on: f64, crit_off: f64) -> HealthTier {
     if v >= crit_on {
@@ -946,7 +937,6 @@ fn stepped_tier(prev: HealthTier, v: f64,
 /// signals if any is known, else the CPU% fallback, else `Calm`. Hysteresis is
 /// applied against `prev`. (CPU fallback exists for remote snapshots from older
 /// daemons that predate the PSI fields; a modern host reports PSI.)
-#[allow(dead_code)]
 fn place_health(prev: HealthTier,
     psi_cpu: Option<f64>, psi_mem: Option<f64>, psi_io: Option<f64>,
     cpu_pct: Option<f64>) -> HealthTier {
@@ -1227,6 +1217,10 @@ pub struct AppState {
     /// In the scope view: `true` shows the detection verdict, `false` the live
     /// observation traces. Toggled with Tab; set by `--stutter` at launch.
     pub scope_detect: bool,
+    /// Coarse health tier per spine place, keyed by place label (hostname).
+    /// Rebuilt each refresh with hysteresis carried from the prior tick. Drives
+    /// the spine's health gutter glyph (see `place_health`).
+    pub health_tiers: HashMap<String, HealthTier>,
 }
 
 /// Parse the --hosts argument into a validated list of hostnames.
@@ -1778,6 +1772,7 @@ impl AppState {
             last_offender_analysis: None,
             stutter_shape: None,
             scope_detect: false,
+            health_tiers: HashMap::new(),
             offender_report: None,
             body_tree: Some(Tree::new(Node::Carousel {
                 id: ui::BODY_ID,
@@ -1881,6 +1876,32 @@ impl AppState {
         } else {
             &self.entries
         }
+    }
+
+    /// The (psi_cpu, psi_mem, psi_io, cpu_pct) signals for a spine place by
+    /// label: the remote host's latest snapshot in Fleet mode, or this machine's
+    /// own metrics in Local mode. The local place uses PSI only — a live local
+    /// kernel always reports PSI, and the CPU fallback exists for old remote
+    /// daemons, so `None` cpu% here just means "rely on local PSI".
+    fn place_signals(&self, place_label: &str)
+        -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+        if let AppMode::Fleet { .. } = self.mode {
+            if let Some(snap) = fleet_conn_for_label(place_label, &self.fleet_clients)
+                .and_then(|c| c.snap.as_ref())
+            {
+                return (snap.sys_psi_cpu, snap.sys_psi_mem, snap.sys_psi_io, snap.sys_cpu_pct);
+            }
+            (None, None, None, None)
+        } else {
+            (self.sys_psi_cpu, self.sys_psi_mem, self.sys_psi_io, None)
+        }
+    }
+
+    /// The cached coarse health tier for a spine place (updated each refresh in
+    /// `refresh`). `Calm` when the place is unknown or has no data yet.
+    #[allow(dead_code)]
+    fn place_health_tier(&self, place_label: &str) -> HealthTier {
+        self.health_tiers.get(place_label).copied().unwrap_or_default()
     }
 
     /// The (group label, per-thread samples) for the Fleet detail of the
@@ -2716,6 +2737,18 @@ impl AppState {
         }
         // Compute anomalies from the current group_member_vals.
         self.compute_anomalies();
+
+        // Refresh coarse per-place health for the spine gutter. Rebuild the map
+        // from the current places (dropping departed hosts), carrying each
+        // place's previous tier so `place_health` can apply hysteresis.
+        let places = self.fleet_spine_places();
+        let mut next: HashMap<String, HealthTier> = HashMap::with_capacity(places.len());
+        for p in &places {
+            let prev = self.health_tiers.get(&p.label).copied().unwrap_or_default();
+            let (pc, pm, pio, cpu) = self.place_signals(&p.label);
+            next.insert(p.label.clone(), place_health(prev, pc, pm, pio, cpu));
+        }
+        self.health_tiers = next;
     }
 
     /// Compute per-group N_eff concentration and update anomaly_states.
