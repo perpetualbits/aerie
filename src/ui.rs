@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{AppMode, AppState, AppView, BarEntry, KubeConn, NomadConn, Metric, PeakVals, Side, AnomalyState, Region};
+use crate::HealthTier;
 use mullion::{Buffer, BorderGap, Rect, gaussian, tree::id_from_key};
 use mullion::border::{draw_box, render_rim, render_shared, Borders, BorderStyle, CornerStyle, LineWeight};
 use mullion::field::Field;
 use mullion::layout::{TileId, Node, Orientation, Constraint, Size};
 use mullion::label::Align;
-use mullion::outline::render_tree_row;
+use mullion::outline::{render_tree_row_decorated, RowDecoration};
 use mullion::style::{Color, Modifier, Style};
 use mullion::table::{ColumnDef, ColumnGrid, ColumnKind};
 use mullion::text::TextCtx;
@@ -1240,6 +1241,23 @@ const SPINE_ID:   TileId = 10;
 const PRIMARY_ID: TileId = 11;
 const DETAIL_ID:  TileId = 12;
 
+/// Health gutter glyphs. Width-1 required (fixed 2-col gutter). `⚠` forces text
+/// presentation (VS15) to stay width-1; if a target terminal renders it wide,
+/// change CRIT_GLYPH to "▲" (see plan Global Constraints / Step 5 verification).
+const WARN_GLYPH: &str = "◆";
+const CRIT_GLYPH: &str = "⚠\u{FE0E}";
+
+/// The leading-gutter decoration for a place's health tier, or `None` when calm
+/// (blank gutter). Colours come from the mullion theme (`warn`/`error`).
+/// `Theme` is already imported unqualified in ui.rs (`use mullion::Theme;`).
+fn tier_decoration(tier: HealthTier, theme: &Theme) -> Option<RowDecoration<'static>> {
+    match tier {
+        HealthTier::Calm => None,
+        HealthTier::Warn => Some(RowDecoration { glyph: WARN_GLYPH, style: theme.warn }),
+        HealthTier::Critical => Some(RowDecoration { glyph: CRIT_GLYPH, style: theme.error }),
+    }
+}
+
 /// The additive three-region "fleet face": spine │ primary │ detail.
 /// Layout + shared-border focus via `mullion::border::render_shared` (census
 /// `dit.rs` idiom); spine via `mullion::outline::render_tree_row`; primary
@@ -1277,8 +1295,9 @@ fn render_fleet(buf: &mut Buffer, area: Rect, state: &mut AppState) {
         for (i, p) in places.iter().enumerate() {
             let row = Rect::new(spine.x, spine.y + i as u16, spine.width, 1);
             if row.y >= spine.y + spine.height { break; }
-            render_tree_row(buf, row, &p.ancestor_last, p.is_last, p.expanded,
-                &p.label, i == state.spine_cursor, &theme, TextCtx::default());
+            let deco = tier_decoration(state.place_health_tier(&p.label), &theme);
+            render_tree_row_decorated(buf, row, &p.ancestor_last, p.is_last, p.expanded,
+                &p.label, i == state.spine_cursor, &theme, TextCtx::default(), deco);
         }
     }
 
@@ -2280,6 +2299,11 @@ fn manual_lines() -> Vec<String> {
         "  [d]                      toggle the latency scope (diagnostics)".into(),
         "  [Esc]                    return from thread view or manual to group list".into(),
         "  [q]  [Ctrl-C]            quit".into(),
+        "".into(),
+        "FLEET HEALTH  (spine gutter)".into(),
+        "  ◆   elevated resource pressure   (PSI stall, some avg10)".into(),
+        "  ⚠   high resource pressure       (PSI stall, some avg10)".into(),
+        "      calm hosts show no glyph.".into(),
         "".into(),
         "DISPLAY CONTROLS".into(),
         "  [Tab]                    switch active side  (left <-> right)".into(),
