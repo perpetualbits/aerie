@@ -1196,6 +1196,27 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
     Ok((entries, now))
 }
 
+/// Build thread samples with rate metrics zeroed — used on a frame where the
+/// threads were read but no previous snapshot is available to compute a CPU/rate
+/// delta (the first tick after a focus change, or too-short resample interval).
+/// Showing the list immediately (0% bars) beats a blank "waiting" frame; the
+/// next tick fills real rates.
+fn zeroed_thread_samples(rows: &[(u32, i32, String, TidCounters)]) -> Vec<ThreadSample> {
+    rows.iter()
+        .map(|(pid, tid, name, _c)| ThreadSample {
+            pid: *pid,
+            tid: *tid,
+            name: name.clone(),
+            cpu_pct: 0.0,
+            faults_per_s: 0.0,
+            disk_read_s: 0.0,
+            disk_write_s: 0.0,
+            ctx_switches_s: 0.0,
+            sched_wait_pct: 0.0,
+        })
+        .collect()
+}
+
 /// Sample per-thread metrics for the given process IDs.
 ///
 /// Walks `/proc/PID/task/` for each PID and reads each TID's `stat` file, plus
@@ -1205,10 +1226,12 @@ pub fn sample(prev: Option<Snapshot>, opts: &CollectOpts, group_by: GroupBy) -> 
 /// `/proc/stat` once per group per tick.
 ///
 /// # Invariants
-/// - If `prev` is None, returns an empty sample list (no delta to compute).
-/// - If the jiffy delta is < 1.0, returns the new snapshot with an empty list;
-///   avoids the pathological division-by-zero that would make every thread appear
-///   at 100% CPU after a very short interval.
+/// - If `prev` is None, returns the thread list with rate metrics zeroed (no
+///   delta to compute yet) instead of an empty list — the caller sees the
+///   threads immediately, and real rates fill in on the next tick.
+/// - If the jiffy delta is < 1.0, returns the new snapshot with the thread list
+///   zeroed the same way; avoids the pathological division-by-zero that would
+///   make every thread appear at 100% CPU after a very short interval.
 ///
 /// # Memory allocation
 /// Reuses a single `String` buffer for path construction and a single read buffer
@@ -1306,14 +1329,16 @@ pub fn sample_threads(
     }
 
     let samples = match prev {
-        None => vec![],
+        None => zeroed_thread_samples(&rows),
         Some(prev) => {
             // System-wide jiffy delta — denominator for thread CPU%.
             let dt = cpu_total.saturating_sub(prev.total) as f64;
             if dt < 1.0 {
-                // Interval too short to compute meaningful CPU%; return snapshot for next time.
+                // Interval too short for a CPU delta: show the list with 0 rates
+                // (not blank); the snapshot still seeds the next tick's real rates.
+                let samples = zeroed_thread_samples(&rows);
                 let tids = rows.into_iter().map(|(_, tid, _, c)| (tid, c)).collect();
-                return Ok((vec![], ThreadSnapshot { total: cpu_total, collected_at, tids }));
+                return Ok((samples, ThreadSnapshot { total: cpu_total, collected_at, tids }));
             }
             let elapsed_secs =
                 collected_at.duration_since(prev.collected_at).as_secs_f64().max(0.001);
@@ -1901,5 +1926,24 @@ drm-memory-vram:\t52428800 B\n";
         assert_eq!(back.pid, 42);
         assert_eq!(back.name, "worker");
         assert!((back.cpu_pct - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_threads_first_frame_lists_threads_with_zero_rates() {
+        // First frame after a focus change: prev == None, so there's no CPU
+        // delta yet — but the thread list must appear immediately (not blank),
+        // with rate metrics at 0. The test process always has >= 1 thread.
+        let pid = std::process::id();
+        let (samples, snap) =
+            super::sample_threads(&[pid], None, &super::ThreadFields::all(), 1000).unwrap();
+        assert!(!samples.is_empty(), "first frame must list the group's threads");
+        assert!(samples.iter().all(|s| s.cpu_pct == 0.0), "no delta yet -> cpu% 0");
+        assert!(!snap.tids.is_empty(), "snapshot carries the delta basis for next tick");
+
+        // dt < 1.0 path: cpu_total unchanged from snap.total -> still lists, not blank.
+        let (samples2, _) =
+            super::sample_threads(&[pid], Some(snap), &super::ThreadFields::all(), 1000).unwrap();
+        assert!(!samples2.is_empty(), "dt<1.0 must also list threads, not blank");
+        assert!(samples2.iter().all(|s| s.cpu_pct == 0.0));
     }
 }
