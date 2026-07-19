@@ -3336,7 +3336,61 @@ fn main() -> Result<()> {
 
         // Poll remote daemon for new snapshots.
         if in_remote {
-            if let Some(ref mut client) = state.remote_client {
+            if let Some(host) = state.fleet_host.clone() {
+                // Fleet-backed host view: read the fleet client's live snapshot.
+                // is_alive() takes &mut self, so this needs a mutable lookup
+                // (fleet_conn_for_label only returns &FleetConn) — same &mut
+                // iter_mut/match idiom used by the fleet poll in refresh().
+                let conn_alive = state.fleet_clients.iter_mut()
+                    .find(|c| c.hostname == host)
+                    .map(|c| match &mut c.client {
+                        Some(FleetClient::Daemon(rc)) => rc.is_alive(),
+                        Some(FleetClient::Thin(t)) => t.is_alive(),
+                        None => false,
+                    })
+                    .unwrap_or(false);
+                if !conn_alive {
+                    state.error = Some(format!("lost connection to {host}"));
+                    state.fleet_host = None;
+                    state.view = AppView::Fleet;
+                } else {
+                    // Drain the fleet client for a fresh snapshot and STASH it on
+                    // the FleetConn (so a later host→app thread drill can read its
+                    // focus_threads — the fleet loop that normally sets c.snap is
+                    // skipped while in_remote). Then mirror it into state for the
+                    // dense body. Stash first, then read from c.snap to avoid a
+                    // partial move; entries is cloned (both places need it).
+                    let got = state.fleet_clients.iter_mut()
+                        .find(|c| c.hostname == host)
+                        .and_then(|c| {
+                            let s = match c.client.as_mut() {
+                                Some(FleetClient::Daemon(rc)) => rc.try_recv(),
+                                Some(FleetClient::Thin(t)) => t.try_recv(),
+                                None => None,
+                            };
+                            if let Some(snap) = s { c.snap = Some(snap); true } else { false }.then_some(())
+                        }).is_some();
+                    if got {
+                        if let Some(snap) = fleet_conn_for_label(&host, &state.fleet_clients)
+                            .and_then(|c| c.snap.as_ref())
+                        {
+                            state.entries = snap.entries.clone();
+                            state.total_ram_bytes = snap.total_ram_bytes;
+                            state.sys_net_rx_s = snap.sys_net_rx_s;
+                            state.sys_net_tx_s = snap.sys_net_tx_s;
+                            state.sys_gpu_pct = snap.sys_gpu_pct;
+                            state.sys_rapl_w = snap.sys_rapl_w;
+                            state.sys_psi_cpu = snap.sys_psi_cpu;
+                            state.sys_psi_mem = snap.sys_psi_mem;
+                            state.sys_psi_io  = snap.sys_psi_io;
+                            state.snap_count = snap.snap_count;
+                        }
+                        state.sync_body_tree();
+                    }
+                    // Keep the thread stream pinned to the host-view cursor's app.
+                    state.route_fleet_focus();
+                }
+            } else if let Some(ref mut client) = state.remote_client {
                 if !client.is_alive() {
                     // SSH process died; return to group view with an error notice.
                     state.error = Some("Remote connection lost.".into());
@@ -3556,6 +3610,13 @@ fn main() -> Result<()> {
                                 state.thread_samples = vec![];
                             }
                             AppView::Manual => state.view = AppView::Groups,
+                            AppView::Remote { .. } if state.fleet_host.is_some() => {
+                                // Fleet-backed host view: return to the fleet face;
+                                // do NOT close anything — the fleet keeps streaming.
+                                state.fleet_host = None;
+                                state.entries = vec![];
+                                state.view = AppView::Fleet;
+                            }
                             AppView::Remote { .. } | AppView::Connecting { .. } => {
                                 if let Some(c) = state.remote_client.take() {
                                     c.close();
@@ -3812,6 +3873,29 @@ fn main() -> Result<()> {
                                     .unwrap_or(0.0);
                                 vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
                             });
+                        }
+                    }
+                    KeyCode::Enter if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Spine => {
+                        // Enter a host "as-if-local": a dense full-screen process
+                        // view sourced from the fleet's already-streaming snapshot
+                        // (no new SSH). Reuses AppView::Remote; fleet_host marks it
+                        // fleet-backed so the poll reads the fleet client and Esc
+                        // returns to the fleet face.
+                        if let Some(host) = state.fleet_spine_places()
+                            .get(state.spine_cursor).map(|p| p.label.clone())
+                        {
+                            match state.selected_fleet_conn() {
+                                Some(conn) if conn.client.is_some() && !conn.thin => {
+                                    state.fleet_host = Some(host.clone());
+                                    state.entries = vec![];
+                                    state.view = AppView::Remote { label: host };
+                                    state.sync_body_tree();
+                                }
+                                Some(conn) if conn.thin => state.error =
+                                    Some("thin probe — no per-process drill-down".into()),
+                                _ => state.error = Some(format!("not connected to {host}")),
+                            }
                         }
                     }
                     // Enter: drill down — threads (local), SSH daemon (proxmox/fleet), kubectl exec (kube), nomad alloc exec (nomad)
