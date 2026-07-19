@@ -864,6 +864,26 @@ fn resolve_fleet_primary(
     }
 }
 
+/// Pure core of [`AppState::drill_focus`]: pick the `(host, app)` whose
+/// per-thread stream should be live, by drill level (thread view > host view >
+/// fleet face). Returns the host and the app to focus on it (`None` app = focus
+/// nothing on that host yet). `None` overall = no host selected.
+fn resolve_drill_focus(
+    fleet_thread: Option<&(String, String)>,
+    fleet_host: Option<&str>,
+    host_view_app: Option<&str>,
+    face_host: Option<&str>,
+    face_app: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    if let Some((h, a)) = fleet_thread {
+        Some((h.clone(), Some(a.clone())))
+    } else if let Some(h) = fleet_host {
+        Some((h.to_string(), host_view_app.map(str::to_string)))
+    } else {
+        face_host.map(|h| (h.to_string(), face_app.map(str::to_string)))
+    }
+}
+
 /// Reorder a remote host's freshly-received group entries into a STABLE order so
 /// the primary rows don't hop as the daemon re-sorts its output each tick.
 /// Mirrors the local `stable_order` discipline in [`AppState::refresh`]: labels
@@ -1079,6 +1099,15 @@ pub struct AppState {
     /// Keeping focus pinned by label (not index) stops the remote thread detail
     /// from restarting its per-thread warm-up every tick.
     pub fleet_primary_label: Option<String>,
+    /// When the fleet face has drilled INTO a host, the entered hostname. The
+    /// `AppView::Remote` is then fleet-backed (data from `fleet_clients[host]`,
+    /// not `remote_client`) and Esc returns to the fleet face, not `Groups`.
+    pub fleet_host: Option<String>,
+    /// When a fleet app's per-thread view is open, the drilled `(host, app)`.
+    /// The `AppView::Threads` is then fleet-backed (samples from the host's
+    /// `focus_threads`, not the local sampler). Esc returns to the host view
+    /// when `fleet_host` is set, else to the fleet face.
+    pub fleet_thread: Option<(String, String)>,
     // ── thread detail ────────────────────────────────────────────────────
     /// Previous per-thread snapshot for CPU delta computation in thread view.
     pub thread_snap: Option<local::ThreadSnapshot>,
@@ -1726,6 +1755,8 @@ impl AppState {
             spine_cursor: 0,
             fleet_primary_cursor: 0,
             fleet_primary_label: None,
+            fleet_host: None,
+            fleet_thread: None,
             group_snaps: HashMap::new(),
             group_member_vals: HashMap::new(),
             last_hist_sample: None,
@@ -1823,6 +1854,41 @@ impl AppState {
     /// the cursor pinned to `fleet_primary_label` so it is.
     fn selected_fleet_group_label(&self) -> Option<String> {
         self.selected_place_entries().get(self.fleet_primary_cursor).map(|e| e.label.clone())
+    }
+
+    /// The `(host, app)` whose per-thread stream should be live, given the
+    /// current fleet drill level. In the fleet face this is the spine host +
+    /// primary app; in the host view it's the entered host + its cursor's app;
+    /// in a thread view it's the fixed drilled `(host, app)`.
+    fn drill_focus(&self) -> Option<(String, Option<String>)> {
+        // Host-view selected app = the dense body's focused entry label.
+        let host_view_app = self.fleet_host.as_ref().and(
+            self.focused_entry_idx().and_then(|i| self.entries.get(i)).map(|e| e.label.as_str()));
+        let face_host = self.fleet_spine_places().get(self.spine_cursor).map(|p| p.label.clone());
+        let face_app = self.selected_fleet_group_label();
+        resolve_drill_focus(
+            self.fleet_thread.as_ref(),
+            self.fleet_host.as_deref(),
+            host_view_app,
+            face_host.as_deref(),
+            face_app.as_deref(),
+        )
+    }
+
+    /// Route `send_focus` to the drilled host's focused app and `None` to every
+    /// other fleet host, so exactly one host samples threads. Call each tick
+    /// from both the fleet refresh loop and the fleet-backed host-view poll.
+    fn route_fleet_focus(&mut self) {
+        let target = self.drill_focus(); // Option<(host, Option<app>)>
+        for conn in self.fleet_clients.iter_mut() {
+            if let Some(FleetClient::Daemon(rc)) = conn.client.as_mut() {
+                let app = match &target {
+                    Some((h, a)) if *h == conn.hostname => a.as_deref(),
+                    _ => None,
+                };
+                rc.send_focus(app);
+            }
+        }
     }
 
     /// Record the current Fleet-primary cursor position as the focused group
@@ -2173,17 +2239,10 @@ impl AppState {
             // daemon's per-thread warm-up (the "waiting for second sample"
             // flicker). Re-deriving the cursor from the label keeps it stable.
             self.sync_fleet_primary_to_label();
-            // Focused-stream routing (Slice C): tell the spine-selected remote
-            // daemon which group to stream per-thread data for; tell the others
-            // to stop. `send_focus` dedups, so this is cheap every tick, and it
-            // only ever asks ONE host to sample threads.
-            let focus_group = self.selected_fleet_group_label(); // owned Option<String>
-            let sel = self.spine_cursor;
-            for (i, conn) in self.fleet_clients.iter_mut().enumerate() {
-                if let Some(FleetClient::Daemon(rc)) = conn.client.as_mut() {
-                    rc.send_focus(if i == sel { focus_group.as_deref() } else { None });
-                }
-            }
+            // Route the focused-thread stream to the drilled (host, app) — on
+            // the fleet face this is the spine host's primary app (unchanged);
+            // when drilled it follows the host view / thread view.
+            self.route_fleet_focus();
             // Build BarEntries: one per fleet member.
             let raw: Vec<BarEntry> = self.fleet_clients.iter().map(|conn| {
                 let (cpu, mem_pct, mem_used, net_rx, net_tx, count, has_data) =
@@ -4062,7 +4121,7 @@ mod fleet_tests {
     use super::{Region, FleetConn, KubeConn, NomadConn, BarEntry,
         fleet_conn_for_label, kube_conn_for_label, nomad_conn_for_label,
         resolve_fleet_primary, stabilize_fleet_entries,
-        HealthTier, stepped_tier, place_health};
+        HealthTier, stepped_tier, place_health, resolve_drill_focus};
 
     fn conn(hostname: &str) -> FleetConn {
         FleetConn { hostname: hostname.into(), client: None, snap: None, err: None, thin: false,
@@ -4229,5 +4288,28 @@ mod fleet_tests {
         assert_eq!(place_health(Calm, None, None, None, Some(98.0)), Critical);
         // Nothing known → Calm (never invent a problem).
         assert_eq!(place_health(Calm, None, None, None, None), Calm);
+    }
+
+    #[test]
+    fn drill_focus_precedence() {
+        // Thread view: the fixed (host, app) wins over everything.
+        assert_eq!(
+            resolve_drill_focus(Some(&("milkv".into(), "btop".into())), Some("milkv"),
+                Some("kworker"), Some("apollo"), Some("steam")),
+            Some(("milkv".into(), Some("btop".into()))));
+        // Host view (no thread): the host + the host-view cursor's app.
+        assert_eq!(
+            resolve_drill_focus(None, Some("milkv"), Some("kworker"), Some("apollo"), Some("steam")),
+            Some(("milkv".into(), Some("kworker".into()))));
+        // Host view with no app selected yet: host, no app to focus.
+        assert_eq!(
+            resolve_drill_focus(None, Some("milkv"), None, Some("apollo"), Some("steam")),
+            Some(("milkv".into(), None)));
+        // Fleet face: spine host + primary app.
+        assert_eq!(
+            resolve_drill_focus(None, None, None, Some("apollo"), Some("steam")),
+            Some(("apollo".into(), Some("steam".into()))));
+        // Nothing selected: no focus.
+        assert_eq!(resolve_drill_focus(None, None, None, None, None), None);
     }
 }
