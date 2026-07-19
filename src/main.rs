@@ -1875,6 +1875,15 @@ impl AppState {
         )
     }
 
+    /// Clear the fleet drill markers. Call when leaving a fleet-backed
+    /// Remote/Threads view by any non-Esc path (view-toggle keys), so the
+    /// fleet face's invariant (both markers None) holds and `drill_focus`
+    /// doesn't pin the focus stream to a stale host.
+    fn clear_fleet_drill(&mut self) {
+        self.fleet_host = None;
+        self.fleet_thread = None;
+    }
+
     /// Route `send_focus` to the drilled host's focused app and `None` to every
     /// other fleet host, so exactly one host samples threads. Call each tick
     /// from both the fleet refresh loop and the fleet-backed host-view poll.
@@ -3660,6 +3669,7 @@ fn main() -> Result<()> {
                         }
                     }
                     KeyCode::Char('m') => {
+                        state.clear_fleet_drill();
                         if matches!(state.view, AppView::Manual) {
                             state.view = AppView::Groups;
                         } else {
@@ -3684,6 +3694,7 @@ fn main() -> Result<()> {
                     // Toggle the latency scope (diagnostics). Spawns the probe on
                     // first use; the probe then keeps running so history persists.
                     KeyCode::Char('d') => {
+                        state.clear_fleet_drill();
                         if matches!(state.view, AppView::Scope) {
                             state.view = AppView::Groups;
                         } else if matches!(
@@ -3703,6 +3714,7 @@ fn main() -> Result<()> {
                     }
                     // Toggle the Fleet three-region face (spine / primary / detail).
                     KeyCode::Char('f') => {
+                        state.clear_fleet_drill();
                         state.view = if matches!(state.view, AppView::Fleet) {
                             AppView::Groups
                         } else {
