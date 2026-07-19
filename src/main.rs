@@ -3885,16 +3885,20 @@ fn main() -> Result<()> {
                         if let Some(host) = state.fleet_spine_places()
                             .get(state.spine_cursor).map(|p| p.label.clone())
                         {
-                            match state.selected_fleet_conn() {
-                                Some(conn) if conn.client.is_some() && !conn.thin => {
-                                    state.fleet_host = Some(host.clone());
-                                    state.entries = vec![];
-                                    state.view = AppView::Remote { label: host };
-                                    state.sync_body_tree();
-                                }
-                                Some(conn) if conn.thin => state.error =
-                                    Some("thin probe — no per-process drill-down".into()),
-                                _ => state.error = Some(format!("not connected to {host}")),
+                            let (connected, thin) =
+                                match fleet_conn_for_label(&host, &state.fleet_clients) {
+                                    Some(c) => (c.client.is_some(), c.thin),
+                                    None => (false, false),
+                                };
+                            if thin {
+                                state.error = Some("thin probe — no per-process drill-down".into());
+                            } else if !connected {
+                                state.error = Some(format!("not connected to {host}"));
+                            } else {
+                                state.fleet_host = Some(host.clone());
+                                state.entries = vec![];
+                                state.view = AppView::Remote { label: host };
+                                state.sync_body_tree();
                             }
                         }
                     }
