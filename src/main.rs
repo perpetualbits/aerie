@@ -864,6 +864,26 @@ fn resolve_fleet_primary(
     }
 }
 
+/// Pure core of [`AppState::drill_focus`]: pick the `(host, app)` whose
+/// per-thread stream should be live, by drill level (thread view > host view >
+/// fleet face). Returns the host and the app to focus on it (`None` app = focus
+/// nothing on that host yet). `None` overall = no host selected.
+fn resolve_drill_focus(
+    fleet_thread: Option<&(String, String)>,
+    fleet_host: Option<&str>,
+    host_view_app: Option<&str>,
+    face_host: Option<&str>,
+    face_app: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    if let Some((h, a)) = fleet_thread {
+        Some((h.clone(), Some(a.clone())))
+    } else if let Some(h) = fleet_host {
+        Some((h.to_string(), host_view_app.map(str::to_string)))
+    } else {
+        face_host.map(|h| (h.to_string(), face_app.map(str::to_string)))
+    }
+}
+
 /// Reorder a remote host's freshly-received group entries into a STABLE order so
 /// the primary rows don't hop as the daemon re-sorts its output each tick.
 /// Mirrors the local `stable_order` discipline in [`AppState::refresh`]: labels
@@ -1079,6 +1099,15 @@ pub struct AppState {
     /// Keeping focus pinned by label (not index) stops the remote thread detail
     /// from restarting its per-thread warm-up every tick.
     pub fleet_primary_label: Option<String>,
+    /// When the fleet face has drilled INTO a host, the entered hostname. The
+    /// `AppView::Remote` is then fleet-backed (data from `fleet_clients[host]`,
+    /// not `remote_client`) and Esc returns to the fleet face, not `Groups`.
+    pub fleet_host: Option<String>,
+    /// When a fleet app's per-thread view is open, the drilled `(host, app)`.
+    /// The `AppView::Threads` is then fleet-backed (samples from the host's
+    /// `focus_threads`, not the local sampler). Esc returns to the host view
+    /// when `fleet_host` is set, else to the fleet face.
+    pub fleet_thread: Option<(String, String)>,
     // ── thread detail ────────────────────────────────────────────────────
     /// Previous per-thread snapshot for CPU delta computation in thread view.
     pub thread_snap: Option<local::ThreadSnapshot>,
@@ -1726,6 +1755,8 @@ impl AppState {
             spine_cursor: 0,
             fleet_primary_cursor: 0,
             fleet_primary_label: None,
+            fleet_host: None,
+            fleet_thread: None,
             group_snaps: HashMap::new(),
             group_member_vals: HashMap::new(),
             last_hist_sample: None,
@@ -1823,6 +1854,50 @@ impl AppState {
     /// the cursor pinned to `fleet_primary_label` so it is.
     fn selected_fleet_group_label(&self) -> Option<String> {
         self.selected_place_entries().get(self.fleet_primary_cursor).map(|e| e.label.clone())
+    }
+
+    /// The `(host, app)` whose per-thread stream should be live, given the
+    /// current fleet drill level. In the fleet face this is the spine host +
+    /// primary app; in the host view it's the entered host + its cursor's app;
+    /// in a thread view it's the fixed drilled `(host, app)`.
+    fn drill_focus(&self) -> Option<(String, Option<String>)> {
+        // Host-view selected app = the dense body's focused entry label.
+        let host_view_app = self.fleet_host.as_ref().and(
+            self.focused_entry_idx().and_then(|i| self.entries.get(i)).map(|e| e.label.as_str()));
+        let face_host = self.fleet_spine_places().get(self.spine_cursor).map(|p| p.label.clone());
+        let face_app = self.selected_fleet_group_label();
+        resolve_drill_focus(
+            self.fleet_thread.as_ref(),
+            self.fleet_host.as_deref(),
+            host_view_app,
+            face_host.as_deref(),
+            face_app.as_deref(),
+        )
+    }
+
+    /// Clear the fleet drill markers. Call when leaving a fleet-backed
+    /// Remote/Threads view by any non-Esc path (view-toggle keys), so the
+    /// fleet face's invariant (both markers None) holds and `drill_focus`
+    /// doesn't pin the focus stream to a stale host.
+    fn clear_fleet_drill(&mut self) {
+        self.fleet_host = None;
+        self.fleet_thread = None;
+    }
+
+    /// Route `send_focus` to the drilled host's focused app and `None` to every
+    /// other fleet host, so exactly one host samples threads. Call each tick
+    /// from both the fleet refresh loop and the fleet-backed host-view poll.
+    fn route_fleet_focus(&mut self) {
+        let target = self.drill_focus(); // Option<(host, Option<app>)>
+        for conn in self.fleet_clients.iter_mut() {
+            if let Some(FleetClient::Daemon(rc)) = conn.client.as_mut() {
+                let app = match &target {
+                    Some((h, a)) if *h == conn.hostname => a.as_deref(),
+                    _ => None,
+                };
+                rc.send_focus(app);
+            }
+        }
     }
 
     /// Record the current Fleet-primary cursor position as the focused group
@@ -2173,17 +2248,10 @@ impl AppState {
             // daemon's per-thread warm-up (the "waiting for second sample"
             // flicker). Re-deriving the cursor from the label keeps it stable.
             self.sync_fleet_primary_to_label();
-            // Focused-stream routing (Slice C): tell the spine-selected remote
-            // daemon which group to stream per-thread data for; tell the others
-            // to stop. `send_focus` dedups, so this is cheap every tick, and it
-            // only ever asks ONE host to sample threads.
-            let focus_group = self.selected_fleet_group_label(); // owned Option<String>
-            let sel = self.spine_cursor;
-            for (i, conn) in self.fleet_clients.iter_mut().enumerate() {
-                if let Some(FleetClient::Daemon(rc)) = conn.client.as_mut() {
-                    rc.send_focus(if i == sel { focus_group.as_deref() } else { None });
-                }
-            }
+            // Route the focused-thread stream to the drilled (host, app) — on
+            // the fleet face this is the spine host's primary app (unchanged);
+            // when drilled it follows the host view / thread view.
+            self.route_fleet_focus();
             // Build BarEntries: one per fleet member.
             let raw: Vec<BarEntry> = self.fleet_clients.iter().map(|conn| {
                 let (cpu, mem_pct, mem_used, net_rx, net_tx, count, has_data) =
@@ -2687,6 +2755,20 @@ impl AppState {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
+        }
+
+        // Fleet-backed thread view: samples come from the drilled host's
+        // focus_threads stream (kept live by route_fleet_focus), not the local
+        // sampler. Match on the drilled (host, app); take the samples when the
+        // streamed label matches the app we drilled.
+        if let Some((host, app)) = self.fleet_thread.clone() {
+            let samples = fleet_conn_for_label(&host, &self.fleet_clients)
+                .and_then(|c| c.snap.as_ref())
+                .and_then(|s| s.focus_threads.as_ref())
+                .filter(|(label, _)| *label == app)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+            self.thread_samples = samples;
         }
 
         // Fleet detail (monitor lens): compute the selected primary group's
@@ -3277,7 +3359,61 @@ fn main() -> Result<()> {
 
         // Poll remote daemon for new snapshots.
         if in_remote {
-            if let Some(ref mut client) = state.remote_client {
+            if let Some(host) = state.fleet_host.clone() {
+                // Fleet-backed host view: read the fleet client's live snapshot.
+                // is_alive() takes &mut self, so this needs a mutable lookup
+                // (fleet_conn_for_label only returns &FleetConn) — same &mut
+                // iter_mut/match idiom used by the fleet poll in refresh().
+                let conn_alive = state.fleet_clients.iter_mut()
+                    .find(|c| c.hostname == host)
+                    .map(|c| match &mut c.client {
+                        Some(FleetClient::Daemon(rc)) => rc.is_alive(),
+                        Some(FleetClient::Thin(t)) => t.is_alive(),
+                        None => false,
+                    })
+                    .unwrap_or(false);
+                if !conn_alive {
+                    state.error = Some(format!("lost connection to {host}"));
+                    state.fleet_host = None;
+                    state.view = AppView::Fleet;
+                } else {
+                    // Drain the fleet client for a fresh snapshot and STASH it on
+                    // the FleetConn (so a later host→app thread drill can read its
+                    // focus_threads — the fleet loop that normally sets c.snap is
+                    // skipped while in_remote). Then mirror it into state for the
+                    // dense body. Stash first, then read from c.snap to avoid a
+                    // partial move; entries is cloned (both places need it).
+                    let got = state.fleet_clients.iter_mut()
+                        .find(|c| c.hostname == host)
+                        .and_then(|c| {
+                            let s = match c.client.as_mut() {
+                                Some(FleetClient::Daemon(rc)) => rc.try_recv(),
+                                Some(FleetClient::Thin(t)) => t.try_recv(),
+                                None => None,
+                            };
+                            if let Some(snap) = s { c.snap = Some(snap); true } else { false }.then_some(())
+                        }).is_some();
+                    if got {
+                        if let Some(snap) = fleet_conn_for_label(&host, &state.fleet_clients)
+                            .and_then(|c| c.snap.as_ref())
+                        {
+                            state.entries = snap.entries.clone();
+                            state.total_ram_bytes = snap.total_ram_bytes;
+                            state.sys_net_rx_s = snap.sys_net_rx_s;
+                            state.sys_net_tx_s = snap.sys_net_tx_s;
+                            state.sys_gpu_pct = snap.sys_gpu_pct;
+                            state.sys_rapl_w = snap.sys_rapl_w;
+                            state.sys_psi_cpu = snap.sys_psi_cpu;
+                            state.sys_psi_mem = snap.sys_psi_mem;
+                            state.sys_psi_io  = snap.sys_psi_io;
+                            state.snap_count = snap.snap_count;
+                        }
+                        state.sync_body_tree();
+                    }
+                    // Keep the thread stream pinned to the host-view cursor's app.
+                    state.route_fleet_focus();
+                }
+            } else if let Some(ref mut client) = state.remote_client {
                 if !client.is_alive() {
                     // SSH process died; return to group view with an error notice.
                     state.error = Some("Remote connection lost.".into());
@@ -3489,6 +3625,16 @@ fn main() -> Result<()> {
                     }
                     KeyCode::Esc => {
                         match &state.view {
+                            AppView::Threads { .. } if state.fleet_thread.is_some() => {
+                                state.fleet_thread = None;
+                                state.thread_samples = vec![];
+                                // Pop to the host view if we drilled from it, else the face.
+                                state.view = if state.fleet_host.is_some() {
+                                    AppView::Remote { label: state.fleet_host.clone().unwrap() }
+                                } else {
+                                    AppView::Fleet
+                                };
+                            }
                             AppView::Threads { .. } => {
                                 // Clear thread state so the next Enter into a different group
                                 // doesn't momentarily show stale data.
@@ -3497,6 +3643,13 @@ fn main() -> Result<()> {
                                 state.thread_samples = vec![];
                             }
                             AppView::Manual => state.view = AppView::Groups,
+                            AppView::Remote { .. } if state.fleet_host.is_some() => {
+                                // Fleet-backed host view: return to the fleet face;
+                                // do NOT close anything — the fleet keeps streaming.
+                                state.fleet_host = None;
+                                state.entries = vec![];
+                                state.view = AppView::Fleet;
+                            }
                             AppView::Remote { .. } | AppView::Connecting { .. } => {
                                 if let Some(c) = state.remote_client.take() {
                                     c.close();
@@ -3516,6 +3669,7 @@ fn main() -> Result<()> {
                         }
                     }
                     KeyCode::Char('m') => {
+                        state.clear_fleet_drill();
                         if matches!(state.view, AppView::Manual) {
                             state.view = AppView::Groups;
                         } else {
@@ -3540,6 +3694,7 @@ fn main() -> Result<()> {
                     // Toggle the latency scope (diagnostics). Spawns the probe on
                     // first use; the probe then keeps running so history persists.
                     KeyCode::Char('d') => {
+                        state.clear_fleet_drill();
                         if matches!(state.view, AppView::Scope) {
                             state.view = AppView::Groups;
                         } else if matches!(
@@ -3559,6 +3714,7 @@ fn main() -> Result<()> {
                     }
                     // Toggle the Fleet three-region face (spine / primary / detail).
                     KeyCode::Char('f') => {
+                        state.clear_fleet_drill();
                         state.view = if matches!(state.view, AppView::Fleet) {
                             AppView::Groups
                         } else {
@@ -3753,6 +3909,59 @@ fn main() -> Result<()> {
                                     .unwrap_or(0.0);
                                 vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
                             });
+                        }
+                    }
+                    KeyCode::Enter if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Spine => {
+                        // Enter a host "as-if-local": a dense full-screen process
+                        // view sourced from the fleet's already-streaming snapshot
+                        // (no new SSH). Reuses AppView::Remote; fleet_host marks it
+                        // fleet-backed so the poll reads the fleet client and Esc
+                        // returns to the fleet face.
+                        if let Some(host) = state.fleet_spine_places()
+                            .get(state.spine_cursor).map(|p| p.label.clone())
+                        {
+                            let (connected, thin) =
+                                match fleet_conn_for_label(&host, &state.fleet_clients) {
+                                    Some(c) => (c.client.is_some(), c.thin),
+                                    None => (false, false),
+                                };
+                            if thin {
+                                state.error = Some("thin probe — no per-process drill-down".into());
+                            } else if !connected {
+                                state.error = Some(format!("not connected to {host}"));
+                            } else {
+                                state.fleet_host = Some(host.clone());
+                                state.entries = vec![];
+                                state.view = AppView::Remote { label: host };
+                                state.sync_body_tree();
+                            }
+                        }
+                    }
+                    KeyCode::Enter if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Primary => {
+                        // Drill the selected app into its per-thread view (from the
+                        // fleet face). Sourced from the host's focus_threads stream.
+                        let host = state.fleet_spine_places()
+                            .get(state.spine_cursor).map(|p| p.label.clone());
+                        let app = state.selected_fleet_group_label();
+                        if let (Some(host), Some(app)) = (host, app) {
+                            state.fleet_thread = Some((host, app.clone()));
+                            state.thread_samples = vec![];
+                            state.view = AppView::Threads { label: app };
+                        }
+                    }
+                    KeyCode::Enter if matches!(state.view, AppView::Remote { .. })
+                        && state.fleet_host.is_some() => {
+                        // From the entered host view, drill the focused app into
+                        // its per-thread view (keeps fleet_host so Esc pops back here).
+                        let host = state.fleet_host.clone();
+                        let app = state.focused_entry_idx()
+                            .and_then(|i| state.entries.get(i)).map(|e| e.label.clone());
+                        if let (Some(host), Some(app)) = (host, app) {
+                            state.fleet_thread = Some((host, app.clone()));
+                            state.thread_samples = vec![];
+                            state.view = AppView::Threads { label: app };
                         }
                     }
                     // Enter: drill down — threads (local), SSH daemon (proxmox/fleet), kubectl exec (kube), nomad alloc exec (nomad)
@@ -4062,7 +4271,7 @@ mod fleet_tests {
     use super::{Region, FleetConn, KubeConn, NomadConn, BarEntry,
         fleet_conn_for_label, kube_conn_for_label, nomad_conn_for_label,
         resolve_fleet_primary, stabilize_fleet_entries,
-        HealthTier, stepped_tier, place_health};
+        HealthTier, stepped_tier, place_health, resolve_drill_focus};
 
     fn conn(hostname: &str) -> FleetConn {
         FleetConn { hostname: hostname.into(), client: None, snap: None, err: None, thin: false,
@@ -4229,5 +4438,28 @@ mod fleet_tests {
         assert_eq!(place_health(Calm, None, None, None, Some(98.0)), Critical);
         // Nothing known → Calm (never invent a problem).
         assert_eq!(place_health(Calm, None, None, None, None), Calm);
+    }
+
+    #[test]
+    fn drill_focus_precedence() {
+        // Thread view: the fixed (host, app) wins over everything.
+        assert_eq!(
+            resolve_drill_focus(Some(&("milkv".into(), "btop".into())), Some("milkv"),
+                Some("kworker"), Some("apollo"), Some("steam")),
+            Some(("milkv".into(), Some("btop".into()))));
+        // Host view (no thread): the host + the host-view cursor's app.
+        assert_eq!(
+            resolve_drill_focus(None, Some("milkv"), Some("kworker"), Some("apollo"), Some("steam")),
+            Some(("milkv".into(), Some("kworker".into()))));
+        // Host view with no app selected yet: host, no app to focus.
+        assert_eq!(
+            resolve_drill_focus(None, Some("milkv"), None, Some("apollo"), Some("steam")),
+            Some(("milkv".into(), None)));
+        // Fleet face: spine host + primary app.
+        assert_eq!(
+            resolve_drill_focus(None, None, None, Some("apollo"), Some("steam")),
+            Some(("apollo".into(), Some("steam".into()))));
+        // Nothing selected: no focus.
+        assert_eq!(resolve_drill_focus(None, None, None, None, None), None);
     }
 }
