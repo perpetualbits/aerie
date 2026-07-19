@@ -2748,6 +2748,20 @@ impl AppState {
             }
         }
 
+        // Fleet-backed thread view: samples come from the drilled host's
+        // focus_threads stream (kept live by route_fleet_focus), not the local
+        // sampler. Match on the drilled (host, app); take the samples when the
+        // streamed label matches the app we drilled.
+        if let Some((host, app)) = self.fleet_thread.clone() {
+            let samples = fleet_conn_for_label(&host, &self.fleet_clients)
+                .and_then(|c| c.snap.as_ref())
+                .and_then(|s| s.focus_threads.as_ref())
+                .filter(|(label, _)| *label == app)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+            self.thread_samples = samples;
+        }
+
         // Fleet detail (monitor lens): compute the selected primary group's
         // per-thread samples each refresh, mirroring the Threads block above but
         // keyed to the Fleet selection. Reset the delta basis when the selection
@@ -3602,6 +3616,16 @@ fn main() -> Result<()> {
                     }
                     KeyCode::Esc => {
                         match &state.view {
+                            AppView::Threads { .. } if state.fleet_thread.is_some() => {
+                                state.fleet_thread = None;
+                                state.thread_samples = vec![];
+                                // Pop to the host view if we drilled from it, else the face.
+                                state.view = if state.fleet_host.is_some() {
+                                    AppView::Remote { label: state.fleet_host.clone().unwrap() }
+                                } else {
+                                    AppView::Fleet
+                                };
+                            }
                             AppView::Threads { .. } => {
                                 // Clear thread state so the next Enter into a different group
                                 // doesn't momentarily show stale data.
@@ -3900,6 +3924,32 @@ fn main() -> Result<()> {
                                 state.view = AppView::Remote { label: host };
                                 state.sync_body_tree();
                             }
+                        }
+                    }
+                    KeyCode::Enter if matches!(state.view, AppView::Fleet)
+                        && state.fleet_region == Region::Primary => {
+                        // Drill the selected app into its per-thread view (from the
+                        // fleet face). Sourced from the host's focus_threads stream.
+                        let host = state.fleet_spine_places()
+                            .get(state.spine_cursor).map(|p| p.label.clone());
+                        let app = state.selected_fleet_group_label();
+                        if let (Some(host), Some(app)) = (host, app) {
+                            state.fleet_thread = Some((host, app.clone()));
+                            state.thread_samples = vec![];
+                            state.view = AppView::Threads { label: app };
+                        }
+                    }
+                    KeyCode::Enter if matches!(state.view, AppView::Remote { .. })
+                        && state.fleet_host.is_some() => {
+                        // From the entered host view, drill the focused app into
+                        // its per-thread view (keeps fleet_host so Esc pops back here).
+                        let host = state.fleet_host.clone();
+                        let app = state.focused_entry_idx()
+                            .and_then(|i| state.entries.get(i)).map(|e| e.label.clone());
+                        if let (Some(host), Some(app)) = (host, app) {
+                            state.fleet_thread = Some((host, app.clone()));
+                            state.thread_samples = vec![];
+                            state.view = AppView::Threads { label: app };
                         }
                     }
                     // Enter: drill down — threads (local), SSH daemon (proxmox/fleet), kubectl exec (kube), nomad alloc exec (nomad)

@@ -50,6 +50,8 @@ pub fn render(buf: &mut Buffer, state: &mut AppState) {
         AppView::Groups | AppView::Remote { .. } => render_body(buf, body_rect, state),
         AppView::Threads { .. } if matches!(state.mode, AppMode::Local) =>
             render_body_with_threads(buf, body_rect, outer_y0, outer_y1, state),
+        AppView::Threads { .. } if state.fleet_thread.is_some() =>
+            render_threads(buf, body_rect, state),
         AppView::Threads { .. } => render_body(buf, body_rect, state),
         AppView::Manual => render_manual(buf, body_rect, state),
         AppView::Connecting { label } => render_connecting(buf, body_rect, &label),
